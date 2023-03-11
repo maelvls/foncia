@@ -21,7 +21,7 @@ var (
 	// EnableDebug enables debug logs.
 	debug = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
 
-	serveBasePath = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies.")
+	serveBasePath = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
 	serveAddr     = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
 )
 
@@ -44,6 +44,10 @@ func main() {
 
 	switch flag.Arg(0) {
 	case "serve":
+		if *serveBasePath != "" && !strings.HasPrefix(*serveBasePath, "/") {
+			logutil.Errorf("basepath must start with a slash")
+			os.Exit(1)
+		}
 		ServeCmd(*serveAddr, *serveBasePath, username, password, coproID)
 	case "list":
 		ListCmd(username, password, coproID)
@@ -128,7 +132,7 @@ func ServeCmd(serveAddr, basePath, username, password, coproID string) {
 			return
 		}
 
-		w.Write([]byte(fmt.Sprintf("The actual page is %s/%s/interventions", r.URL, basePath)))
+		w.Write([]byte(fmt.Sprintf("The actual page is %s%s/interventions", r.URL, basePath)))
 	})
 
 	http.HandleFunc("/interventions", func(w http.ResponseWriter, r *http.Request) {
