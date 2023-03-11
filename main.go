@@ -173,12 +173,14 @@ func ServeCmd(serveAddr, basePath, username, password, coproID string) {
 		err := Authenticate(client, username, password)
 		if err != nil {
 			logutil.Errorf("while authenticating: %v", err)
+			http.Error(w, fmt.Sprintf("error while authenticating: %s", err), http.StatusInternalServerError)
+			return
 		}
 
 		items, err := GetInterventions(client, coproID)
 		if err != nil {
 			logutil.Errorf("getting interventions: %v", err)
-			http.Error(w, fmt.Sprintf("error: %s", err), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("error while listing interventions: %s", err), http.StatusInternalServerError)
 			return
 		}
 
