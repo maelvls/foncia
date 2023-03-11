@@ -10,6 +10,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"strings"
 
 	"github.com/sethgrid/gencurl"
@@ -18,16 +19,38 @@ import (
 )
 
 var (
-	// EnableDebug enables debug logs.
-	debug = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
+	// EnableDebug enables debugFlag logs.
+	debugFlag = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
 
 	serveBasePath = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
 	serveAddr     = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
+
+	versionFlag = flag.Bool("version", false, "Print the version and exit.")
 )
+
+var (
+	// version is the version of the binary. It is set at build time.
+	version = "unknown"
+	date    = "unknown"
+)
+
+func init() {
+	info, ok := debug.ReadBuildInfo()
+	if ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" {
+				version = setting.Value
+			}
+			if setting.Key == "vcs.time" {
+				date = setting.Value
+			}
+		}
+	}
+}
 
 func main() {
 	flag.Parse()
-	if *debug {
+	if *debugFlag {
 		logutil.EnableDebug = true
 	}
 	username := os.Getenv("FONCIA_USERNAME")
@@ -43,6 +66,8 @@ func main() {
 	}
 
 	switch flag.Arg(0) {
+	case "version":
+		fmt.Println(version)
 	case "serve":
 		if *serveBasePath != "" && !strings.HasPrefix(*serveBasePath, "/") {
 			logutil.Errorf("basepath must start with a slash")
@@ -100,17 +125,18 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 		<thead>
 			<tr>
 				<th>Nom Fournisseur</th>
-				<th>Activité Fournisseur</th>
 				<th>Date</th>
 				<th>Statut</th>
 				<th>Description</th>
 			</tr>
 		</thead>
 		<tbody>
-			{{range .}}
+			{{range .Items}}
 			<tr>
-				<td>{{ .NomFournisseur }}</td>
-				<td>{{ .ActiviteFournisseur }}</td>
+				<td>
+					{{ .NomFournisseur }}
+					<small>({{ .ActiviteFournisseur }})</small>
+				</td>
 				<td>{{.Date}}</td>
 				<td>{{.Statut}}</td>
 				<td>{{.Description}}</td>
@@ -118,6 +144,9 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 			{{end}}
 		</tbody>
 	</table>
+	<div>
+		<small>Version: {{.Version}}</small>
+	</div>
 </body>
 </html>
 `))
@@ -149,7 +178,7 @@ func ServeCmd(serveAddr, basePath, username, password, coproID string) {
 		items, err := GetInterventions(client, coproID)
 		if err != nil {
 			logutil.Errorf("getting interventions: %v", err)
-			http.Error(w, "error", http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("error: %s", err), http.StatusInternalServerError)
 			return
 		}
 
@@ -165,7 +194,11 @@ func ServeCmd(serveAddr, basePath, username, password, coproID string) {
 		}
 
 		w.Header().Set("Content-Type", "text/html")
-		err = tmpl.Execute(w, items)
+
+		err = tmpl.Execute(w, struct {
+			Items   []Intervention
+			Version string
+		}{Items: items, Version: version + " (" + date + ")"})
 		if err != nil {
 			logutil.Errorf("executing template: %v", err)
 			http.Error(w, "error", http.StatusInternalServerError)
