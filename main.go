@@ -19,8 +19,10 @@ import (
 
 var (
 	// EnableDebug enables debug logs.
-	debug    = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
-	basePath = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies.")
+	debug = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
+
+	serveBasePath = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies.")
+	serveAddr     = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
 )
 
 func main() {
@@ -42,7 +44,7 @@ func main() {
 
 	switch flag.Arg(0) {
 	case "serve":
-		ServeCmd(*basePath, username, password, coproID)
+		ServeCmd(*serveAddr, *serveBasePath, username, password, coproID)
 	case "list":
 		ListCmd(username, password, coproID)
 	default:
@@ -116,7 +118,7 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 </html>
 `))
 
-func ServeCmd(basePath, username, password, coproID string) {
+func ServeCmd(serveAddr, basePath, username, password, coproID string) {
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
 
@@ -167,8 +169,8 @@ func ServeCmd(basePath, username, password, coproID string) {
 		}
 	})
 
-	logutil.Infof("Listening on :8080")
-	err := http.ListenAndServe(":8080", nil)
+	logutil.Infof("Listening on %s", serveAddr)
+	err := http.ListenAndServe(serveAddr, nil)
 	if err != nil {
 		logutil.Errorf("while listening: %v", err)
 		os.Exit(1)
