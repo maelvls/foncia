@@ -247,7 +247,7 @@ func ServeCmd(serveAddr, basePath, username, password, coproID string) {
 	}
 }
 
-func ListCmd(username, password, coproID string) {
+func ListCmd(username string, password secret, coproID string) {
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
 
@@ -295,7 +295,17 @@ type Intervention struct {
 	Timestamp           int         `json:"timestamp"`
 }
 
-func Authenticate(client *http.Client, username, password string) error {
+type secret string
+
+func (p secret) String() string {
+	return "[redacted]"
+}
+
+func (p secret) Raw() string {
+	return string(p)
+}
+
+func Authenticate(client *http.Client, username string, password secret) error {
 	// Redirects don't make sense for HTML pages. For example, a 302 redirect
 	// might actually indicate an error.
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
@@ -326,7 +336,7 @@ func Authenticate(client *http.Client, username, password string) error {
 	// The second request is the actual authentication.
 	form := url.Values{}
 	form.Add("username", username)
-	form.Add("_password", password)
+	form.Add("_password", password.Raw())
 	req, err = http.NewRequest("POST", "https://myfoncia.fr/login_check", strings.NewReader(form.Encode()))
 	if err != nil {
 		fmt.Printf("Error creating request: %v", err)
