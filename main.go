@@ -13,9 +13,8 @@ import (
 	"runtime/debug"
 	"strings"
 
-	"github.com/sethgrid/gencurl"
-
 	"github.com/maelvls/foncia/logutil"
+	"github.com/sethgrid/gencurl"
 )
 
 var (
@@ -52,17 +51,7 @@ func main() {
 	flag.Parse()
 	if *debugFlag {
 		logutil.EnableDebug = true
-	}
-	username := os.Getenv("FONCIA_USERNAME")
-	password := os.Getenv("FONCIA_PASSWORD")
-	coproID := os.Getenv("FONCIA_COPRO_ID")
-	if username == "" || password == "" {
-		logutil.Errorf("FONCIA_USERNAME and FONCIA_PASSWORD must be set.")
-		os.Exit(1)
-	}
-	if coproID == "" {
-		logutil.Errorf("FONCIA_COPRO_ID must be set.")
-		os.Exit(1)
+		logutil.Debugf("debug output enabled")
 	}
 
 	switch flag.Arg(0) {
@@ -73,13 +62,31 @@ func main() {
 			logutil.Errorf("basepath must start with a slash")
 			os.Exit(1)
 		}
+		logutil.Infof("version: %s", version)
+		username, password, coproID := getCreds()
 		ServeCmd(*serveAddr, *serveBasePath, username, password, coproID)
 	case "list":
+		username, password, coproID := getCreds()
 		ListCmd(username, password, coproID)
 	default:
 		logutil.Errorf("unknown command %q", flag.Arg(0))
 		os.Exit(1)
 	}
+}
+
+func getCreds() (string, secret, string) {
+	username := os.Getenv("FONCIA_USERNAME")
+	password := secret(os.Getenv("FONCIA_PASSWORD"))
+	coproID := os.Getenv("FONCIA_COPRO_ID")
+	if username == "" || password == "" {
+		logutil.Errorf("FONCIA_USERNAME and FONCIA_PASSWORD must be set.")
+		os.Exit(1)
+	}
+	if coproID == "" {
+		logutil.Errorf("FONCIA_COPRO_ID must be set.")
+		os.Exit(1)
+	}
+	return username, password, coproID
 }
 
 type tmlpData struct {
@@ -177,7 +184,7 @@ var tmlpErr = template.Must(template.New("").Parse(`<!DOCTYPE html>
 </html>
 `))
 
-func ServeCmd(serveAddr, basePath, username, password, coproID string) {
+func ServeCmd(serveAddr, basePath, username string, password secret, coproID string) {
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
 
@@ -325,7 +332,7 @@ func Authenticate(client *http.Client, username string, password secret) error {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", req.Method, req.URL, err)
+		return fmt.Errorf("while performing request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -339,29 +346,41 @@ func Authenticate(client *http.Client, username string, password secret) error {
 	form.Add("_password", password.Raw())
 	req, err = http.NewRequest("POST", "https://myfoncia.fr/login_check", strings.NewReader(form.Encode()))
 	if err != nil {
-		fmt.Printf("Error creating request: %v", err)
+		logutil.Errorf("Error creating request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err = client.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", req.Method, req.URL, err)
+		return fmt.Errorf("while performing request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 302 {
+		logutil.Debugf("authentication: got %d instead of a 302", resp.StatusCode)
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
 		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
 	loc, err := resp.Location()
 	if err != nil {
+		logutil.Debugf("authentication: no Location header found")
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
 		return fmt.Errorf("error getting redirect location: %w", err)
 	}
 	if loc.Path != "/espace-client/espace-de-gestion/mon-bien" {
+		logutil.Debugf("authentication: unexpectedly redirected to %s", loc.String())
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
 		return fmt.Errorf("authentication did not go well (redirected to %s)", loc.String())
 	}
 
 	setCookies := resp.Header.Values("Set-Cookie")
 	if setCookies == nil {
+		logutil.Debugf("authentication: Set-Cookie missing from the response")
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
 		return fmt.Errorf("no Set-Cookie found in the response, the authentication failed")
 	}
 
@@ -467,12 +486,53 @@ func enableDebugCurlLogs(client *http.Client) {
 	client.Transport = transportCurlLogs{trWrapped: client.Transport}
 }
 
+// Only used when --debug is passed.
 type transportCurlLogs struct {
 	trWrapped http.RoundTripper
-	token     string
 }
 
 func (tr transportCurlLogs) RoundTrip(r *http.Request) (*http.Response, error) {
 	logutil.Debugf("%s", gencurl.FromRequest(r))
 	return tr.trWrapped.RoundTrip(r)
 }
+
+// // The original request is not modified. A clone of the request is returned.
+// func redactHeadersAndFormAndCookies(orig *http.Request) *http.Request {
+// 	r := orig.Clone(context.Background())
+//
+// 	// req.Clone does not copy the body, so we need to do it manually.
+// 	if orig.Body != nil {
+// 		bodyBytes, err := io.ReadAll(orig.Body)
+// 		if err != nil {
+// 			logutil.Errorf("redactHeadersAndFormAndCookies: error copying body: %v", err)
+// 		}
+// 		orig.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+// 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+// 	}
+//
+// 	for _, header := range []string{
+// 		"_password",
+// 		"password",
+// 	} {
+// 		v := r.FormValue(header)
+// 		if v == "" {
+// 			continue
+// 		}
+// 		r.Form.Set(header, "*****")
+// 	}
+//
+// 	re := regexp.MustCompile(`(?i)authorization:\s+Bearer\s+\S+`)
+// 	header := r.Header.Get("Authorization")
+// 	if header != "" {
+// 		r.Header.Set("Authorization", re.ReplaceAllString(header, "Authorization: Bearer ********"))
+// 	}
+//
+// 	for _, cookie := range r.Cookies() {
+// 		if cookie.Name == "eZSESSID" {
+// 			cookie.Value = "********"
+// 		}
+// 	}
+//
+// 	return r
+// }
+//
