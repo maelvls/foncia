@@ -82,6 +82,11 @@ func main() {
 	}
 }
 
+type tmlpData struct {
+	Items   []Intervention
+	Version string
+}
+
 var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 <html>
 <head>
@@ -151,6 +156,27 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 </html>
 `))
 
+type tmlpErrData struct {
+	Error   string
+	Version string
+}
+
+var tmlpErr = template.Must(template.New("").Parse(`<!DOCTYPE html>
+<html>
+<head>
+<title>Error</title>
+<meta charset="utf-8">
+</head>
+<body>
+	<h1>Error</h1>
+	<p>{{.Error}}</p>
+	<div>
+		<small>Version: {{.Version}}</small>
+	</div>
+</body>
+</html>
+`))
+
 func ServeCmd(serveAddr, basePath, username, password, coproID string) {
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
@@ -161,7 +187,11 @@ func ServeCmd(serveAddr, basePath, username, password, coproID string) {
 			return
 		}
 
-		w.Write([]byte(fmt.Sprintf("The actual page is %s%s/interventions", r.URL, basePath)))
+		w.WriteHeader(302)
+		tmlpErr.Execute(w, tmlpErrData{
+			Error:   fmt.Sprintf(`The actual page is <a href="%s/interventions">here</a>.`, basePath),
+			Version: version,
+		})
 	})
 
 	http.HandleFunc("/interventions", func(w http.ResponseWriter, r *http.Request) {
@@ -173,34 +203,35 @@ func ServeCmd(serveAddr, basePath, username, password, coproID string) {
 		err := Authenticate(client, username, password)
 		if err != nil {
 			logutil.Errorf("while authenticating: %v", err)
-			http.Error(w, fmt.Sprintf("error while authenticating: %s", err), http.StatusInternalServerError)
+
+			w.WriteHeader(http.StatusInternalServerError)
+			tmlpErr.Execute(w, tmlpErrData{
+				Error:   fmt.Sprintf("Error while authenticating: %s", err),
+				Version: version,
+			})
+
 			return
 		}
 
 		items, err := GetInterventions(client, coproID)
 		if err != nil {
-			logutil.Errorf("getting interventions: %v", err)
-			http.Error(w, fmt.Sprintf("error while listing interventions: %s", err), http.StatusInternalServerError)
-			return
-		}
+			logutil.Errorf("while listing interventions: %v", err)
 
-		if r.Header.Get("Accept") == "application/json" {
-			w.Header().Set("Content-Type", "application/json")
-			err = json.NewEncoder(w).Encode(items)
-			if err != nil {
-				logutil.Errorf("encoding interventions: %v", err)
-				http.Error(w, "error", http.StatusInternalServerError)
-				return
-			}
+			w.WriteHeader(http.StatusInternalServerError)
+			tmlpErr.Execute(w, tmlpErrData{
+				Error:   fmt.Sprintf("Error while listing interventions: %s", err),
+				Version: version,
+			})
+
 			return
 		}
 
 		w.Header().Set("Content-Type", "text/html")
 
-		err = tmpl.Execute(w, struct {
-			Items   []Intervention
-			Version string
-		}{Items: items, Version: version + " (" + date + ")"})
+		err = tmpl.Execute(w, tmlpData{
+			Items:   items,
+			Version: version + " (" + date + ")"},
+		)
 		if err != nil {
 			logutil.Errorf("executing template: %v", err)
 			http.Error(w, "error", http.StatusInternalServerError)
