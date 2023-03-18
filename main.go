@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strings"
 
+	"github.com/dreamscached/minequery/v2"
 	"github.com/maelvls/foncia/logutil"
 	"github.com/sethgrid/gencurl"
 )
@@ -62,12 +63,18 @@ func main() {
 			logutil.Errorf("basepath must start with a slash")
 			os.Exit(1)
 		}
-		logutil.Infof("version: %s", version)
+		logutil.Infof("version: %s (%s)", version, date)
 		username, password, coproID := getCreds()
 		ServeCmd(*serveAddr, *serveBasePath, username, password, coproID)
 	case "list":
 		username, password, coproID := getCreds()
 		ListCmd(username, password, coproID)
+	case "list-mc":
+		res, err := minequery.Ping17("lisa.valais.dev", 25565)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(res)
 	default:
 		logutil.Errorf("unknown command %q", flag.Arg(0))
 		os.Exit(1)
@@ -195,6 +202,7 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 		}
 
 		w.WriteHeader(302)
+		w.Header().Set("Location", basePath+"/interventions")
 		tmlpErr.Execute(w, tmlpErrData{
 			Error:   fmt.Sprintf(`The actual page is <a href="%s/interventions">here</a>.`, basePath),
 			Version: version,
@@ -245,6 +253,8 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 			return
 		}
 	})
+
+	http.HandleFunc("/minecraft", ServeMinecraft)
 
 	logutil.Infof("Listening on %s", serveAddr)
 	err := http.ListenAndServe(serveAddr, nil)
