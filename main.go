@@ -570,8 +570,8 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 		}
 	}
 	type TrusteeCouncil struct {
-		MissionIncidents MissionIncidents
-		Typename         graphql.String `graphql:"__typename"`
+		MissionIncidents MissionIncidents `graphql:"missionIncidents(first: $first, after: $after)"`
+		Typename         graphql.String   `graphql:"__typename"`
 	}
 
 	type CoownerAccount struct {
@@ -593,38 +593,60 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 	// 	TrusteeMember bool   `json:"trusteeMember"`
 	// }
 
-	type EncodedID string
+	// ShurcooL/graphql requires me to define types for anything that is not a
+	// graphql.String, graphql.Int, etc. I also discovered that the cursor
+	// variable needs to be "null" to get the first page. It took me over 2
+	// hours of going over shurcooL/graphql's `writeArgumentType` func to figure
+	// that I shouldn't use "type Cursor *graphql.String", but instead use "type
+	// Cursor graphql.String" and then use a pointer to a Cursor. This library
+	// seems to be the mostly used one, which says a lot about GraphQL's
+	// maturity!
+	type EncodedID graphql.String
+	type Cursor graphql.String
 
 	accountUuid := "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
-	// Set the variables you want to use in the query.
-	variables := map[string]interface{}{
-		"accountUuid": (EncodedID)(accountUuid),
-	}
-
-	q := GetCouncilMissionIncidentsQuery{}
-	err := gqlclient.Query(context.Background(), &q, variables)
-	if err != nil {
-		logutil.Debugf("while querying: %v", err)
-		return nil, fmt.Errorf("error while querying: %w", err)
-	}
 
 	var interventions []Intervention
-	for _, edge := range q.CoownerAccount.TrusteeCouncil.MissionIncidents.Edges {
-		var startedAt time.Time
-		if edge.Node.StartedAt != "" {
-			startedAt, err = time.Parse(time.RFC3339, string(edge.Node.StartedAt))
-			if err != nil {
-				return nil, fmt.Errorf("error parsing time: %w", err)
-			}
+	q := GetCouncilMissionIncidentsQuery{}
+	perPage := 100 // I found that it is the maximum value that works.
+	var cursor *Cursor
+	for {
+		variables := map[string]interface{}{
+			"accountUuid": (EncodedID)(accountUuid),
+			"first":       graphql.Int(perPage),
+			"after":       cursor,
 		}
-		interventions = append(interventions, Intervention{
-			ID:          string(edge.Node.ID),
-			Number:      string(edge.Node.Number),
-			Label:       string(edge.Node.Label),
-			Status:      string(edge.Node.Status),
-			StartedAt:   startedAt,
-			Description: string(edge.Node.Description),
-		})
+
+		err := gqlclient.Query(context.Background(), &q, variables)
+		if err != nil {
+			logutil.Debugf("while querying: %v", err)
+			return nil, fmt.Errorf("error while querying: %w", err)
+		}
+
+		for _, edge := range q.CoownerAccount.TrusteeCouncil.MissionIncidents.Edges {
+			var startedAt time.Time
+			if edge.Node.StartedAt != "" {
+				startedAt, err = time.Parse(time.RFC3339, string(edge.Node.StartedAt))
+				if err != nil {
+					return nil, fmt.Errorf("error parsing time: %w", err)
+				}
+			}
+			interventions = append(interventions, Intervention{
+				ID:          string(edge.Node.ID),
+				Number:      string(edge.Node.Number),
+				Label:       string(edge.Node.Label),
+				Status:      string(edge.Node.Status),
+				StartedAt:   startedAt,
+				Description: string(edge.Node.Description),
+			})
+		}
+
+		if !q.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.HasNextPage {
+			break
+		}
+
+		temp := Cursor(q.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.EndCursor)
+		cursor = &temp
 	}
 
 	return interventions, nil

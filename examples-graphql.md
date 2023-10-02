@@ -57,7 +57,7 @@ curl 'https://myfoncia-gateway.prod.fonciamillenium.net/graphql' \
   }
 
   fragment pageInfo on PageInfo {
-      startCursor
+    startCursor
     endCursor
     hasPreviousPage
     hasNextPage
