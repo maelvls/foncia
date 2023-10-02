@@ -170,7 +170,7 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 				<td>{{ .Number }}</td>
 				<td>{{.Label}}</td>
 				<td>{{.Status}}</td>
-				<td>{{.StartedAt}}</td>
+				<td>{{.StartedAt.Format "02 Jan 2006"}}</td>
 				<td><small>{{.Description}}</small></td>
 			</tr>
 			{{end}}
