@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,10 +13,13 @@ import (
 	"os"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/dreamscached/minequery/v2"
 	"github.com/maelvls/foncia/logutil"
 	"github.com/sethgrid/gencurl"
+	"github.com/shurcooL/graphql"
+	"golang.org/x/oauth2"
 )
 
 var (
@@ -67,8 +71,18 @@ func main() {
 		username, password, coproID := getCreds()
 		ServeCmd(*serveAddr, *serveBasePath, username, password, coproID)
 	case "list":
-		username, password, coproID := getCreds()
-		ListCmd(username, password, coproID)
+		username, password, _ := getCreds()
+		ListCmd(username, password)
+	case "token":
+		username, password, _ := getCreds()
+		client := &http.Client{}
+		enableDebugCurlLogs(client)
+		token, err := Token(client, username, password)
+		if err != nil {
+			logutil.Errorf("while authenticating: %v", err)
+			os.Exit(1)
+		}
+		fmt.Println(token)
 	case "list-mc":
 		res, err := minequery.Ping17("lisa.valais.dev", 25565)
 		if err != nil {
@@ -143,22 +157,19 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 	<table>
 		<thead>
 			<tr>
-				<th>Nom Fournisseur</th>
-				<th>Date</th>
-				<th>Statut</th>
-				<th>Description</th>
+				<th>Number</th>
+				<th>Label</th>
+				<th>Status</th>
+				<th>StartedAt</th>
 			</tr>
 		</thead>
 		<tbody>
 			{{range .Items}}
 			<tr>
-				<td>
-					{{ .NomFournisseur }}
-					<small>({{ .ActiviteFournisseur }})</small>
-				</td>
-				<td>{{.Date}}</td>
-				<td>{{.Statut}}</td>
-				<td>{{.Description}}</td>
+				<td>{{ .Number }}</td>
+				<td>{{.Label}}</td>
+				<td>{{.Status}}</td>
+				<td>{{.StartedAt}}</td>
 			</tr>
 			{{end}}
 		</tbody>
@@ -215,7 +226,12 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 			return
 		}
 
-		err := Authenticate(client, username, password)
+		token, err := Token(client, username, password)
+		client := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
+			&oauth2.Token{AccessToken: token},
+		))
+		enableDebugCurlLogs(client)
+
 		if err != nil {
 			logutil.Errorf("while authenticating: %v", err)
 
@@ -228,7 +244,7 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 			return
 		}
 
-		items, err := GetInterventions(client, coproID)
+		items, err := GetInterventions(client)
 		if err != nil {
 			logutil.Errorf("while listing interventions: %v", err)
 
@@ -264,17 +280,22 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 	}
 }
 
-func ListCmd(username string, password secret, coproID string) {
+func ListCmd(username string, password secret) {
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
 
-	err := Authenticate(client, username, password)
+	token, err := Token(client, username, password)
 	if err != nil {
 		logutil.Errorf("while authenticating: %v", err)
 		os.Exit(1)
 	}
 
-	items, err := GetInterventions(client, coproID)
+	client = oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: token},
+	))
+	enableDebugCurlLogs(client)
+
+	items, err := GetInterventions(client)
 	if err != nil {
 		logutil.Errorf("getting interventions: %v", err)
 		os.Exit(1)
@@ -282,34 +303,67 @@ func ListCmd(username string, password secret, coproID string) {
 
 	// Print the items starting with the oldest one.
 	for i := len(items) - 1; i > 0; i-- {
-		fmt.Printf("%s %s %s %s %s\n",
-			items[i].Date,
-			items[i].ActiviteFournisseur,
-			logutil.Yel(items[i].NomFournisseur),
+		fmt.Printf("%s %s %s\n",
+			items[i].StartedAt,
+			logutil.Yel(items[i].Label),
 			func() string {
-				if items[i].Statut == "V" {
-					return logutil.Green("Terminé")
+				if items[i].Status == "WORK_IN_PROGRESS" {
+					return logutil.Red(items[i].Status)
+				} else {
+					return logutil.Green(items[i].Status)
 				}
-				return logutil.Red("En cours")
 			}(),
-			logutil.Gray(items[i].Description),
 		)
 	}
 }
 
+// Example:
+//
+// {
+//   "data": {
+//     "coownerAccount": {
+//       "uuid": "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9",
+//       "trusteeCouncil": {
+//         "missionIncidents": {
+//           "totalCount": null,
+//           "pageInfo": {
+//             "startCursor": "eyJwYWdlTnVtYmVyIjoxLCJpdGVtc1BlclBhZ2UiOjEwfQ",
+//             "endCursor": "eyJwYWdlTnVtYmVyIjoyLCJpdGVtc1BlclBhZ2UiOjEwfQ",
+//             "hasPreviousPage": false,
+//             "hasNextPage": true,
+//             "pageNumber": 1,
+//             "itemsPerPage": 10,
+//             "totalDisplayPages": 6,
+//             "totalPages": null
+//           },
+//           "edges": [
+//             {
+//               "node": {
+//                 "id": "64850e8019d5d64c415d13dd",
+//                 "number": "7000YRK51",
+//                 "startedAt": "2023-04-24T22:00:00.000Z",
+//                 "label": "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS ",
+//                 "status": "WORK_IN_PROGRESS",
+//                 "__typename": "MissionIncident"
+//               },
+//               "__typename": "MissionIncidentNode"
+//             }
+//           ]
+//         },
+//         "__typename": "TrusteeCouncil"
+//       },
+//       "__typename": "CoownerAccount"
+//     },
+//     "__typename": "Query"
+//   }
+// }
+
 type Intervention struct {
-	ID                  int         `json:"id"`
-	NomFournisseur      string      `json:"nomFournisseur"`
-	ActiviteFournisseur string      `json:"activiteFournisseur"`
-	TelFournisseur      interface{} `json:"telFournisseur"`
-	Date                string      `json:"date"`
-	Description         string      `json:"description"`
-	Statut              string      `json:"statut"`
-	LibelleStatut       interface{} `json:"libelleStatut"`
-	Document            interface{} `json:"document"`
-	MonthYear           string      `json:"monthYear"`
-	MonthYearTs         int         `json:"monthYearTs"`
-	Timestamp           int         `json:"timestamp"`
+	ID        string    // "64850e8019d5d64c415d13dd"
+	Number    string    // "7000YRK51"
+	Label     string    // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
+	Status    string    // "WORK_IN_PROGRESS"
+	StartedAt time.Time // "2023-04-24T22:00:00.000Z"
 }
 
 type secret string
@@ -322,7 +376,14 @@ func (p secret) Raw() string {
 	return string(p)
 }
 
-func Authenticate(client *http.Client, username string, password secret) error {
+// After getting the token, create a client with the following:
+//
+//	client := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
+//	    &oauth2.Token{AccessToken: token},
+//	))
+//
+// The given client isn't mutated.
+func Token(client *http.Client, username string, password secret) (token string, _ error) {
 	// Redirects don't make sense for HTML pages. For example, a 302 redirect
 	// might actually indicate an error.
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
@@ -331,23 +392,23 @@ func Authenticate(client *http.Client, username string, password secret) error {
 
 	jar, err := cookiejar.New(nil)
 	if err != nil {
-		return fmt.Errorf("error creating cookie jar: %w", err)
+		return "", fmt.Errorf("error creating cookie jar: %w", err)
 	}
 	client.Jar = jar
 
 	// A first request is needed to get the session cookie.
 	req, err := http.NewRequest("GET", "https://myfoncia.fr/login", nil)
 	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
+		return "", fmt.Errorf("error creating request: %w", err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("while performing request: %w", err)
+		return "", fmt.Errorf("while performing request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
+		return "", fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
 
 	// The second request is the actual authentication.
@@ -362,7 +423,7 @@ func Authenticate(client *http.Client, username string, password secret) error {
 
 	resp, err = client.Do(req)
 	if err != nil {
-		return fmt.Errorf("while performing request: %w", err)
+		return "", fmt.Errorf("while performing request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -370,51 +431,30 @@ func Authenticate(client *http.Client, username string, password secret) error {
 		logutil.Debugf("authentication: got %d instead of a 302", resp.StatusCode)
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
-		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
+		return "", fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
 	loc, err := resp.Location()
 	if err != nil {
 		logutil.Debugf("authentication: no Location header found")
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
-		return fmt.Errorf("error getting redirect location: %w", err)
+		return "", fmt.Errorf("error getting redirect location: %w", err)
 	}
-	if loc.Path != "/espace-client/espace-de-gestion/mon-bien" {
-		logutil.Debugf("authentication: unexpectedly redirected to %s", loc.String())
+	// The Location header should be:
+	// https://my-foncia.fonciamillenium.net?sso=<jwt>
+	expected := "https://my-foncia.fonciamillenium.net?sso=<jwt>"
+	ssoParam := loc.Query()["sso"]
+	if len(ssoParam) != 1 {
+		logutil.Debugf("authentication: no 'sso' query parameter found in the Location header. Was redirected to %s instead of expected %s", loc.String(), expected)
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
-		return fmt.Errorf("authentication did not go well (redirected to %s)", loc.String())
+		return "", fmt.Errorf("authentication did not go well. No 'sso' query param was found in the Location header. Location header was %s", loc.String())
 	}
-
-	setCookies := resp.Header.Values("Set-Cookie")
-	if setCookies == nil {
-		logutil.Debugf("authentication: Set-Cookie missing from the response")
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
-		return fmt.Errorf("no Set-Cookie found in the response, the authentication failed")
-	}
-
-	// The endpoint returns three cookies. The first eZSESSID doesn't work, so
-	// it needs to be skipped. The second eZSESSID is the one that works. Sample
-	// of the cookies returned:
-	//
-	//  Set-Cookie: eZSESSID=mjcimnin45v5u33061a1mstlr4; path=/; secure; HttpOnly
-	//  Set-Cookie: is_logged_in=true; expires=Sat, 11-Mar-2023 18:20:16 GMT; Max-Age=1800; path=/
-	//  Set-Cookie: eZSESSID=bdrjj36o2okutmmro6vlmkrqo5; path=/; secure; HttpOnly
-
-	// var eZSESSID *http.Cookie
-	// for _, cookie := range resp.Cookies() {
-	// 	if cookie.Name == "eZSESSID" {
-	// 		eZSESSID = cookie
-	// 	}
-	// }
-	// req.AddCookie(eZSESSID)
-
-	logutil.Debugf("Successfully authenticated as %s", username)
-	return nil
+	jwt := ssoParam[0]
+	return jwt, nil
 }
 
-func GetInterventions(client *http.Client, coproID string) ([]Intervention, error) {
+func GetInterventionsOld(client *http.Client, coproID string) ([]Intervention, error) {
 	req, err := http.NewRequest("GET", "https://myfoncia.fr/espace-client/espace-de-gestion/conseil-syndical/interventions/"+coproID, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
@@ -489,6 +529,101 @@ func GetInterventions(client *http.Client, coproID string) ([]Intervention, erro
 	return items, nil
 }
 
+func GetInterventions(client *http.Client) ([]Intervention, error) {
+	gqlclient := graphql.NewClient("https://myfoncia-gateway.prod.fonciamillenium.net/graphql", client)
+
+	type PageOptions struct {
+		// Define the fields of PageOptions here if necessary.
+	}
+
+	type PageInfo struct {
+		StartCursor       graphql.String
+		EndCursor         graphql.String
+		HasPreviousPage   graphql.Boolean
+		HasNextPage       graphql.Boolean
+		PageNumber        graphql.Int
+		ItemsPerPage      graphql.Int
+		TotalDisplayPages graphql.Int
+		TotalPages        graphql.Int
+	}
+
+	type MissionIncident struct {
+		ID        graphql.String
+		Number    graphql.String
+		StartedAt graphql.String
+		Label     graphql.String
+		Status    graphql.String
+		Typename  graphql.String `graphql:"__typename"`
+	}
+
+	type MissionIncidents struct {
+		TotalCount graphql.Int
+		PageInfo   PageInfo
+		Edges      []struct {
+			Node     MissionIncident
+			Typename graphql.String `graphql:"__typename"`
+		}
+	}
+	type TrusteeCouncil struct {
+		MissionIncidents MissionIncidents
+		Typename         graphql.String `graphql:"__typename"`
+	}
+
+	type CoownerAccount struct {
+		UUID           graphql.String
+		TrusteeCouncil TrusteeCouncil
+		Typename       graphql.String `graphql:"__typename"`
+	}
+
+	type GetCouncilMissionIncidentsQuery struct {
+		CoownerAccount CoownerAccount `graphql:"coownerAccount(uuid: $accountUuid)"`
+		Typename       graphql.String `graphql:"__typename"`
+	}
+
+	// type AccountUUID struct {
+	// 	AccountID     string `json:"accountId"`
+	// 	CustomerID    string `json:"customerId"`
+	// 	Quality       string `json:"quality"`
+	// 	BuildingID    string `json:"buildingId"`
+	// 	TrusteeMember bool   `json:"trusteeMember"`
+	// }
+
+	type EncodedID string
+
+	accountUuid := "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
+	// Set the variables you want to use in the query.
+	variables := map[string]interface{}{
+		"accountUuid": (EncodedID)(accountUuid),
+	}
+
+	q := GetCouncilMissionIncidentsQuery{}
+	err := gqlclient.Query(context.Background(), &q, variables)
+	if err != nil {
+		logutil.Debugf("while querying: %v", err)
+		return nil, fmt.Errorf("error while querying: %w", err)
+	}
+
+	var interventions []Intervention
+	for _, edge := range q.CoownerAccount.TrusteeCouncil.MissionIncidents.Edges {
+		var startedAt time.Time
+		if edge.Node.StartedAt != "" {
+			startedAt, err = time.Parse(time.RFC3339, string(edge.Node.StartedAt))
+			if err != nil {
+				return nil, fmt.Errorf("error parsing time: %w", err)
+			}
+		}
+		interventions = append(interventions, Intervention{
+			ID:        string(edge.Node.ID),
+			Number:    string(edge.Node.Number),
+			Label:     string(edge.Node.Label),
+			Status:    string(edge.Node.Status),
+			StartedAt: startedAt,
+		})
+	}
+
+	return interventions, nil
+}
+
 func enableDebugCurlLogs(client *http.Client) {
 	if client.Transport == nil {
 		client.Transport = http.DefaultTransport
@@ -505,44 +640,3 @@ func (tr transportCurlLogs) RoundTrip(r *http.Request) (*http.Response, error) {
 	logutil.Debugf("%s", gencurl.FromRequest(r))
 	return tr.trWrapped.RoundTrip(r)
 }
-
-// // The original request is not modified. A clone of the request is returned.
-// func redactHeadersAndFormAndCookies(orig *http.Request) *http.Request {
-// 	r := orig.Clone(context.Background())
-//
-// 	// req.Clone does not copy the body, so we need to do it manually.
-// 	if orig.Body != nil {
-// 		bodyBytes, err := io.ReadAll(orig.Body)
-// 		if err != nil {
-// 			logutil.Errorf("redactHeadersAndFormAndCookies: error copying body: %v", err)
-// 		}
-// 		orig.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-// 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-// 	}
-//
-// 	for _, header := range []string{
-// 		"_password",
-// 		"password",
-// 	} {
-// 		v := r.FormValue(header)
-// 		if v == "" {
-// 			continue
-// 		}
-// 		r.Form.Set(header, "*****")
-// 	}
-//
-// 	re := regexp.MustCompile(`(?i)authorization:\s+Bearer\s+\S+`)
-// 	header := r.Header.Get("Authorization")
-// 	if header != "" {
-// 		r.Header.Set("Authorization", re.ReplaceAllString(header, "Authorization: Bearer ********"))
-// 	}
-//
-// 	for _, cookie := range r.Cookies() {
-// 		if cookie.Name == "eZSESSID" {
-// 			cookie.Value = "********"
-// 		}
-// 	}
-//
-// 	return r
-// }
-//
