@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 
@@ -158,6 +159,7 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 		<thead>
 			<tr>
 				<th>Number</th>
+				<th>Kind</th>
 				<th>Label</th>
 				<th>Status</th>
 				<th>StartedAt</th>
@@ -168,6 +170,7 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 			{{range .Items}}
 			<tr>
 				<td>{{ .Number }}</td>
+				<td>{{ .Kind }}</td>
 				<td>{{.Label}}</td>
 				<td>{{.Status}}</td>
 				<td>{{.StartedAt.Format "02 Jan 2006"}}</td>
@@ -305,8 +308,9 @@ func ListCmd(username string, password secret) {
 
 	// Print the items starting with the oldest one.
 	for i := len(items) - 1; i > 0; i-- {
-		fmt.Printf("%s %s %s %s\n",
-			items[i].StartedAt,
+		fmt.Printf("%s %s %s %s %s\n",
+			items[i].StartedAt.Format("02 Jan 2006"),
+			logutil.Bold(string(items[i].Kind)),
 			logutil.Yel(items[i].Label),
 			func() string {
 				if items[i].Status == "WORK_IN_PROGRESS" {
@@ -362,13 +366,21 @@ func ListCmd(username string, password secret) {
 // }
 
 type Intervention struct {
-	ID          string    // "64850e8019d5d64c415d13dd"
-	Number      string    // "7000YRK51"
-	Label       string    // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
-	Status      string    // "WORK_IN_PROGRESS"
-	StartedAt   time.Time // "2023-04-24T22:00:00.000Z"
-	Description string    // "BONJOUR,\n\nVEUILLEZ ENREGISTER LE C02\t\nMERCI CORDIALEMENT"
+	ID          string           // "64850e8019d5d64c415d13dd"
+	Number      string           // "7000YRK51"
+	Label       string           // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
+	Status      string           // "WORK_IN_PROGRESS"
+	StartedAt   time.Time        // "2023-04-24T22:00:00.000Z"
+	Description string           // "BONJOUR,\n\nVEUILLEZ ENREGISTER LE C02\t\nMERCI CORDIALEMENT"
+	Kind        InterventionKind // "Incident" | "Repair"
 }
+
+type InterventionKind string
+
+var (
+	Incident InterventionKind = "Incident"
+	Repair   InterventionKind = "Repair"
+)
 
 type secret string
 
@@ -533,6 +545,62 @@ func GetInterventionsOld(client *http.Client, coproID string) ([]Intervention, e
 	return items, nil
 }
 
+// Repairs.
+//
+// Example:
+//  {
+//    "query": "query getCouncilMissionRepairs($accountUuid: EncodedID!, $first: Int, $after: Cursor) {
+// 	  coownerAccount(uuid: $accountUuid) {
+// 	    uuid
+// 	    trusteeCouncil {
+// 	      missionRepairs(first: $first, after: $after) {
+// 	        totalCount
+// 	        pageInfo {
+// 	          ...pageInfo
+// 	          __typename
+// 	        }
+//         edges {
+// 	          node {
+// 	            ...missionRepair
+// 	            __typename
+// 	          }
+//           __typename
+//         }
+//         __typename
+//       }
+//       __typename
+//     }
+//     __typename
+//   }
+// }
+//
+// fragment pageInfo on PageInfo {
+// 	  startCursor
+// 	  endCursor
+// 	  hasPreviousPage
+// 	  hasNextPage
+// 	  pageNumber
+// 	  itemsPerPage
+// 	  totalDisplayPages
+// 	  totalPages
+// 	  __typename
+// 	}
+//
+// fragment missionRepair on MissionRepair {
+// 	  id
+// 	  number
+// 	  startedAt
+// 	  label
+// 	  status
+// 	  __typename
+// 	}",
+//   "variables": {
+//     "accountUuid": "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
+//   },
+//   "operationName": "getCouncilMissionRepairs"
+// }
+
+// Incidents.
 func GetInterventions(client *http.Client) ([]Intervention, error) {
 	gqlclient := graphql.NewClient("https://myfoncia-gateway.prod.fonciamillenium.net/graphql", client)
 
@@ -551,38 +619,38 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 		TotalPages        graphql.Int
 	}
 
-	type MissionIncident struct {
-		ID          graphql.String
-		Number      graphql.String
-		StartedAt   graphql.String
-		Label       graphql.String
-		Status      graphql.String
-		Description graphql.String
-		Typename    graphql.String `graphql:"__typename"`
-	}
-
 	type MissionIncidents struct {
 		TotalCount graphql.Int
 		PageInfo   PageInfo
 		Edges      []struct {
-			Node     MissionIncident
+			Node struct {
+				ID          graphql.String
+				Number      graphql.String
+				StartedAt   graphql.String
+				Label       graphql.String
+				Status      graphql.String
+				Description graphql.String
+				Typename    graphql.String `graphql:"__typename"`
+			} `graphql:"node"`
 			Typename graphql.String `graphql:"__typename"`
 		}
 	}
-	type TrusteeCouncil struct {
-		MissionIncidents MissionIncidents `graphql:"missionIncidents(first: $first, after: $after)"`
-		Typename         graphql.String   `graphql:"__typename"`
-	}
 
-	type CoownerAccount struct {
-		UUID           graphql.String
-		TrusteeCouncil TrusteeCouncil
-		Typename       graphql.String `graphql:"__typename"`
-	}
-
-	type GetCouncilMissionIncidentsQuery struct {
-		CoownerAccount CoownerAccount `graphql:"coownerAccount(uuid: $accountUuid)"`
-		Typename       graphql.String `graphql:"__typename"`
+	type MissionRepairs struct {
+		TotalCount graphql.Int
+		PageInfo   PageInfo
+		Edges      []struct {
+			Node struct {
+				ID          graphql.String
+				Number      graphql.String
+				StartedAt   graphql.String
+				Label       graphql.String
+				Status      graphql.String
+				Description graphql.String
+				Typename    graphql.String `graphql:"__typename"`
+			} `graphql:"node"`
+			Typename graphql.String `graphql:"__typename"`
+		}
 	}
 
 	// type AccountUUID struct {
@@ -607,7 +675,18 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 	accountUuid := "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
 
 	var interventions []Intervention
-	q := GetCouncilMissionIncidentsQuery{}
+
+	q := struct {
+		CoownerAccount struct {
+			UUID           graphql.String
+			TrusteeCouncil struct {
+				MissionIncidents MissionIncidents `graphql:"missionIncidents(first: $first, after: $after)"`
+				Typename         graphql.String   `graphql:"__typename"`
+			}
+			Typename graphql.String `graphql:"__typename"`
+		} `graphql:"coownerAccount(uuid: $accountUuid)"`
+		Typename graphql.String `graphql:"__typename"`
+	}{}
 	perPage := 100 // I found that it is the maximum value that works.
 	var cursor *Cursor
 	for {
@@ -638,6 +717,7 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 				Status:      string(edge.Node.Status),
 				StartedAt:   startedAt,
 				Description: string(edge.Node.Description),
+				Kind:        Incident,
 			})
 		}
 
@@ -648,6 +728,59 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 		temp := Cursor(q.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.EndCursor)
 		cursor = &temp
 	}
+
+	q2 := struct {
+		CoownerAccount struct {
+			UUID           graphql.String
+			TrusteeCouncil struct {
+				MissionRepairs MissionRepairs `graphql:"missionRepairs(first: $first, after: $after)"`
+			}
+			Typename graphql.String `graphql:"__typename"`
+		} `graphql:"coownerAccount(uuid: $accountUuid)"`
+	}{}
+	for {
+		variables := map[string]interface{}{
+			"accountUuid": (EncodedID)(accountUuid),
+			"first":       graphql.Int(perPage),
+			"after":       cursor,
+		}
+
+		err := gqlclient.Query(context.Background(), &q2, variables)
+		if err != nil {
+			logutil.Debugf("while querying: %v", err)
+			return nil, fmt.Errorf("error while querying: %w", err)
+		}
+
+		for _, edge := range q2.CoownerAccount.TrusteeCouncil.MissionRepairs.Edges {
+			var startedAt time.Time
+			if edge.Node.StartedAt != "" {
+				startedAt, err = time.Parse(time.RFC3339, string(edge.Node.StartedAt))
+				if err != nil {
+					return nil, fmt.Errorf("error parsing time: %w", err)
+				}
+			}
+			interventions = append(interventions, Intervention{
+				ID:          string(edge.Node.ID),
+				Number:      string(edge.Node.Number),
+				Label:       string(edge.Node.Label),
+				Status:      string(edge.Node.Status),
+				StartedAt:   startedAt,
+				Description: string(edge.Node.Description),
+				Kind:        Repair,
+			})
+		}
+
+		if !q2.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.HasNextPage {
+			break
+		}
+
+		temp := Cursor(q2.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.EndCursor)
+		cursor = &temp
+	}
+
+	sort.Slice(interventions, func(i, j int) bool {
+		return interventions[i].StartedAt.After(interventions[j].StartedAt)
+	})
 
 	return interventions, nil
 }
