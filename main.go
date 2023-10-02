@@ -738,6 +738,7 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 			Typename graphql.String `graphql:"__typename"`
 		} `graphql:"coownerAccount(uuid: $accountUuid)"`
 	}{}
+	cursor = nil
 	for {
 		variables := map[string]interface{}{
 			"accountUuid": (EncodedID)(accountUuid),
