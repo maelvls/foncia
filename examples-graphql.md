@@ -3,7 +3,8 @@ With `graphqurl` (install it with `brew`):
 
 ```bash
 export TOKEN=$(foncia token)
-gq http://localhost:9090 -H "Authorization: bearer $TOKEN" -q 'query foo($accountUuid: EncodedID!) {
+mitmproxy --mode reverse:https://myfoncia-gateway.prod.fonciamillenium.net
+gq http://localhost:8080/graphql -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -q 'query foo($accountUuid: EncodedID!) {
   coownerAccount(uuid: $accountUuid) {
     trusteeCouncil {
       missionIncidents {
@@ -15,6 +16,7 @@ gq http://localhost:9090 -H "Authorization: bearer $TOKEN" -q 'query foo($accoun
               startedAt
               label
               status
+              description
             }
           }
         }

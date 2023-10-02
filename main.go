@@ -161,6 +161,7 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 				<th>Label</th>
 				<th>Status</th>
 				<th>StartedAt</th>
+				<th>Description</th>
 			</tr>
 		</thead>
 		<tbody>
@@ -170,6 +171,7 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 				<td>{{.Label}}</td>
 				<td>{{.Status}}</td>
 				<td>{{.StartedAt}}</td>
+				<td><small>{{.Description}}</small></td>
 			</tr>
 			{{end}}
 		</tbody>
@@ -303,7 +305,7 @@ func ListCmd(username string, password secret) {
 
 	// Print the items starting with the oldest one.
 	for i := len(items) - 1; i > 0; i-- {
-		fmt.Printf("%s %s %s\n",
+		fmt.Printf("%s %s %s %s\n",
 			items[i].StartedAt,
 			logutil.Yel(items[i].Label),
 			func() string {
@@ -313,6 +315,7 @@ func ListCmd(username string, password secret) {
 					return logutil.Green(items[i].Status)
 				}
 			}(),
+			logutil.Gray(items[i].Description),
 		)
 	}
 }
@@ -359,11 +362,12 @@ func ListCmd(username string, password secret) {
 // }
 
 type Intervention struct {
-	ID        string    // "64850e8019d5d64c415d13dd"
-	Number    string    // "7000YRK51"
-	Label     string    // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
-	Status    string    // "WORK_IN_PROGRESS"
-	StartedAt time.Time // "2023-04-24T22:00:00.000Z"
+	ID          string    // "64850e8019d5d64c415d13dd"
+	Number      string    // "7000YRK51"
+	Label       string    // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
+	Status      string    // "WORK_IN_PROGRESS"
+	StartedAt   time.Time // "2023-04-24T22:00:00.000Z"
+	Description string    // "BONJOUR,\n\nVEUILLEZ ENREGISTER LE C02\t\nMERCI CORDIALEMENT"
 }
 
 type secret string
@@ -548,12 +552,13 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 	}
 
 	type MissionIncident struct {
-		ID        graphql.String
-		Number    graphql.String
-		StartedAt graphql.String
-		Label     graphql.String
-		Status    graphql.String
-		Typename  graphql.String `graphql:"__typename"`
+		ID          graphql.String
+		Number      graphql.String
+		StartedAt   graphql.String
+		Label       graphql.String
+		Status      graphql.String
+		Description graphql.String
+		Typename    graphql.String `graphql:"__typename"`
 	}
 
 	type MissionIncidents struct {
@@ -613,11 +618,12 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 			}
 		}
 		interventions = append(interventions, Intervention{
-			ID:        string(edge.Node.ID),
-			Number:    string(edge.Node.Number),
-			Label:     string(edge.Node.Label),
-			Status:    string(edge.Node.Status),
-			StartedAt: startedAt,
+			ID:          string(edge.Node.ID),
+			Number:      string(edge.Node.Number),
+			Label:       string(edge.Node.Label),
+			Status:      string(edge.Node.Status),
+			StartedAt:   startedAt,
+			Description: string(edge.Node.Description),
 		})
 	}
 
