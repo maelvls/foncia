@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/dreamscached/minequery/v2"
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/maelvls/foncia/logutil"
 	"github.com/sethgrid/gencurl"
 	"github.com/shurcooL/graphql"
@@ -27,8 +29,9 @@ var (
 	// EnableDebug enables debugFlag logs.
 	debugFlag = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
 
-	serveBasePath = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
-	serveAddr     = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
+	serveBasePath       = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
+	serveAddr           = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
+	saveBetweenRestarts = flag.Bool("save-between-restarts", false, "Save the data between restarts.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
 )
@@ -90,6 +93,8 @@ func main() {
 			panic(err)
 		}
 		fmt.Println(res)
+	case "":
+		logutil.Errorf("no command given. Use one of: serve, list, token, list-mc, version")
 	default:
 		logutil.Errorf("unknown command %q", flag.Arg(0))
 		os.Exit(1)
@@ -211,6 +216,11 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
 
+	// Create schema.
+	// number = Foncia's ID for the intervention.
+	// Get the interventions from the database.
+	err := getInterventions()
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -278,11 +288,60 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 	http.HandleFunc("/minecraft", ServeMinecraft)
 
 	logutil.Infof("Listening on %s", serveAddr)
-	err := http.ListenAndServe(serveAddr, nil)
+	err = http.ListenAndServe(serveAddr, nil)
 	if err != nil {
 		logutil.Errorf("while listening: %v", err)
 		os.Exit(1)
 	}
+}
+
+// Unused for now.
+func getInterventions() error {
+	sqlitePath := "foncia.db"
+	if !*saveBetweenRestarts {
+		logutil.Infof("saving data between restarts")
+	} else {
+		logutil.Infof("not saving data between restarts")
+		sqlitePath = ":memory:"
+	}
+
+	db, err := sql.Open("sqlite", sqlitePath)
+	if err != nil {
+		return fmt.Errorf("while opening SQLite database: %v", err)
+	}
+
+	_, err = db.Exec(`
+		create table if not exists interventions (
+			id text primary key,
+			number integer,
+			kind text,
+			label text,
+			status text,
+			started_at text,
+			description text
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("while creating schema: %v", err)
+	}
+
+	rows, err := db.Query("select id, number, kind, label, status, started_at, description from interventions")
+	if err != nil {
+		return fmt.Errorf("while querying database: %v", err)
+	}
+	defer rows.Close()
+
+	var items []Intervention
+	for rows.Next() {
+		var i Intervention
+		err = rows.Scan(&i.ID, &i.Number, &i.Kind, &i.Label, &i.Status, &i.StartedAt, &i.Description)
+		if err != nil {
+			return fmt.Errorf("while scanning row: %v", err)
+		}
+		items = append(items, i)
+	}
+
+	return nil
 }
 
 func ListCmd(username string, password secret) {
