@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dreamscached/minequery/v2"
@@ -32,6 +34,8 @@ var (
 	serveBasePath       = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
 	serveAddr           = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
 	saveBetweenRestarts = flag.Bool("save-between-restarts", false, "Save the data between restarts.")
+	dbPath              = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
+	ntfyTopic           = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
 )
@@ -72,13 +76,75 @@ func main() {
 			os.Exit(1)
 		}
 		logutil.Infof("version: %s (%s)", version, date)
-		username, password, coproID := getCreds()
-		ServeCmd(*serveAddr, *serveBasePath, username, password, coproID)
+		username, password := getCreds()
+
+		path := *dbPath
+
+		err := createDB(context.Background(), path)
+		if err != nil {
+			logutil.Errorf("while creating schema: %v", err)
+			os.Exit(1)
+		}
+
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			logutil.Errorf("while opening database: %v", err)
+			os.Exit(1)
+		}
+
+		m := sync.RWMutex{}
+		lastSyncErr := error(nil)
+		lastSync := time.Time{}
+
+		writeLastSync := func(err error) {
+			m.Lock()
+			lastSyncErr = err
+			lastSync = time.Now()
+			m.Unlock()
+		}
+		readLastSync := func() (time.Time, error) {
+			m.RLock()
+			defer m.RUnlock()
+			return lastSync, lastSyncErr
+		}
+
+		go func() {
+			items, err := authFetchSave(&http.Client{}, username, password, db)
+			writeLastSync(err)
+			if err != nil {
+				logutil.Errorf("initial fetch: %v", err)
+			}
+			logutil.Debugf("initial fetch: %d new items", len(items))
+
+			for {
+				time.Sleep(10 * time.Minute)
+
+				logutil.Debugf("updating database by fetching from live")
+				newEntries, err := authFetchSave(&http.Client{}, username, password, db)
+				writeLastSync(err)
+				if err != nil {
+					logutil.Errorf("while fetching and updating database: %v", err)
+				}
+				logutil.Debugf("found %d new items", len(newEntries))
+				if len(newEntries) > 0 {
+					for _, e := range newEntries {
+						logutil.Infof("new: %s", e.Label)
+						err := ntfy(*ntfyTopic, fmt.Sprintf("%s: %s", e.Label, e.Description))
+						if err != nil {
+							logutil.Errorf("while sending notification: %v", err)
+							writeLastSync(err)
+						}
+					}
+				}
+			}
+		}()
+
+		ServeCmd(db, *serveAddr, *serveBasePath, username, password, readLastSync)
 	case "list":
-		username, password, _ := getCreds()
+		username, password := getCreds()
 		ListCmd(username, password)
 	case "token":
-		username, password, _ := getCreds()
+		username, password := getCreds()
 		client := &http.Client{}
 		enableDebugCurlLogs(client)
 		token, err := Token(client, username, password)
@@ -101,24 +167,33 @@ func main() {
 	}
 }
 
-func getCreds() (string, secret, string) {
+// Returns the new entries found.
+func authFetchSave(c *http.Client, username string, password secret, db *sql.DB) ([]Intervention, error) {
+	cl, err := authenticatedClient(c, username, password)
+	if err != nil {
+		return nil, fmt.Errorf("while authenticating: %v", err)
+	}
+	newEntries, err := getInterventionsAndSave(context.Background(), cl, db)
+	if err != nil {
+		return nil, fmt.Errorf("while saving to database: %v", err)
+	}
+	return newEntries, nil
+}
+
+func getCreds() (string, secret) {
 	username := os.Getenv("FONCIA_USERNAME")
 	password := secret(os.Getenv("FONCIA_PASSWORD"))
-	coproID := os.Getenv("FONCIA_COPRO_ID")
 	if username == "" || password == "" {
 		logutil.Errorf("FONCIA_USERNAME and FONCIA_PASSWORD must be set.")
 		os.Exit(1)
 	}
-	if coproID == "" {
-		logutil.Errorf("FONCIA_COPRO_ID must be set.")
-		os.Exit(1)
-	}
-	return username, password, coproID
+	return username, password
 }
 
 type tmlpData struct {
-	Items   []Intervention
-	Version string
+	SyncStatus string
+	Items      []Intervention
+	Version    string
 }
 
 var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
@@ -160,6 +235,8 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 	</style>
 </head>
 <body>
+	<h1>Interventions</h1>
+	<p>{{.SyncStatus}}</p>
 	<table>
 		<thead>
 			<tr>
@@ -212,16 +289,41 @@ var tmlpErr = template.Must(template.New("").Parse(`<!DOCTYPE html>
 </html>
 `))
 
-func ServeCmd(serveAddr, basePath, username string, password secret, coproID string) {
+func createDB(ctx context.Context, path string) error {
+	if path == "" {
+		return fmt.Errorf("missing required value: path")
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return fmt.Errorf("failed to open database at %q: %w", path, err)
+	}
+
+	defer db.Close()
+
+	// number = Foncia's ID for the intervention.
+	if _, err = db.ExecContext(ctx, `
+		create table IF NOT EXISTS entries (
+			id TEXT UNIQUE,
+			number INTEGER,
+			kind TEXT,
+			label TEXT,
+			status TEXT,
+			started_at TEXT,
+			description TEXT
+		);`); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret, lastSync func() (time.Time, error)) {
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
 
-	// Create schema.
-	// number = Foncia's ID for the intervention.
-	// Get the interventions from the database.
-	err := getInterventions()
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -235,31 +337,13 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 		})
 	})
 
-	http.HandleFunc("/interventions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/interventions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		token, err := Token(client, username, password)
-		client := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
-			&oauth2.Token{AccessToken: token},
-		))
-		enableDebugCurlLogs(client)
-
-		if err != nil {
-			logutil.Errorf("while authenticating: %v", err)
-
-			w.WriteHeader(http.StatusInternalServerError)
-			tmlpErr.Execute(w, tmlpErrData{
-				Error:   fmt.Sprintf("Error while authenticating: %s", err),
-				Version: version,
-			})
-
-			return
-		}
-
-		items, err := GetInterventions(client)
+		items, err := getInterventionsDB(context.Background(), db)
 		if err != nil {
 			logutil.Errorf("while listing interventions: %v", err)
 
@@ -274,9 +358,21 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 
 		w.Header().Set("Content-Type", "text/html")
 
+		var statusMsg string
+		when, err := lastSync()
+		switch {
+		case when.IsZero():
+			statusMsg = "No sync has been done yet."
+		case err != nil:
+			statusMsg = fmt.Sprintf("Last sync failed %s ago: %v", time.Since(when).Truncate(time.Second), err)
+		default:
+			statusMsg = fmt.Sprintf("Last sync succeeded %s ago", time.Since(when).Truncate(time.Second))
+		}
+
 		err = tmpl.Execute(w, tmlpData{
-			Items:   items,
-			Version: version + " (" + date + ")"},
+			SyncStatus: statusMsg,
+			Items:      items,
+			Version:    version + " (" + date + ")"},
 		)
 		if err != nil {
 			logutil.Errorf("executing template: %v", err)
@@ -285,67 +381,101 @@ func ServeCmd(serveAddr, basePath, username string, password secret, coproID str
 		}
 	})
 
-	http.HandleFunc("/minecraft", ServeMinecraft)
+	mux.HandleFunc("/minecraft", ServeMinecraft)
 
-	logutil.Infof("Listening on %s", serveAddr)
-	err = http.ListenAndServe(serveAddr, nil)
+	listner, err := net.Listen("tcp", serveAddr)
+	if err != nil {
+		logutil.Errorf("while listening: %v", err)
+		os.Exit(1)
+	}
+	logutil.Infof("listening on http://%v/interventions", listner.Addr())
+
+	err = http.Serve(listner, mux)
 	if err != nil {
 		logutil.Errorf("while listening: %v", err)
 		os.Exit(1)
 	}
 }
 
-// Unused for now.
-func getInterventions() error {
-	sqlitePath := "foncia.db"
-	if !*saveBetweenRestarts {
-		logutil.Infof("saving data between restarts")
-	} else {
-		logutil.Infof("not saving data between restarts")
-		sqlitePath = ":memory:"
+// This function comes from an MIT-licensed project from github.com/SgtCoDFish.
+func ntfy(topic, message string) error {
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	ntfyMessage := strings.NewReader(
+		fmt.Sprintf("%s", message),
+	)
+
+	_, err := client.Post(fmt.Sprintf("https://ntfy.sh/%s", topic), "text/plain", ntfyMessage)
+	return err
+}
+
+// Returns the new item.
+func getInterventionsAndSave(ctx context.Context, client *http.Client, db *sql.DB) (newOnes []Intervention, _ error) {
+	uuid, err := GetAccountUUID(client)
+	if err != nil {
+		return nil, fmt.Errorf("while getting account UUID: %v", err)
+	}
+	items, err := getInterventionsLive(client, uuid)
+	if err != nil {
+		return nil, fmt.Errorf("while getting interventions: %v", err)
 	}
 
-	db, err := sql.Open("sqlite", sqlitePath)
+	existingItems, err := getInterventionsDB(ctx, db)
 	if err != nil {
-		return fmt.Errorf("while opening SQLite database: %v", err)
+		return nil, fmt.Errorf("while getting existing items: %v", err)
+	}
+	exists := make(map[string]struct{})
+	for _, i := range existingItems {
+		exists[i.ID] = struct{}{}
 	}
 
-	_, err = db.Exec(`
-		create table if not exists interventions (
-			id text primary key,
-			number integer,
-			kind text,
-			label text,
-			status text,
-			started_at text,
-			description text
-		);
-	`)
-	if err != nil {
-		return fmt.Errorf("while creating schema: %v", err)
+	// Save the missing items in the database.
+	var newEntries []Intervention
+	for _, i := range items {
+		if _, ok := exists[i.ID]; ok {
+			continue
+		}
+
+		logutil.Debugf("found new item %q", i.ID)
+		_, err := db.ExecContext(ctx, "insert into entries (id, number, kind, label, status, started_at, description) values (?, ?, ?, ?, ?, ?, ?)",
+			i.ID, i.Number, i.Kind, i.Label, i.Status, i.StartedAt, i.Description)
+		if err != nil {
+			return nil, fmt.Errorf("while inserting row: %v", err)
+		}
+		newEntries = append(newEntries, i)
 	}
 
-	rows, err := db.Query("select id, number, kind, label, status, started_at, description from interventions")
+	return newEntries, nil
+}
+
+func getInterventionsDB(_ context.Context, db *sql.DB) ([]Intervention, error) {
+	rows, err := db.Query("select id, number, kind, label, status, started_at, description from entries")
 	if err != nil {
-		return fmt.Errorf("while querying database: %v", err)
+		return nil, fmt.Errorf("while querying database: %v", err)
 	}
 	defer rows.Close()
 
 	var items []Intervention
 	for rows.Next() {
 		var i Intervention
-		err = rows.Scan(&i.ID, &i.Number, &i.Kind, &i.Label, &i.Status, &i.StartedAt, &i.Description)
+		var startedAt string
+		err = rows.Scan(&i.ID, &i.Number, &i.Kind, &i.Label, &i.Status, &startedAt, &i.Description)
 		if err != nil {
-			return fmt.Errorf("while scanning row: %v", err)
+			return nil, fmt.Errorf("while scanning row: %v", err)
+		}
+
+		// Format: "2006-01-02 15:04:05.999Z07:00"
+		i.StartedAt, err = time.Parse("2006-01-02 15:04:05.999Z07:00", startedAt)
+		if err != nil {
+			return nil, fmt.Errorf("while parsing 'started_at': %v", err)
 		}
 		items = append(items, i)
 	}
 
-	return nil
+	return items, nil
 }
 
-func ListCmd(username string, password secret) {
-	client := &http.Client{}
+func authenticatedClient(client *http.Client, username string, password secret) (*http.Client, error) {
 	enableDebugCurlLogs(client)
 
 	token, err := Token(client, username, password)
@@ -359,7 +489,23 @@ func ListCmd(username string, password secret) {
 	))
 	enableDebugCurlLogs(client)
 
-	items, err := GetInterventions(client)
+	return client, nil
+}
+
+func ListCmd(username string, password secret) {
+	client, err := authenticatedClient(&http.Client{}, username, password)
+	if err != nil {
+		logutil.Errorf("while authenticating: %v", err)
+		os.Exit(1)
+	}
+
+	accUUID, err := GetAccountUUID(client)
+	if err != nil {
+		logutil.Errorf("while getting account UUID: %v", err)
+		os.Exit(1)
+	}
+
+	items, err := getInterventionsLive(client, accUUID)
 	if err != nil {
 		logutil.Errorf("getting interventions: %v", err)
 		os.Exit(1)
@@ -526,9 +672,11 @@ func Token(client *http.Client, username string, password secret) (token string,
 		return "", fmt.Errorf("authentication did not go well. No 'sso' query param was found in the Location header. Location header was %s", loc.String())
 	}
 	jwt := ssoParam[0]
+	logutil.Debugf("authentication: got jwt %q", jwt)
 	return jwt, nil
 }
 
+// DO NOT USE. This function is kept for historical reasons.
 func GetInterventionsOld(client *http.Client, coproID string) ([]Intervention, error) {
 	req, err := http.NewRequest("GET", "https://myfoncia.fr/espace-client/espace-de-gestion/conseil-syndical/interventions/"+coproID, nil)
 	if err != nil {
@@ -604,6 +752,196 @@ func GetInterventionsOld(client *http.Client, coproID string) ([]Intervention, e
 	return items, nil
 }
 
+// The accountUUID is the base 64 encoded ID of the account. For example:
+//
+//  "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
+//
+// which decodes to:
+//
+//  {"accountId":"64850e80b3b2947c6cfbd608","customerId":"64850e8036ccdc2407baecd4","quality":"CO_OWNER","buildingId":"64850e80a4ccb95ce4b6b115","trusteeMember":true}
+//
+// To know what the accountUUID is, the query is:
+//
+//  query getAccounts {
+//    accounts {
+//      ...basicAccount
+//      __typename
+//    }
+//  }
+//
+//  fragment basicAccount on Account {
+//    uuid
+//    number
+//    quality
+//    count {
+//      units
+//      buildings
+//      __typename
+//    }
+//    manager {
+//      id
+//      __typename
+//    }
+//    customer {
+//      ...customer
+//      __typename
+//    }
+//    hasRestrictedAccess
+//    ... on CoownerAccount {
+//      building {
+//        ...basicBuilding
+//        __typename
+//      }
+//      isTrusteeCouncilMember
+//      hasActiveCoOwnershipMandate
+//      showDalenysHeadband
+//      eReco {
+//        isSubscribed
+//        hasHistory
+//        __typename
+//      }
+//      hasEReleve
+//      hasAccessToGeneralAssembly
+//      __typename
+//    }
+//    ... on TenantAccount {
+//      hasFutureLeaseEntryDate
+//      building {
+//        ...basicBuilding
+//        __typename
+//      }
+//      __typename
+//    }
+//    ... on LandlordAccount {
+//      buildings {
+//        ...basicBuilding
+//        __typename
+//      }
+//      __typename
+//    }
+//    __typename
+//  }
+//
+//  fragment customer on Customer {
+//    id
+//    number
+//    civility
+//    familyStatus
+//    firstName
+//    lastName
+//    email
+//    address {
+//      ...address
+//      __typename
+//    }
+//    birthDate
+//    phones {
+//      landline
+//      mobile
+//      __typename
+//    }
+//    noSnailMail
+//    contactPreferences {
+//      eventNotification {
+//        sms
+//        email
+//        postalMail
+//        __typename
+//      }
+//      litigationPrevention {
+//        sms
+//        email
+//        postalMail
+//        __typename
+//      }
+//      privilegedOffers {
+//        sms
+//        email
+//        postalMail
+//        __typename
+//      }
+//      myFonciaNews {
+//        sms
+//        email
+//        postalMail
+//        __typename
+//      }
+//      newsLetter {
+//        sms
+//        email
+//        postalMail
+//        __typename
+//      }
+//      __typename
+//    }
+//    confidentiality {
+//      personalData
+//      isFirstSubmit
+//      partnersOffersInformation
+//      offersInformation
+//      __typename
+//    }
+//    company {
+//      name
+//      siret
+//      address {
+//        ...address
+//        __typename
+//      }
+//      __typename
+//    }
+//    __typename
+//  }
+//
+//  fragment address on Address {
+//    address1
+//    address2
+//    city
+//    zipCode
+//    countryCode
+//    __typename
+//  }
+//
+//  fragment basicBuilding on Building {
+//    id
+//    name
+//    number
+//    address {
+//      ...address
+//      __typename
+//    }
+//    units {
+//      id
+//      __typename
+//    }
+//    __typename
+//  }
+
+// I copy-pasted the graphql query from the "Dev tools" in Chrome, and asked
+// ChatGPT to turn that query into Go.
+func GetAccountUUID(client *http.Client) (string, error) {
+	gqlclient := graphql.NewClient("https://myfoncia-gateway.prod.fonciamillenium.net/graphql", client)
+
+	type Account struct {
+		UUID string `graphql:"uuid"`
+	}
+
+	q := struct {
+		Accounts []Account `graphql:"accounts"`
+	}{}
+
+	err := gqlclient.Query(context.Background(), &q, nil)
+	if err != nil {
+		return "", fmt.Errorf("error while querying: %w", err)
+	}
+
+	if len(q.Accounts) == 0 {
+		return "", fmt.Errorf("no accounts found")
+	}
+
+	return q.Accounts[0].UUID, nil
+}
+
 // Repairs.
 //
 // Example:
@@ -660,7 +998,7 @@ func GetInterventionsOld(client *http.Client, coproID string) ([]Intervention, e
 // }
 
 // Incidents.
-func GetInterventions(client *http.Client) ([]Intervention, error) {
+func getInterventionsLive(client *http.Client, accountUUID string) ([]Intervention, error) {
 	gqlclient := graphql.NewClient("https://myfoncia-gateway.prod.fonciamillenium.net/graphql", client)
 
 	type PageOptions struct {
@@ -689,9 +1027,7 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 				Label       graphql.String
 				Status      graphql.String
 				Description graphql.String
-				Typename    graphql.String `graphql:"__typename"`
 			} `graphql:"node"`
-			Typename graphql.String `graphql:"__typename"`
 		}
 	}
 
@@ -706,19 +1042,9 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 				Label       graphql.String
 				Status      graphql.String
 				Description graphql.String
-				Typename    graphql.String `graphql:"__typename"`
 			} `graphql:"node"`
-			Typename graphql.String `graphql:"__typename"`
 		}
 	}
-
-	// type AccountUUID struct {
-	// 	AccountID     string `json:"accountId"`
-	// 	CustomerID    string `json:"customerId"`
-	// 	Quality       string `json:"quality"`
-	// 	BuildingID    string `json:"buildingId"`
-	// 	TrusteeMember bool   `json:"trusteeMember"`
-	// }
 
 	// ShurcooL/graphql requires me to define types for anything that is not a
 	// graphql.String, graphql.Int, etc. I also discovered that the cursor
@@ -731,26 +1057,20 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 	type EncodedID graphql.String
 	type Cursor graphql.String
 
-	accountUuid := "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
-
 	var interventions []Intervention
-
 	q := struct {
 		CoownerAccount struct {
 			UUID           graphql.String
 			TrusteeCouncil struct {
 				MissionIncidents MissionIncidents `graphql:"missionIncidents(first: $first, after: $after)"`
-				Typename         graphql.String   `graphql:"__typename"`
 			}
-			Typename graphql.String `graphql:"__typename"`
 		} `graphql:"coownerAccount(uuid: $accountUuid)"`
-		Typename graphql.String `graphql:"__typename"`
 	}{}
 	perPage := 100 // I found that it is the maximum value that works.
 	var cursor *Cursor
 	for {
 		variables := map[string]interface{}{
-			"accountUuid": (EncodedID)(accountUuid),
+			"accountUuid": (EncodedID)(accountUUID),
 			"first":       graphql.Int(perPage),
 			"after":       cursor,
 		}
@@ -800,7 +1120,7 @@ func GetInterventions(client *http.Client) ([]Intervention, error) {
 	cursor = nil
 	for {
 		variables := map[string]interface{}{
-			"accountUuid": (EncodedID)(accountUuid),
+			"accountUuid": (EncodedID)(accountUUID),
 			"first":       graphql.Int(perPage),
 			"after":       cursor,
 		}
