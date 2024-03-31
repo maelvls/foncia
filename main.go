@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -932,6 +933,7 @@ func GetAccountUUID(client *http.Client) (string, error) {
 
 	err := gqlclient.Query(context.Background(), &q, nil)
 	if err != nil {
+		logutil.Debugf("DEBUG: %+v", err)
 		return "", fmt.Errorf("error while querying: %w", err)
 	}
 
@@ -942,148 +944,119 @@ func GetAccountUUID(client *http.Client) (string, error) {
 	return q.Accounts[0].UUID, nil
 }
 
-// Repairs.
-//
-// Example:
-//  {
-//    "query": "query getCouncilMissionRepairs($accountUuid: EncodedID!, $first: Int, $after: Cursor) {
-// 	  coownerAccount(uuid: $accountUuid) {
-// 	    uuid
-// 	    trusteeCouncil {
-// 	      missionRepairs(first: $first, after: $after) {
-// 	        totalCount
-// 	        pageInfo {
-// 	          ...pageInfo
-// 	          __typename
-// 	        }
-//         edges {
-// 	          node {
-// 	            ...missionRepair
-// 	            __typename
-// 	          }
-//           __typename
-//         }
-//         __typename
-//       }
-//       __typename
-//     }
-//     __typename
-//   }
-// }
-//
-// fragment pageInfo on PageInfo {
-// 	  startCursor
-// 	  endCursor
-// 	  hasPreviousPage
-// 	  hasNextPage
-// 	  pageNumber
-// 	  itemsPerPage
-// 	  totalDisplayPages
-// 	  totalPages
-// 	  __typename
-// 	}
-//
-// fragment missionRepair on MissionRepair {
-// 	  id
-// 	  number
-// 	  startedAt
-// 	  label
-// 	  status
-// 	  __typename
-// 	}",
-//   "variables": {
-//     "accountUuid": "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
-//   },
-//   "operationName": "getCouncilMissionRepairs"
-// }
-
-// Incidents.
+// Repairs and Incidents. Use GetAccountUUID to get the accountUUID.
 func getInterventionsLive(client *http.Client, accountUUID string) ([]Intervention, error) {
-	gqlclient := graphql.NewClient("https://myfoncia-gateway.prod.fonciamillenium.net/graphql", client)
-
-	type PageOptions struct {
-		// Define the fields of PageOptions here if necessary.
-	}
+	var interventions []Intervention
 
 	type PageInfo struct {
-		StartCursor       graphql.String
-		EndCursor         graphql.String
-		HasPreviousPage   graphql.Boolean
-		HasNextPage       graphql.Boolean
-		PageNumber        graphql.Int
-		ItemsPerPage      graphql.Int
-		TotalDisplayPages graphql.Int
-		TotalPages        graphql.Int
+		StartCursor       string `json:"startCursor"`
+		EndCursor         string `json:"endCursor"`
+		HasPreviousPage   bool   `json:"hasPreviousPage"`
+		HasNextPage       bool   `json:"hasNextPage"`
+		PageNumber        int    `json:"pageNumber"`
+		ItemsPerPage      int    `json:"itemsPerPage"`
+		TotalDisplayPages int    `json:"totalDisplayPages"`
+		TotalPages        int    `json:"totalPages"`
 	}
 
 	type MissionIncidents struct {
-		TotalCount graphql.Int
-		PageInfo   PageInfo
+		TotalCount int      `json:"totalCount"`
+		PageInfo   PageInfo `json:"pageInfo"`
 		Edges      []struct {
 			Node struct {
-				ID          graphql.String
-				Number      graphql.String
-				StartedAt   graphql.String
-				Label       graphql.String
-				Status      graphql.String
-				Description graphql.String
-			} `graphql:"node"`
-		}
+				ID          string `json:"id"`
+				Number      string `json:"number"`
+				StartedAt   string `json:"startedAt"`
+				Label       string `json:"label"`
+				Status      string `json:"status"`
+				Description string `json:"description"`
+			} `json:"node"`
+		} `json:"edges"`
 	}
 
 	type MissionRepairs struct {
-		TotalCount graphql.Int
-		PageInfo   PageInfo
+		TotalCount int      `json:"totalCount"`
+		PageInfo   PageInfo `json:"pageInfo"`
 		Edges      []struct {
 			Node struct {
-				ID          graphql.String
-				Number      graphql.String
-				StartedAt   graphql.String
-				Label       graphql.String
-				Status      graphql.String
-				Description graphql.String
-			} `graphql:"node"`
-		}
+				ID          string `json:"id"`
+				Number      string `json:"number"`
+				StartedAt   string `json:"startedAt"`
+				Label       string `json:"label"`
+				Status      string `json:"status"`
+				Description string `json:"description"`
+			} `json:"node"`
+		} `json:"edges"`
 	}
 
-	// ShurcooL/graphql requires me to define types for anything that is not a
-	// graphql.String, graphql.Int, etc. I also discovered that the cursor
-	// variable needs to be "null" to get the first page. It took me over 2
-	// hours of going over shurcooL/graphql's `writeArgumentType` func to figure
-	// that I shouldn't use "type Cursor *graphql.String", but instead use "type
-	// Cursor graphql.String" and then use a pointer to a Cursor. This library
-	// seems to be the mostly used one, which says a lot about GraphQL's
-	// maturity!
-	type EncodedID graphql.String
-	type Cursor graphql.String
-
-	var interventions []Intervention
-	q := struct {
-		CoownerAccount struct {
-			UUID           graphql.String
-			TrusteeCouncil struct {
-				MissionIncidents MissionIncidents `graphql:"missionIncidents(first: $first, after: $after)"`
+	getIncidentsQuery := `
+		query getCouncilMissionIncidents($accountUuid: EncodedID!, $first: Int, $after: Cursor, $sortBy: [SortByType!]) {
+			coownerAccount(uuid: $accountUuid) {
+				uuid
+				trusteeCouncil {
+					missionIncidents(first: $first, after: $after, sortBy: $sortBy) {
+						totalCount
+						pageInfo {
+							startCursor
+							endCursor
+							hasPreviousPage
+							hasNextPage
+							pageNumber
+							itemsPerPage
+							totalDisplayPages
+							totalPages
+						}
+						edges {
+							node {
+								id
+								number
+								startedAt
+								label
+								status
+								description
+							}
+						}
+					}
+				}
 			}
-		} `graphql:"coownerAccount(uuid: $accountUuid)"`
-	}{}
+		}
+	`
+
 	perPage := 100 // I found that it is the maximum value that works.
-	var cursor *Cursor
+
+	// The reason *string is needed is because I found that the empty string
+	// doesn't work to get the first page. To get the first page, the field
+	// `after` must be appearing as `null`.
+	var cursor *string
 	for {
-		variables := map[string]interface{}{
-			"accountUuid": (EncodedID)(accountUUID),
-			"first":       graphql.Int(perPage),
+		var getIncidentsResp struct {
+			Data struct {
+				CoownerAccount struct {
+					UUID           string `json:"uuid"`
+					TrusteeCouncil struct {
+						MissionIncidents MissionIncidents `json:"missionIncidents"`
+					} `json:"trusteeCouncil"`
+				}
+			} `json:"data"`
+		}
+		err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getIncidentsQuery, map[string]interface{}{
+			"accountUuid": accountUUID,
+			"first":       perPage,
 			"after":       cursor,
-		}
-
-		err := gqlclient.Query(context.Background(), &q, variables)
+			"sortBy": map[string]interface{}{
+				"key":       "createdAt",
+				"direction": "DESC",
+			},
+		}, &getIncidentsResp)
 		if err != nil {
-			logutil.Debugf("while querying: %v", err)
-			return nil, fmt.Errorf("error while querying: %w", err)
+			return nil, fmt.Errorf("error while querying getIncidentsResp: %w", err)
 		}
 
-		for _, edge := range q.CoownerAccount.TrusteeCouncil.MissionIncidents.Edges {
+		for _, edge := range getIncidentsResp.Data.CoownerAccount.TrusteeCouncil.MissionIncidents.Edges {
+			logutil.Debugf("%+v", edge.Node)
 			var startedAt time.Time
 			if edge.Node.StartedAt != "" {
+				var err error
 				startedAt, err = time.Parse(time.RFC3339, string(edge.Node.StartedAt))
 				if err != nil {
 					return nil, fmt.Errorf("error parsing time: %w", err)
@@ -1100,38 +1073,73 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 			})
 		}
 
-		if !q.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.HasNextPage {
+		if !getIncidentsResp.Data.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.HasNextPage {
 			break
 		}
-
-		temp := Cursor(q.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.EndCursor)
+		temp := getIncidentsResp.Data.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.EndCursor
 		cursor = &temp
 	}
 
-	q2 := struct {
-		CoownerAccount struct {
-			UUID           graphql.String
-			TrusteeCouncil struct {
-				MissionRepairs MissionRepairs `graphql:"missionRepairs(first: $first, after: $after)"`
+	// Repairs.
+	getRepairsQuery := `
+		query getCouncilMissionRepairs($accountUuid: EncodedID!, $first: Int, $after: Cursor, $sortBy: [SortByType!]) {
+			coownerAccount(uuid: $accountUuid) {
+				uuid
+				trusteeCouncil {
+					missionRepairs(first: $first, after: $after, sortBy: $sortBy) {
+						totalCount
+						pageInfo {
+							startCursor
+							endCursor
+							hasPreviousPage
+							hasNextPage
+							pageNumber
+							itemsPerPage
+							totalDisplayPages
+							totalPages
+						}
+						edges {
+							node {
+								id
+								number
+								startedAt
+								label
+								status
+								description
+							}
+						}
+					}
+				}
 			}
-			Typename graphql.String `graphql:"__typename"`
-		} `graphql:"coownerAccount(uuid: $accountUuid)"`
-	}{}
+		}
+	`
+
 	cursor = nil
 	for {
-		variables := map[string]interface{}{
-			"accountUuid": (EncodedID)(accountUUID),
-			"first":       graphql.Int(perPage),
+		var getRepairsResp struct {
+			Data struct {
+				CoownerAccount struct {
+					UUID           string `json:"uuid"`
+					TrusteeCouncil struct {
+						MissionRepairs MissionRepairs `json:"missionRepairs"`
+					} `json:"trusteeCouncil"`
+				}
+			} `json:"data"`
+		}
+		err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getRepairsQuery, map[string]interface{}{
+			"accountUuid": accountUUID,
+			"first":       perPage,
 			"after":       cursor,
-		}
-
-		err := gqlclient.Query(context.Background(), &q2, variables)
+			"sortBy": map[string]interface{}{
+				"key":       "createdAt",
+				"direction": "DESC",
+			},
+		}, &getRepairsResp)
 		if err != nil {
-			logutil.Debugf("while querying: %v", err)
-			return nil, fmt.Errorf("error while querying: %w", err)
+			return nil, fmt.Errorf("error while querying getRepairsResp: %w", err)
 		}
 
-		for _, edge := range q2.CoownerAccount.TrusteeCouncil.MissionRepairs.Edges {
+		for _, edge := range getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.Edges {
 			var startedAt time.Time
 			if edge.Node.StartedAt != "" {
 				startedAt, err = time.Parse(time.RFC3339, string(edge.Node.StartedAt))
@@ -1150,12 +1158,10 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 			})
 		}
 
-		if !q2.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.HasNextPage {
+		if !getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.HasNextPage {
 			break
 		}
-
-		temp := Cursor(q2.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.EndCursor)
-		cursor = &temp
+		cursor = &getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.EndCursor
 	}
 
 	sort.Slice(interventions, func(i, j int) bool {
@@ -1180,4 +1186,80 @@ type transportCurlLogs struct {
 func (tr transportCurlLogs) RoundTrip(r *http.Request) (*http.Response, error) {
 	logutil.Debugf("%s", gencurl.FromRequest(r))
 	return tr.trWrapped.RoundTrip(r)
+}
+
+// At first, I coded this using ShurcooL/graphql. I stopped using it for three
+// reasons: (1) I found it painful to have to guess the types of anything that
+// is not a graphql.String, graphql.Int. (2) In the same vein, I wasted a few
+// hours finding out that the cursor variable needs to be "null" to get the
+// first page... I had to dig into shurcooL/graphql's `writeArgumentType` func
+// to figure that I shouldn't use "type Cursor *graphql.String", but instead use
+// "type Cursor graphql.String" and then use a pointer to a Cursor. (3) The last
+// reason is that the GraphQL library I was using had mismatched types... A
+// variable was expected to be "[SortByType!]" but the variable had to be a
+// SortByType... and this was impossible to work around in ShurcooL/graphql.
+//
+// The reason (3) isn't related to ShurcooL/graphql, but (1) and (2) is... This
+// library seems to be the mostly used one, which says a lot about GraphQL's
+// maturity!
+func DoGraphQL[T any](client *http.Client, url, query string, variables map[string]interface{}, resp T) error {
+	req := struct {
+		Query     string                 `json:"query"`
+		Variables map[string]interface{} `json:"variables"`
+	}{
+		Query:     query,
+		Variables: variables,
+	}
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("error marshaling request body: %w", err)
+	}
+	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("error creating request: %w", err)
+	}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("error while querying: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	// It would be more efficient to parse the JSON blob straigt from the
+	// io.Reader (would use less memory), but I don't care. If the body
+	// can't be parsed as JSON, I want to see a dump of it. I should set a
+	// limit to the size of the body though to prevent DoS attacks, but I
+	// don't care about that right now.
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return fmt.Errorf("status code %d, error while reading body: %w", httpResp.StatusCode, err)
+	}
+
+	if httpResp.StatusCode == 400 {
+		var graphQLResp struct {
+			Errors []struct {
+				Message   string `json:"message"`
+				Locations []struct {
+					Line   int `json:"line"`
+					Column int `json:"column"`
+				} `json:"locations"`
+			} `json:"errors"`
+		}
+		errUnmarsh := json.Unmarshal(body, &graphQLResp)
+		if errUnmarsh != nil {
+			// Fall back to showing the raw body.
+			return fmt.Errorf("status code was 400, but body isn't a standard graphql JSON error, body: %v", string(body))
+		}
+		bytes, _ := json.MarshalIndent(graphQLResp, "", "  ")
+		return fmt.Errorf("status code 400: %s", string(bytes))
+	}
+	if httpResp.StatusCode != 200 {
+		return fmt.Errorf("unexpected status code %d, body: %s", httpResp.StatusCode, string(body))
+	}
+
+	err = json.Unmarshal(body, &resp)
+	if err != nil {
+		return fmt.Errorf("status code was 200 but body could not be parsed as %T: %s\nbody: %s", resp, err, string(body))
+	}
+
+	return nil
 }
