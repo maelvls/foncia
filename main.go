@@ -304,7 +304,7 @@ func createDB(ctx context.Context, path string) error {
 	defer db.Close()
 
 	// number = Foncia's ID for the intervention.
-	if _, err = db.ExecContext(ctx, `
+	_, err = db.ExecContext(ctx, `
 		create table IF NOT EXISTS entries (
 			id TEXT UNIQUE,
 			number INTEGER,
@@ -313,8 +313,13 @@ func createDB(ctx context.Context, path string) error {
 			status TEXT,
 			started_at TEXT,
 			description TEXT
-		);`); err != nil {
-		return err
+		);`)
+	if err != nil {
+		return fmt.Errorf("failed to create table: %w", err)
+	}
+	_, err = db.ExecContext(ctx, `create index IF NOT EXISTS idx_entries_started_at on entries (started_at);`)
+	if err != nil {
+		return fmt.Errorf("failed to create index: %w", err)
 	}
 
 	return nil
@@ -422,18 +427,19 @@ func syncLiveInterventionsWithDB(ctx context.Context, client *http.Client, db *s
 		return nil, fmt.Errorf("while getting interventions: %v", err)
 	}
 
-	existingItems, err := getInterventionsDB(ctx, db)
+	itemsInDB, err := getInterventionsDB(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("while getting existing items: %v", err)
 	}
-	exists := make(map[string]struct{})
-	for _, i := range existingItems {
-		exists[i.ID] = struct{}{}
+	existsInDB := make(map[string]struct{})
+	for _, item := range itemsInDB {
+		existsInDB[item.ID] = struct{}{}
 	}
 	var newEntries []Intervention
 	for _, i := range items {
-		_, already := exists[i.ID]
+		_, already := existsInDB[i.ID]
 		if already {
+			logutil.Debugf("item %q already exists: %s", i.ID, i.Label)
 			continue
 		}
 		newEntries = append(newEntries, i)
@@ -459,7 +465,7 @@ func syncLiveInterventionsWithDB(ctx context.Context, client *http.Client, db *s
 }
 
 func getInterventionsDB(_ context.Context, db *sql.DB) ([]Intervention, error) {
-	rows, err := db.Query("select id, number, kind, label, status, started_at, description from entries")
+	rows, err := db.Query("select id, number, kind, label, status, started_at, description from entries order by started_at desc")
 	if err != nil {
 		return nil, fmt.Errorf("while querying database: %v", err)
 	}
