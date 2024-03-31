@@ -31,11 +31,11 @@ var (
 	// EnableDebug enables debugFlag logs.
 	debugFlag = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
 
-	serveBasePath       = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
-	serveAddr           = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
-	saveBetweenRestarts = flag.Bool("save-between-restarts", false, "Save the data between restarts.")
-	dbPath              = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
-	ntfyTopic           = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/.")
+	serveBasePath = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
+	serveAddr     = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
+	dbOnly        = flag.Bool("db-only", false, "When set, no HTTP request is made, and everything is fetched from the DB.")
+	dbPath        = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
+	ntfyTopic     = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
 )
@@ -121,14 +121,14 @@ func main() {
 				time.Sleep(10 * time.Minute)
 
 				logutil.Debugf("updating database by fetching from live")
-				newEntries, err := authFetchSave(&http.Client{}, username, password, db)
+				newMissions, err := authFetchSave(&http.Client{}, username, password, db)
 				writeLastSync(err)
 				if err != nil {
 					logutil.Errorf("while fetching and updating database: %v", err)
 				}
-				logutil.Debugf("found %d new items", len(newEntries))
-				if len(newEntries) > 0 {
-					for _, e := range newEntries {
+				logutil.Debugf("found %d new items", len(newMissions))
+				if len(newMissions) > 0 {
+					for _, e := range newMissions {
 						logutil.Infof("new: %s", e.Label)
 						err := ntfy(*ntfyTopic, fmt.Sprintf("%s: %s", e.Label, e.Description))
 						if err != nil {
@@ -163,16 +163,16 @@ func main() {
 }
 
 // Returns the new entries found.
-func authFetchSave(c *http.Client, username string, password secret, db *sql.DB) ([]Intervention, error) {
+func authFetchSave(c *http.Client, username string, password secret, db *sql.DB) ([]Mission, error) {
 	cl, err := authenticatedClient(c, username, password)
 	if err != nil {
 		return nil, fmt.Errorf("while authenticating: %v", err)
 	}
-	newEntries, err := syncLiveInterventionsWithDB(context.Background(), cl, db)
+	newMissions, err := syncLiveMissionsWithDB(context.Background(), cl, db)
 	if err != nil {
 		return nil, fmt.Errorf("while saving to database: %v", err)
 	}
-	return newEntries, nil
+	return newMissions, nil
 }
 
 func getCreds() (string, secret) {
@@ -187,7 +187,7 @@ func getCreds() (string, secret) {
 
 type tmlpData struct {
 	SyncStatus string
-	Items      []Intervention
+	Items      []Mission
 	Version    string
 }
 
@@ -239,6 +239,7 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 				<th>Status</th>
 				<th>Label</th>
 				<th>Description</th>
+				<th>Work Orders</th>
 			</tr>
 		</thead>
 		<tbody>
@@ -248,6 +249,17 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 				<td>{{ .Kind }} {{ .Number }}</br><small>{{ .Status }}</small></td>
 				<td>{{.Label}}</td>
 				<td><small>{{.Description}}</small></td>
+				<td>
+					<small>
+						{{range .WorkOrders}}
+							{{.Number}}
+							{{.Label}}
+							{{.RepairDateStart.Format "02/01/2006"}}–{{.RepairDateEnd.Format "02/01/2006"}}
+							{{.SupplierName}}
+							{{.SupplierActivity}}</br>
+						{{end}}
+					</small>
+				</td>
 			</tr>
 			{{end}}
 		</tbody>
@@ -294,19 +306,35 @@ func createDB(ctx context.Context, path string) error {
 
 	// number = Foncia's ID for the intervention.
 	_, err = db.ExecContext(ctx, `
-		create table IF NOT EXISTS entries (
+		create table IF NOT EXISTS missions (
 			id TEXT UNIQUE,
-			number INTEGER,
+			number TEXT,
 			kind TEXT,
 			label TEXT,
 			status TEXT,
-			started_at TEXT,
+			started_at TEXT,             -- time.RFC3339
 			description TEXT
 		);`)
 	if err != nil {
-		return fmt.Errorf("failed to create table: %w", err)
+		return fmt.Errorf("failed to create table 'missions': %w", err)
 	}
-	_, err = db.ExecContext(ctx, `create index IF NOT EXISTS idx_entries_started_at on entries (started_at);`)
+	_, err = db.ExecContext(ctx, `
+		create table IF NOT EXISTS work_orders (
+			id TEXT UNIQUE,
+			mission_id TEXT NOT NULL,
+			number TEXT,
+			label TEXT,
+			repair_date_start TEXT,      -- time.RFC3339
+			repair_date_end TEXT,        -- time.RFC3339
+			supplier_id TEXT,
+			supplier_name TEXT,
+			supplier_activity TEXT,
+			FOREIGN KEY(mission_id) REFERENCES missions(id)
+		);`)
+	if err != nil {
+		return fmt.Errorf("failed to create table 'work_orders': %w", err)
+	}
+	_, err = db.ExecContext(ctx, `create index IF NOT EXISTS idx_entries_started_at on missions (started_at);`)
 	if err != nil {
 		return fmt.Errorf("failed to create index: %w", err)
 	}
@@ -341,7 +369,7 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 			return
 		}
 
-		items, err := getInterventionsDB(context.Background(), db)
+		items, err := getMissionsDB(context.Background(), db)
 		if err != nil {
 			logutil.Errorf("while listing interventions: %v", err)
 
@@ -407,78 +435,207 @@ func ntfy(topic, message string) error {
 }
 
 // Returns the new items.
-func syncLiveInterventionsWithDB(ctx context.Context, client *http.Client, db *sql.DB) ([]Intervention, error) {
+func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, db *sql.DB) ([]Mission, error) {
 	uuid, err := GetAccountUUID(client)
 	if err != nil {
 		return nil, fmt.Errorf("while getting account UUID: %v", err)
 	}
-	items, err := getInterventionsLive(client, uuid)
+	missions, err := getMissionsLive(client, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting interventions: %v", err)
 	}
 
-	itemsInDB, err := getInterventionsDB(ctx, db)
+	missionsInDB, err := getMissionsDB(ctx, db)
 	if err != nil {
-		return nil, fmt.Errorf("while getting existing items: %v", err)
+		return nil, fmt.Errorf("while getting existing missions: %v", err)
 	}
 	existsInDB := make(map[string]struct{})
-	for _, item := range itemsInDB {
+	for _, item := range missionsInDB {
 		existsInDB[item.ID] = struct{}{}
 	}
-	var newEntries []Intervention
-	for _, i := range items {
-		_, already := existsInDB[i.ID]
+	var newMissions []Mission
+	for _, m := range missions {
+		_, already := existsInDB[m.ID]
 		if already {
-			logutil.Debugf("item %q already exists: %s", i.ID, i.Label)
 			continue
 		}
-		newEntries = append(newEntries, i)
-		logutil.Debugf("found new item %q", i.ID)
+		newMissions = append(newMissions, m)
+		logutil.Debugf("found new item %q", m.ID)
 	}
 
-	// Save the new items to the database.
-	if len(newEntries) > 0 {
-		req := "insert into entries (id, number, kind, label, status, started_at, description) values "
-		var values []interface{}
-		for _, e := range newEntries {
-			req += "(?, ?, ?, ?, ?, ?, ?),"
-			values = append(values, e.ID, e.Number, e.Kind, e.Label, e.Status, e.StartedAt, e.Description)
-		}
-		req = strings.TrimSuffix(req, ",")
-		_, err = db.ExecContext(ctx, req, values...)
+	// Watch out, one HTTP request per new mission is made here. There may be
+	// 200-300 missions, so this may take a while.
+	//
+	// Let's keep track of which mission IDs have been processed so that we can
+	// save to DB in batches. That's because (1) disk is slow on Synology so we
+	// need to batchSize, and (2) we don't want to lose all the work if the program
+	// crashes.
+	batchSize := 20
+	var missionIDs []string
+	var missionBatch []Mission
+	workOrders := make(map[string][]WorkOrder) // missionID -> work orders
+
+	for _, m := range newMissions {
+		wo, err := getWorkOrdersLive(client, uuid, m.ID)
 		if err != nil {
-			return nil, fmt.Errorf("while inserting values: %v", err)
+			return nil, fmt.Errorf("while getting work orders: %v", err)
 		}
+		workOrders[m.ID] = wo
+		missionIDs = append(missionIDs, m.ID)
+		missionBatch = append(missionBatch, m)
+
+		if len(missionIDs) < batchSize {
+			continue
+		}
+
+		logutil.Debugf("saving work orders for %d missions to DB", len(missionBatch))
+		err = saveWorkOrdersToDB(ctx, db, missionIDs, workOrders)
+		if err != nil {
+			return nil, fmt.Errorf("while saving work orders: %v", err)
+		}
+		missionIDs = nil
+		workOrders = make(map[string][]WorkOrder)
+
+		logutil.Debugf("saving %d missions to DB", len(missionBatch))
+		err = saveMissionsToDB(ctx, db, missionBatch...)
+		if err != nil {
+			return nil, fmt.Errorf("while saving missions: %v", err)
+		}
+		missionBatch = nil
 	}
 
-	return newEntries, nil
+	return newMissions, nil
 }
 
-func getInterventionsDB(_ context.Context, db *sql.DB) ([]Intervention, error) {
-	rows, err := db.Query("select id, number, kind, label, status, started_at, description from entries order by started_at desc")
+func saveWorkOrdersToDB(ctx context.Context, db *sql.DB, missionIDs []string, workOrdersMap map[string][]WorkOrder) error {
+	if len(workOrdersMap) == 0 {
+		return nil
+	}
+
+	req := "insert into work_orders (id, mission_id, number, label, repair_date_start, repair_date_end, supplier_id, supplier_name, supplier_activity) values "
+	var values []interface{}
+	for _, missionID := range missionIDs {
+		workOrders, found := workOrdersMap[missionID]
+		if !found {
+			logutil.Debugf("no work orders for mission %q", missionID)
+			continue
+		}
+		for _, w := range workOrders {
+			req += "(?, ?, ?, ?, ?, ?, ?, ?, ?),"
+			values = append(values, w.ID, missionID, w.Number, w.Label, w.RepairDateStart.Format(time.RFC3339), w.RepairDateEnd.Format(time.RFC3339), w.SupplierID, w.SupplierName, w.SupplierActivity)
+		}
+	}
+	req = strings.TrimSuffix(req, ",")
+	_, err := db.ExecContext(ctx, req, values...)
+	if err != nil {
+		return fmt.Errorf("while inserting work orders: %v", err)
+	}
+
+	return nil
+}
+
+func saveMissionsToDB(ctx context.Context, db *sql.DB, missions ...Mission) error {
+	req := "insert into missions (id, number, kind, label, status, started_at, description) values "
+	var values []interface{}
+	for _, e := range missions {
+		req += "(?, ?, ?, ?, ?, ?, ?),"
+		values = append(values, e.ID, e.Number, e.Kind, e.Label, e.Status, e.StartedAt.Format(time.RFC3339), e.Description)
+	}
+	req = strings.TrimSuffix(req, ",")
+	_, err := db.ExecContext(ctx, req, values...)
+	if err != nil {
+		return fmt.Errorf("while inserting values: %v", err)
+	}
+
+	return nil
+}
+
+func getMissionsDB(ctx context.Context, db *sql.DB) ([]Mission, error) {
+	rows, err := db.QueryContext(ctx, "SELECT id, number, kind, label, status, started_at, description FROM missions ORDER BY started_at DESC")
 	if err != nil {
 		return nil, fmt.Errorf("while querying database: %v", err)
 	}
 	defer rows.Close()
 
-	var items []Intervention
+	var missions []Mission
 	for rows.Next() {
-		var i Intervention
+		var m Mission
 		var startedAt string
-		err = rows.Scan(&i.ID, &i.Number, &i.Kind, &i.Label, &i.Status, &startedAt, &i.Description)
+		err = rows.Scan(&m.ID, &m.Number, &m.Kind, &m.Label, &m.Status, &startedAt, &m.Description)
 		if err != nil {
 			return nil, fmt.Errorf("while scanning row: %v", err)
 		}
 
-		// Format: "2006-01-02 15:04:05.999Z07:00"
-		i.StartedAt, err = time.Parse("2006-01-02 15:04:05.999Z07:00", startedAt)
+		m.StartedAt, err = time.Parse(time.RFC3339, startedAt)
 		if err != nil {
 			return nil, fmt.Errorf("while parsing 'started_at': %v", err)
 		}
-		items = append(items, i)
+		missions = append(missions, m)
 	}
 
-	return items, nil
+	var missionIDs []string
+	for i := range missions {
+		missionIDs = append(missionIDs, missions[i].ID)
+	}
+	workOrderMap, err := getWorkOrdersDB(ctx, db, missionIDs...)
+	if err != nil {
+		return nil, fmt.Errorf("while getting work orders: %v", err)
+	}
+
+	for i := range missions {
+		workOrders, found := workOrderMap[missions[i].ID]
+		if !found {
+			continue
+		}
+		missions[i].WorkOrders = workOrders
+	}
+	logutil.Debugf("found %d missions", len(missions))
+	return missions, nil
+}
+
+func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map[string][]WorkOrder, error) {
+	if len(missionIDs) == 0 {
+		return nil, nil
+	}
+
+	req := "select id, mission_id, number, label, repair_date_start, repair_date_end, supplier_id, supplier_name, supplier_activity from work_orders where mission_id in ("
+	var values []interface{}
+	for _, id := range missionIDs {
+		req += "?,"
+		values = append(values, id)
+	}
+	req = strings.TrimSuffix(req, ",") + ");"
+	logutil.Debugf("sql getWorkOrdersDB: %s", req)
+
+	rows, err := db.QueryContext(ctx, req, values...)
+	if err != nil {
+		return nil, fmt.Errorf("while querying database: %v", err)
+	}
+	defer rows.Close()
+
+	workOrderMap := make(map[string][]WorkOrder)
+	for rows.Next() {
+		var wo WorkOrder
+		var repairDateStart, repairDateEnd string
+		var missionID string
+		err = rows.Scan(&wo.ID, &missionID, &wo.Number, &wo.Label, &repairDateStart, &repairDateEnd, &wo.SupplierID, &wo.SupplierName, &wo.SupplierActivity)
+		if err != nil {
+			return nil, fmt.Errorf("while scanning row: %v", err)
+		}
+
+		wo.RepairDateStart, err = time.Parse(time.RFC3339, repairDateStart)
+		if err != nil {
+			return nil, fmt.Errorf("while parsing 'repair_date_start': %v", err)
+		}
+		wo.RepairDateEnd, err = time.Parse(time.RFC3339, repairDateEnd)
+		if err != nil {
+			return nil, fmt.Errorf("while parsing 'repair_date_end': %v", err)
+		}
+
+		workOrderMap[missionID] = append(workOrderMap[missionID], wo)
+	}
+
+	return workOrderMap, nil
 }
 
 func authenticatedClient(client *http.Client, username string, password secret) (*http.Client, error) {
@@ -511,45 +668,57 @@ func ListCmd(username string, password secret) {
 		os.Exit(1)
 	}
 
-	items, err := getInterventionsLive(client, accUUID)
+	missions, err := getMissionsLive(client, accUUID)
 	if err != nil {
 		logutil.Errorf("getting interventions: %v", err)
 		os.Exit(1)
 	}
 
 	// Print the items starting with the oldest one.
-	for i := len(items) - 1; i >= 0; i-- {
+	for i := len(missions) - 1; i >= 0; i-- {
 		fmt.Printf("%s %s %s %s %s\n",
-			items[i].StartedAt.Format("02 Jan 2006"),
-			logutil.Bold(string(items[i].Kind)),
-			logutil.Yel(items[i].Label),
+			missions[i].StartedAt.Format("02 Jan 2006"),
+			logutil.Bold(string(missions[i].Kind)),
+			logutil.Yel(missions[i].Label),
 			func() string {
-				if items[i].Status == "WORK_IN_PROGRESS" {
-					return logutil.Red(items[i].Status)
+				if missions[i].Status == "WORK_IN_PROGRESS" {
+					return logutil.Red(missions[i].Status)
 				} else {
-					return logutil.Green(items[i].Status)
+					return logutil.Green(missions[i].Status)
 				}
 			}(),
-			logutil.Gray(items[i].Description),
+			logutil.Gray(missions[i].Description),
 		)
 	}
 }
 
-type Intervention struct {
-	ID          string           // "64850e8019d5d64c415d13dd"
-	Number      string           // "7000YRK51"
-	Label       string           // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
-	Status      string           // "WORK_IN_PROGRESS"
-	StartedAt   time.Time        // "2023-04-24T22:00:00.000Z"
-	Description string           // "BONJOUR,\n\nVEUILLEZ ENREGISTER LE C02\t\nMERCI CORDIALEMENT"
-	Kind        InterventionKind // "Incident" | "Repair"
+type Mission struct {
+	ID          string      // "64850e8019d5d64c415d13dd"
+	Number      string      // "7000YRK51"
+	Label       string      // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
+	Status      string      // "WORK_IN_PROGRESS"
+	StartedAt   time.Time   // "2023-04-24T22:00:00.000Z" (time.RFC3339)
+	Description string      // "BONJOUR,\n\nVEUILLEZ ENREGISTER LE C02\t\nMERCI CORDIALEMENT"
+	Kind        MissionKind // "Incident" | "Repair"
+	WorkOrders  []WorkOrder
 }
 
-type InterventionKind string
+type WorkOrder struct {
+	ID               string    // "64850e80df57eb4ade3cf63c"
+	Number           string    // "OSMIL802702875"
+	Label            string    // "BOUVIER SECURITE INCENDIE - DEMANDE INTERVENTION P"
+	RepairDateStart  time.Time // "2022-10-18T22:00:00.000Z"
+	RepairDateEnd    time.Time // "2022-10-18T22:00:00.000Z"
+	SupplierID       string    // "64850e809b58ffb817f73b20"
+	SupplierName     string    // ""
+	SupplierActivity string    // "MFEU"
+}
+
+type MissionKind string
 
 var (
-	Incident InterventionKind = "Incident"
-	Repair   InterventionKind = "Repair"
+	Incident MissionKind = "Incident"
+	Repair   MissionKind = "Repair"
 )
 
 type secret string
@@ -642,7 +811,7 @@ func Token(client *http.Client, username string, password secret) (token string,
 }
 
 // DO NOT USE. This function is kept for historical reasons.
-func GetInterventionsOld(client *http.Client, coproID string) ([]Intervention, error) {
+func GetInterventionsOld(client *http.Client, coproID string) ([]Mission, error) {
 	req, err := http.NewRequest("GET", "https://myfoncia.fr/espace-client/espace-de-gestion/conseil-syndical/interventions/"+coproID, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
@@ -708,13 +877,13 @@ func GetInterventionsOld(client *http.Client, coproID string) ([]Intervention, e
 	line = strings.TrimSuffix(strings.TrimSpace(line), "}]")
 
 	// Finally, unmarshal the JSON array.
-	var items []Intervention
-	err = json.Unmarshal([]byte(line), &items)
+	var missions []Mission
+	err = json.Unmarshal([]byte(line), &missions)
 	if err != nil {
 		return nil, fmt.Errorf("could not unmarshal JSON array: %v", err)
 	}
 
-	return items, nil
+	return missions, nil
 }
 
 // The accountUUID is the base 64 encoded ID of the account. For example:
@@ -740,7 +909,6 @@ func GetAccountUUID(client *http.Client) (string, error) {
 
 	err := gqlclient.Query(context.Background(), &q, nil)
 	if err != nil {
-		logutil.Debugf("DEBUG: %+v", err)
 		return "", fmt.Errorf("error while querying: %w", err)
 	}
 
@@ -752,18 +920,12 @@ func GetAccountUUID(client *http.Client) (string, error) {
 }
 
 // Repairs and Incidents. Use GetAccountUUID to get the accountUUID.
-func getInterventionsLive(client *http.Client, accountUUID string) ([]Intervention, error) {
-	var interventions []Intervention
+func getMissionsLive(client *http.Client, accountUUID string) ([]Mission, error) {
+	var interventions []Mission
 
 	type PageInfo struct {
-		StartCursor       string `json:"startCursor"`
-		EndCursor         string `json:"endCursor"`
-		HasPreviousPage   bool   `json:"hasPreviousPage"`
-		HasNextPage       bool   `json:"hasNextPage"`
-		PageNumber        int    `json:"pageNumber"`
-		ItemsPerPage      int    `json:"itemsPerPage"`
-		TotalDisplayPages int    `json:"totalDisplayPages"`
-		TotalPages        int    `json:"totalPages"`
+		EndCursor   string `json:"endCursor"`
+		HasNextPage bool   `json:"hasNextPage"`
 	}
 
 	type MissionIncidents struct {
@@ -796,7 +958,7 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		} `json:"edges"`
 	}
 
-	getIncidentsQuery := `
+	const getIncidentsQuery = `
 		query getCouncilMissionIncidents($accountUuid: EncodedID!, $first: Int, $after: Cursor, $sortBy: [SortByType!]) {
 			coownerAccount(uuid: $accountUuid) {
 				uuid
@@ -862,7 +1024,6 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		}
 
 		for _, edge := range getIncidentsResp.Data.CoownerAccount.TrusteeCouncil.MissionIncidents.Edges {
-			logutil.Debugf("%+v", edge.Node)
 			var startedAt time.Time
 			if edge.Node.StartedAt != "" {
 				var err error
@@ -872,7 +1033,7 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 					return nil, fmt.Errorf("error parsing time: %w", err)
 				}
 			}
-			interventions = append(interventions, Intervention{
+			interventions = append(interventions, Mission{
 				ID:          edge.Node.ID,
 				Number:      edge.Node.Number,
 				Label:       edge.Node.Label,
@@ -896,7 +1057,7 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 	}
 
 	// Repairs.
-	getRepairsQuery := `
+	const getRepairsQuery = `
 		query getCouncilMissionRepairs($accountUuid: EncodedID!, $first: Int, $after: Cursor, $sortBy: [SortByType!]) {
 			coownerAccount(uuid: $accountUuid) {
 				uuid
@@ -956,7 +1117,6 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		}
 
 		for _, edge := range getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.Edges {
-			logutil.Debugf("%+v", edge.Node)
 			var startedAt time.Time
 			if edge.Node.StartedAt != "" {
 				startedAt, err = time.Parse(time.RFC3339, edge.Node.StartedAt)
@@ -964,7 +1124,7 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 					return nil, fmt.Errorf("error parsing time: %w", err)
 				}
 			}
-			interventions = append(interventions, Intervention{
+			interventions = append(interventions, Mission{
 				ID:          edge.Node.ID,
 				Number:      edge.Node.Number,
 				Label:       edge.Node.Label,
@@ -990,6 +1150,93 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		return interventions[i].StartedAt.After(interventions[j].StartedAt)
 	})
 	return interventions, nil
+}
+
+func getWorkOrdersLive(client *http.Client, accountUUID, missionID string) ([]WorkOrder, error) {
+	const getWorkOrders = `
+		query getWorkOrders($accountUuid: EncodedID!, $missionId: ID!, $first: Int, $before: Cursor, $after: Cursor) {
+			workOrders(accountUuid: $accountUuid, missionId: $missionId, first: $first, before: $before, after: $after) {
+				edges {
+					node {
+						id
+						number
+						label
+						repairDate {
+							start
+							end
+						}
+						supplier {
+							id
+							name
+							firstName
+							activity
+						}
+					}
+				}
+			}
+		}
+	`
+	var getWorkOrdersResp struct {
+		Data struct {
+			WorkOrders struct {
+				Edges []struct {
+					Node struct {
+						ID         string `json:"id"`
+						Number     string `json:"number"`
+						Label      string `json:"label"`
+						RepairDate struct {
+							Start string `json:"start"`
+							End   string `json:"end"`
+						} `json:"repairDate"`
+						Supplier struct {
+							ID        string `json:"id"`
+							Name      string `json:"name"`
+							FirstName string `json:"firstName"`
+							Activity  string `json:"activity"`
+						} `json:"supplier"`
+					} `json:"node"`
+				} `json:"edges"`
+			} `json:"workOrders"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getWorkOrders, map[string]interface{}{
+		"accountUuid": accountUUID,
+		"missionId":   missionID,
+	}, &getWorkOrdersResp)
+	if err != nil {
+		return nil, fmt.Errorf("error while querying getWorkOrdersResp for mission %s: %w", missionID, err)
+	}
+
+	var orders []WorkOrder
+	for _, edge := range getWorkOrdersResp.Data.WorkOrders.Edges {
+		var start, end time.Time
+		if edge.Node.RepairDate.Start != "" {
+			start, err = time.Parse(time.RFC3339, edge.Node.RepairDate.Start)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing time: %w", err)
+			}
+		}
+		if edge.Node.RepairDate.End != "" {
+			end, err = time.Parse(time.RFC3339, edge.Node.RepairDate.End)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing time: %w", err)
+			}
+		}
+
+		orders = append(orders, WorkOrder{
+			ID:               edge.Node.ID,
+			Number:           edge.Node.Number,
+			Label:            edge.Node.Label,
+			RepairDateStart:  start,
+			RepairDateEnd:    end,
+			SupplierID:       edge.Node.Supplier.ID,
+			SupplierName:     edge.Node.Supplier.Name,
+			SupplierActivity: edge.Node.Supplier.Activity,
+		})
+	}
+
+	return orders, nil
 }
 
 func enableDebugCurlLogs(client *http.Client) {
