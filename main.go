@@ -20,7 +20,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dreamscached/minequery/v2"
 	_ "github.com/glebarez/go-sqlite"
 	"github.com/maelvls/foncia/logutil"
 	"github.com/sethgrid/gencurl"
@@ -155,14 +154,8 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(token)
-	case "list-mc":
-		res, err := minequery.Ping17("lisa.valais.dev", 25565)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println(res)
 	case "":
-		logutil.Errorf("no command given. Use one of: serve, list, token, list-mc, version")
+		logutil.Errorf("no command given. Use one of: serve, list, token, version")
 	default:
 		logutil.Errorf("unknown command %q", flag.Arg(0))
 		os.Exit(1)

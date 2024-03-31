@@ -4,6 +4,15 @@ The `foncia` CLI lets you list all "missionRepairs" and "missionIncidents". It
 also lets you create a server that notifies you using ntfy.sh when a new
 "missionIncident" or "missionRepair" is created.
 
+I've created this for two reasons:
+
+1. I wanted to be aware of anything happening in my building, preferably in
+   real-time on my phone.
+2. I found that the `description` field of "missionIncidents" and
+   "missionRepairs" had disappeared since the migration from the old myFoncia
+   website to the new "fonciamillenium" website, and I found that I could access
+   that field using the GraphQL API.
+
 ## Deploy
 
 ```bash
