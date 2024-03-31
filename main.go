@@ -80,6 +80,7 @@ func main() {
 		username, password := getCreds()
 
 		path := *dbPath
+		logutil.Debugf("using sqlite3 database file %q", path)
 
 		err := createDB(context.Background(), path)
 		if err != nil {
@@ -174,7 +175,7 @@ func authFetchSave(c *http.Client, username string, password secret, db *sql.DB)
 	if err != nil {
 		return nil, fmt.Errorf("while authenticating: %v", err)
 	}
-	newEntries, err := getInterventionsAndSave(context.Background(), cl, db)
+	newEntries, err := syncLiveInterventionsWithDB(context.Background(), cl, db)
 	if err != nil {
 		return nil, fmt.Errorf("while saving to database: %v", err)
 	}
@@ -410,8 +411,8 @@ func ntfy(topic, message string) error {
 	return err
 }
 
-// Returns the new item.
-func getInterventionsAndSave(ctx context.Context, client *http.Client, db *sql.DB) (newOnes []Intervention, _ error) {
+// Returns the new items.
+func syncLiveInterventionsWithDB(ctx context.Context, client *http.Client, db *sql.DB) ([]Intervention, error) {
 	uuid, err := GetAccountUUID(client)
 	if err != nil {
 		return nil, fmt.Errorf("while getting account UUID: %v", err)
@@ -429,21 +430,29 @@ func getInterventionsAndSave(ctx context.Context, client *http.Client, db *sql.D
 	for _, i := range existingItems {
 		exists[i.ID] = struct{}{}
 	}
-
-	// Save the missing items in the database.
 	var newEntries []Intervention
 	for _, i := range items {
-		if _, ok := exists[i.ID]; ok {
+		_, already := exists[i.ID]
+		if already {
 			continue
 		}
-
-		logutil.Debugf("found new item %q", i.ID)
-		_, err := db.ExecContext(ctx, "insert into entries (id, number, kind, label, status, started_at, description) values (?, ?, ?, ?, ?, ?, ?)",
-			i.ID, i.Number, i.Kind, i.Label, i.Status, i.StartedAt, i.Description)
-		if err != nil {
-			return nil, fmt.Errorf("while inserting row: %v", err)
-		}
 		newEntries = append(newEntries, i)
+		logutil.Debugf("found new item %q", i.ID)
+	}
+
+	// Save the new items to the database.
+	if len(newEntries) > 0 {
+		req := "insert into entries (id, number, kind, label, status, started_at, description) values "
+		var values []interface{}
+		for _, e := range newEntries {
+			req += "(?, ?, ?, ?, ?, ?, ?),"
+			values = append(values, e.ID, e.Number, e.Kind, e.Label, e.Status, e.StartedAt, e.Description)
+		}
+		req = strings.TrimSuffix(req, ",")
+		_, err = db.ExecContext(ctx, req, values...)
+		if err != nil {
+			return nil, fmt.Errorf("while inserting values: %v", err)
+		}
 	}
 
 	return newEntries, nil
@@ -1022,8 +1031,8 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		}
 	`
 
-	perPage := 1 // I found that it is the maximum value that works.
-	totalPages := 1
+	perPage := 100 // I found that it is the maximum value that works.
+	pagesLimit := 100000
 
 	// The reason *string is needed is because I found that the empty string
 	// doesn't work to get the first page. To get the first page, the field
@@ -1083,7 +1092,7 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		cursor = &temp
 
 		pageCount++
-		if pageCount == totalPages {
+		if pageCount == pagesLimit {
 			break
 		}
 	}
@@ -1174,7 +1183,7 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		cursor = &getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.EndCursor
 
 		pageCount++
-		if pageCount == totalPages {
+		if pageCount == pagesLimit {
 			break
 		}
 	}
