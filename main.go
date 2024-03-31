@@ -513,7 +513,7 @@ func ListCmd(username string, password secret) {
 	}
 
 	// Print the items starting with the oldest one.
-	for i := len(items) - 1; i > 0; i-- {
+	for i := len(items) - 1; i >= 0; i-- {
 		fmt.Printf("%s %s %s %s %s\n",
 			items[i].StartedAt.Format("02 Jan 2006"),
 			logutil.Bold(string(items[i].Kind)),
@@ -1022,12 +1022,14 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		}
 	`
 
-	perPage := 100 // I found that it is the maximum value that works.
+	perPage := 1 // I found that it is the maximum value that works.
+	totalPages := 1
 
 	// The reason *string is needed is because I found that the empty string
 	// doesn't work to get the first page. To get the first page, the field
 	// `after` must be appearing as `null`.
 	var cursor *string
+	pageCount := 0
 	for {
 		var getIncidentsResp struct {
 			Data struct {
@@ -1057,18 +1059,19 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 			var startedAt time.Time
 			if edge.Node.StartedAt != "" {
 				var err error
-				startedAt, err = time.Parse(time.RFC3339, string(edge.Node.StartedAt))
+				startedAt, err = time.Parse(time.RFC3339, edge.Node.StartedAt)
 				if err != nil {
+					logutil.Debugf("error parsing time: %v", err)
 					return nil, fmt.Errorf("error parsing time: %w", err)
 				}
 			}
 			interventions = append(interventions, Intervention{
-				ID:          string(edge.Node.ID),
-				Number:      string(edge.Node.Number),
-				Label:       string(edge.Node.Label),
-				Status:      string(edge.Node.Status),
+				ID:          edge.Node.ID,
+				Number:      edge.Node.Number,
+				Label:       edge.Node.Label,
+				Status:      edge.Node.Status,
 				StartedAt:   startedAt,
-				Description: string(edge.Node.Description),
+				Description: edge.Node.Description,
 				Kind:        Incident,
 			})
 		}
@@ -1078,6 +1081,11 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		}
 		temp := getIncidentsResp.Data.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.EndCursor
 		cursor = &temp
+
+		pageCount++
+		if pageCount == totalPages {
+			break
+		}
 	}
 
 	// Repairs.
@@ -1115,6 +1123,7 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 	`
 
 	cursor = nil
+	pageCount = 0
 	for {
 		var getRepairsResp struct {
 			Data struct {
@@ -1140,20 +1149,21 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 		}
 
 		for _, edge := range getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.Edges {
+			logutil.Debugf("%+v", edge.Node)
 			var startedAt time.Time
 			if edge.Node.StartedAt != "" {
-				startedAt, err = time.Parse(time.RFC3339, string(edge.Node.StartedAt))
+				startedAt, err = time.Parse(time.RFC3339, edge.Node.StartedAt)
 				if err != nil {
 					return nil, fmt.Errorf("error parsing time: %w", err)
 				}
 			}
 			interventions = append(interventions, Intervention{
-				ID:          string(edge.Node.ID),
-				Number:      string(edge.Node.Number),
-				Label:       string(edge.Node.Label),
-				Status:      string(edge.Node.Status),
+				ID:          edge.Node.ID,
+				Number:      edge.Node.Number,
+				Label:       edge.Node.Label,
+				Status:      edge.Node.Status,
 				StartedAt:   startedAt,
-				Description: string(edge.Node.Description),
+				Description: edge.Node.Description,
 				Kind:        Repair,
 			})
 		}
@@ -1162,12 +1172,16 @@ func getInterventionsLive(client *http.Client, accountUUID string) ([]Interventi
 			break
 		}
 		cursor = &getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.EndCursor
+
+		pageCount++
+		if pageCount == totalPages {
+			break
+		}
 	}
 
 	sort.Slice(interventions, func(i, j int) bool {
 		return interventions[i].StartedAt.After(interventions[j].StartedAt)
 	})
-
 	return interventions, nil
 }
 
