@@ -235,22 +235,18 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 	<table>
 		<thead>
 			<tr>
-				<th>Number</th>
-				<th>Kind</th>
-				<th>Label</th>
+				<th>Started At</th>
 				<th>Status</th>
-				<th>StartedAt</th>
+				<th>Label</th>
 				<th>Description</th>
 			</tr>
 		</thead>
 		<tbody>
 			{{range .Items}}
 			<tr>
-				<td>{{ .Number }}</td>
-				<td>{{ .Kind }}</td>
-				<td>{{.Label}}</td>
-				<td>{{.Status}}</td>
 				<td>{{.StartedAt.Format "02 Jan 2006"}}</td>
+				<td>{{ .Kind }} {{ .Number }}</br><small>{{ .Status }}</small></td>
+				<td>{{.Label}}</td>
 				<td><small>{{.Description}}</small></td>
 			</tr>
 			{{end}}
