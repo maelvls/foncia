@@ -326,6 +326,8 @@ func createDB(ctx context.Context, path string) error {
 }
 
 func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret, lastSync func() (time.Time, error)) {
+	defaultPath := basePath + "/interventions"
+
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
 
@@ -337,9 +339,9 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 		}
 
 		w.WriteHeader(302)
-		w.Header().Set("Location", basePath+"/interventions")
+		w.Header().Set("Location", defaultPath)
 		tmlpErr.Execute(w, tmlpErrData{
-			Error:   fmt.Sprintf(`The actual page is <a href="%s/interventions">here</a>.`, basePath),
+			Error:   fmt.Sprintf(`Nothing here. Go to: %s`, defaultPath),
 			Version: version,
 		})
 	})
@@ -388,14 +390,13 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 		}
 	})
 
-	mux.HandleFunc("/minecraft", ServeMinecraft)
-
 	listner, err := net.Listen("tcp", serveAddr)
 	if err != nil {
 		logutil.Errorf("while listening: %v", err)
 		os.Exit(1)
 	}
-	logutil.Infof("listening on http://%v/interventions", listner.Addr())
+	logutil.Infof("listening on %v", listner.Addr())
+	logutil.Infof("url: http://%s%s", listner.Addr(), defaultPath)
 
 	err = http.Serve(listner, mux)
 	if err != nil {
@@ -544,47 +545,6 @@ func ListCmd(username string, password secret) {
 		)
 	}
 }
-
-// Example:
-//
-// {
-//   "data": {
-//     "coownerAccount": {
-//       "uuid": "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9",
-//       "trusteeCouncil": {
-//         "missionIncidents": {
-//           "totalCount": null,
-//           "pageInfo": {
-//             "startCursor": "eyJwYWdlTnVtYmVyIjoxLCJpdGVtc1BlclBhZ2UiOjEwfQ",
-//             "endCursor": "eyJwYWdlTnVtYmVyIjoyLCJpdGVtc1BlclBhZ2UiOjEwfQ",
-//             "hasPreviousPage": false,
-//             "hasNextPage": true,
-//             "pageNumber": 1,
-//             "itemsPerPage": 10,
-//             "totalDisplayPages": 6,
-//             "totalPages": null
-//           },
-//           "edges": [
-//             {
-//               "node": {
-//                 "id": "64850e8019d5d64c415d13dd",
-//                 "number": "7000YRK51",
-//                 "startedAt": "2023-04-24T22:00:00.000Z",
-//                 "label": "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS ",
-//                 "status": "WORK_IN_PROGRESS",
-//                 "__typename": "MissionIncident"
-//               },
-//               "__typename": "MissionIncidentNode"
-//             }
-//           ]
-//         },
-//         "__typename": "TrusteeCouncil"
-//       },
-//       "__typename": "CoownerAccount"
-//     },
-//     "__typename": "Query"
-//   }
-// }
 
 type Intervention struct {
 	ID          string           // "64850e8019d5d64c415d13dd"
@@ -770,169 +730,12 @@ func GetInterventionsOld(client *http.Client, coproID string) ([]Intervention, e
 
 // The accountUUID is the base 64 encoded ID of the account. For example:
 //
-//  "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
+//	"eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
 //
 // which decodes to:
 //
-//  {"accountId":"64850e80b3b2947c6cfbd608","customerId":"64850e8036ccdc2407baecd4","quality":"CO_OWNER","buildingId":"64850e80a4ccb95ce4b6b115","trusteeMember":true}
+//	{"accountId":"64850e80b3b2947c6cfbd608","customerId":"64850e8036ccdc2407baecd4","quality":"CO_OWNER","buildingId":"64850e80a4ccb95ce4b6b115","trusteeMember":true}
 //
-// To know what the accountUUID is, the query is:
-//
-//  query getAccounts {
-//    accounts {
-//      ...basicAccount
-//      __typename
-//    }
-//  }
-//
-//  fragment basicAccount on Account {
-//    uuid
-//    number
-//    quality
-//    count {
-//      units
-//      buildings
-//      __typename
-//    }
-//    manager {
-//      id
-//      __typename
-//    }
-//    customer {
-//      ...customer
-//      __typename
-//    }
-//    hasRestrictedAccess
-//    ... on CoownerAccount {
-//      building {
-//        ...basicBuilding
-//        __typename
-//      }
-//      isTrusteeCouncilMember
-//      hasActiveCoOwnershipMandate
-//      showDalenysHeadband
-//      eReco {
-//        isSubscribed
-//        hasHistory
-//        __typename
-//      }
-//      hasEReleve
-//      hasAccessToGeneralAssembly
-//      __typename
-//    }
-//    ... on TenantAccount {
-//      hasFutureLeaseEntryDate
-//      building {
-//        ...basicBuilding
-//        __typename
-//      }
-//      __typename
-//    }
-//    ... on LandlordAccount {
-//      buildings {
-//        ...basicBuilding
-//        __typename
-//      }
-//      __typename
-//    }
-//    __typename
-//  }
-//
-//  fragment customer on Customer {
-//    id
-//    number
-//    civility
-//    familyStatus
-//    firstName
-//    lastName
-//    email
-//    address {
-//      ...address
-//      __typename
-//    }
-//    birthDate
-//    phones {
-//      landline
-//      mobile
-//      __typename
-//    }
-//    noSnailMail
-//    contactPreferences {
-//      eventNotification {
-//        sms
-//        email
-//        postalMail
-//        __typename
-//      }
-//      litigationPrevention {
-//        sms
-//        email
-//        postalMail
-//        __typename
-//      }
-//      privilegedOffers {
-//        sms
-//        email
-//        postalMail
-//        __typename
-//      }
-//      myFonciaNews {
-//        sms
-//        email
-//        postalMail
-//        __typename
-//      }
-//      newsLetter {
-//        sms
-//        email
-//        postalMail
-//        __typename
-//      }
-//      __typename
-//    }
-//    confidentiality {
-//      personalData
-//      isFirstSubmit
-//      partnersOffersInformation
-//      offersInformation
-//      __typename
-//    }
-//    company {
-//      name
-//      siret
-//      address {
-//        ...address
-//        __typename
-//      }
-//      __typename
-//    }
-//    __typename
-//  }
-//
-//  fragment address on Address {
-//    address1
-//    address2
-//    city
-//    zipCode
-//    countryCode
-//    __typename
-//  }
-//
-//  fragment basicBuilding on Building {
-//    id
-//    name
-//    number
-//    address {
-//      ...address
-//      __typename
-//    }
-//    units {
-//      id
-//      __typename
-//    }
-//    __typename
-//  }
-
 // I copy-pasted the graphql query from the "Dev tools" in Chrome, and asked
 // ChatGPT to turn that query into Go.
 func GetAccountUUID(client *http.Client) (string, error) {
