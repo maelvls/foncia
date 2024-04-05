@@ -2,3 +2,4 @@ foncia
 foncia.db
 *.sqlite
 wordlist
+/invoices

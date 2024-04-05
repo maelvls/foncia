@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -36,6 +39,7 @@ var (
 	dbOnly        = flag.Bool("db-only", false, "When set, no HTTP request is made, and everything is fetched from the DB.")
 	dbPath        = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
 	ntfyTopic     = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/.")
+	invoicesDir   = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
 )
@@ -110,7 +114,7 @@ func main() {
 		}
 
 		go func() {
-			items, err := authFetchSave(&http.Client{}, username, password, db)
+			items, err := authFetchSave(&http.Client{}, username, password, *invoicesDir, db)
 			writeLastSync(err)
 			if err != nil {
 				logutil.Errorf("initial fetch: %v", err)
@@ -121,7 +125,7 @@ func main() {
 				time.Sleep(10 * time.Minute)
 
 				logutil.Debugf("updating database by fetching from live")
-				newMissions, err := authFetchSave(&http.Client{}, username, password, db)
+				newMissions, err := authFetchSave(&http.Client{}, username, password, *invoicesDir, db)
 				writeLastSync(err)
 				if err != nil {
 					logutil.Errorf("while fetching and updating database: %v", err)
@@ -163,15 +167,22 @@ func main() {
 }
 
 // Returns the new entries found.
-func authFetchSave(c *http.Client, username string, password secret, db *sql.DB) ([]Mission, error) {
+func authFetchSave(c *http.Client, username string, password secret, invoicesDir string, db *sql.DB) ([]Mission, error) {
+	ctx := context.Background()
+
 	cl, err := authenticatedClient(c, username, password)
 	if err != nil {
 		return nil, fmt.Errorf("while authenticating: %v", err)
 	}
-	newMissions, err := syncLiveMissionsWithDB(context.Background(), cl, db)
+	newMissions, err := syncLiveMissionsWithDB(ctx, cl, db)
 	if err != nil {
 		return nil, fmt.Errorf("while saving to database: %v", err)
 	}
+	err = syncExpensesWithDB(ctx, cl, db, invoicesDir)
+	if err != nil {
+		return nil, fmt.Errorf("while saving to database: %v", err)
+	}
+
 	return newMissions, nil
 }
 
@@ -187,7 +198,7 @@ func getCreds() (string, secret) {
 
 type tmlpData struct {
 	SyncStatus string
-	Items      []Mission
+	Items      []MissionOrExpense
 	Version    string
 }
 
@@ -244,23 +255,38 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 		</thead>
 		<tbody>
 			{{range .Items}}
-			<tr>
-				<td>{{.StartedAt.Format "02 Jan 2006"}}</td>
-				<td>{{ .Kind }} {{ .Number }}</br><small>{{ .Status }}</small></td>
-				<td>{{.Label}}</td>
-				<td><small>{{.Description}}</small></td>
-				<td>
-					<small>
-						{{range .WorkOrders}}
-							{{.Number}}
-							{{.Label}}
-							{{.RepairDateStart.Format "02/01/2006"}}–{{.RepairDateEnd.Format "02/01/2006"}}
-							{{.SupplierName}}
-							{{.SupplierActivity}}</br>
-						{{end}}
-					</small>
-				</td>
-			</tr>
+				{{with .Mission}}
+				<tr>
+					<td>{{.StartedAt.Format "02 Jan 2006"}}</td>
+					<td>{{ .Kind }} {{ .Number }}</br><small>{{ .Status }}</small></td>
+					<td>{{.Label}}</td>
+					<td><small>{{.Description}}</small></td>
+					<td>
+						<small>
+							{{range .WorkOrders}}
+								{{.Number}}
+								{{.Label}}
+								{{.RepairDateStart.Format "02/01/2006"}}–{{.RepairDateEnd.Format "02/01/2006"}}
+								{{.SupplierName}}
+								{{.SupplierActivity}}</br>
+							{{end}}
+						</small>
+					</td>
+				</tr>
+				{{end}}
+				{{with .Expense}}
+				<tr>
+					<td>{{.Date.Format "02 Jan 2006"}}</td>
+					<td>Expense</td>
+					<td>{{.Label}}</td>
+					<td><small>
+						Credit: {{.AmountCredit}} €
+						</br>
+						Debit: {{.AmountDebit}} €
+					</small></td>
+					<td><small><a href="/interventions/dl/{{.InvoiceID}}/{{.Filename}}">{{.Filename}}</a></small></td>
+				</tr>
+				{{end}}
 			{{end}}
 		</tbody>
 	</table>
@@ -334,12 +360,48 @@ func createDB(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create table 'work_orders': %w", err)
 	}
+	_, err = db.ExecContext(ctx, `
+		create table IF NOT EXISTS expenses (
+			invoice_id TEXT,       -- can be empty
+			label TEXT,
+			credit INTEGER,
+			debit INTEGER,
+			date TEXT,             -- time.RFC3339
+			file_path TEXT
+		);`)
+	if err != nil {
+		return fmt.Errorf("failed to create table 'work_orders': %w", err)
+	}
 	_, err = db.ExecContext(ctx, `create index IF NOT EXISTS idx_entries_started_at on missions (started_at);`)
 	if err != nil {
 		return fmt.Errorf("failed to create index: %w", err)
 	}
 
 	return nil
+}
+
+// errors.Is(err, sql.NoRows) when not found.
+func getExpenseByInvoiceID(ctx context.Context, db *sql.DB, id string) (Expense, error) {
+	var e Expense
+	var date string
+	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, credit, debit, date, file_path FROM expenses WHERE invoice_id = ?", id).Scan(&e.InvoiceID, &e.Label, &e.AmountCredit, &e.AmountDebit, &date, &e.FilePath)
+	if err != nil {
+		return Expense{}, fmt.Errorf("while querying database: %w", err)
+	}
+	e.Date, err = time.Parse(time.RFC3339, date)
+	if err != nil {
+		return Expense{}, fmt.Errorf("while parsing 'date': %v", err)
+	}
+	e.Filename = filepath.Base(e.FilePath)
+
+	return e, nil
+}
+
+func logRequest(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		logutil.Debugf("request: %s %s", r.Method, r.URL)
+		next(w, r)
+	}
 }
 
 func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret, lastSync func() (time.Time, error)) {
@@ -349,7 +411,7 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 	enableDebugCurlLogs(client)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -361,15 +423,48 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 			Error:   fmt.Sprintf(`Nothing here. Go to: %s`, defaultPath),
 			Version: version,
 		})
-	})
+	}))
 
-	mux.HandleFunc("/interventions", func(w http.ResponseWriter, r *http.Request) {
+	// Download the invoice PDF. Example:
+	//  GET /interventions/dl/660d79500178f21ab3ffc357/invoice.pdf
+	//                        <invoiceId>              <filename>
+	mux.HandleFunc("/interventions/dl/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		items, err := getMissionsDB(context.Background(), db)
+		// Get filename and invoice ID.
+		path, found := strings.CutPrefix(r.URL.Path, "/interventions/dl/")
+		if !found {
+			logutil.Errorf("was expecting a path like /interventions/dl/<invoiceId>/<filename> but got %q", r.URL.Path)
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		parts := strings.SplitN(path, "/", 2)
+		if len(parts) != 2 {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		invoiceID, _ := parts[0], parts[1]
+
+		expense, err := getExpenseByInvoiceID(context.Background(), db, invoiceID)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		http.ServeFile(w, r, expense.FilePath)
+	}))
+
+	mux.HandleFunc("/interventions", logRequest(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		missions, err := getMissionsDB(context.Background(), db)
 		if err != nil {
 			logutil.Errorf("while listing interventions: %v", err)
 
@@ -381,6 +476,45 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 
 			return
 		}
+
+		expenses, err := getExpensesDB(context.Background(), db)
+		if err != nil {
+			logutil.Errorf("while listing expenses: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			tmlpErr.Execute(w, tmlpErrData{
+				Error:   fmt.Sprintf("Error while listing expenses: %s", err),
+				Version: version,
+			})
+			return
+		}
+
+		// Combine them.
+		var combined []MissionOrExpense
+		for _, m := range missions {
+			m := m
+			combined = append(combined, MissionOrExpense{Mission: &m})
+		}
+		for _, e := range expenses {
+			e := e
+			combined = append(combined, MissionOrExpense{Expense: &e})
+		}
+
+		sort.Slice(combined, func(i, j int) bool {
+			di, dj := time.Time{}, time.Time{}
+			if combined[i].Mission != nil {
+				di = combined[i].Mission.StartedAt
+			}
+			if combined[i].Expense != nil {
+				di = combined[i].Expense.Date
+			}
+			if combined[j].Mission != nil {
+				dj = combined[j].Mission.StartedAt
+			}
+			if combined[j].Expense != nil {
+				dj = combined[j].Expense.Date
+			}
+			return di.After(dj)
+		})
 
 		w.Header().Set("Content-Type", "text/html")
 
@@ -397,7 +531,7 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 
 		err = tmpl.Execute(w, tmlpData{
 			SyncStatus: statusMsg,
-			Items:      items,
+			Items:      combined,
 			Version:    version + " (" + date + ")"},
 		)
 		if err != nil {
@@ -405,7 +539,7 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 			http.Error(w, "error", http.StatusInternalServerError)
 			return
 		}
-	})
+	}))
 
 	listner, err := net.Listen("tcp", serveAddr)
 	if err != nil {
@@ -473,11 +607,11 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, db *sql.DB
 	batchSize := 20
 	err = DoInBatches(batchSize, newMissions, func(batch []Mission) error {
 		for _, mission := range batch {
-			wo, err := getWorkOrdersLive(client, uuid, mission.ID)
+			orders, err := getWorkOrdersLive(client, uuid, mission.ID)
 			if err != nil {
 				return fmt.Errorf("while getting work orders: %v", err)
 			}
-			workOrders[mission.ID] = wo
+			workOrders[mission.ID] = orders
 		}
 
 		logutil.Debugf("saving work orders for %d missions to DB", len(batch))
@@ -500,6 +634,251 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, db *sql.DB
 	})
 
 	return newMissions, nil
+}
+
+func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, invoicesDir string) error {
+	// Create dir if missing.
+	err := os.MkdirAll(invoicesDir, 0755)
+	if err != nil {
+		return fmt.Errorf("while creating directory: %v", err)
+	}
+
+	uuid, err := GetAccountUUID(client)
+	if err != nil {
+		return fmt.Errorf("while getting account UUID: %v", err)
+	}
+	expensesLive, err := getExpensesLive(client, uuid)
+	if err != nil {
+		return fmt.Errorf("while getting expenses: %v", err)
+	}
+
+	expensesInDB, err := getExpensesDB(ctx, db)
+	if err != nil {
+		return fmt.Errorf("while getting existing expenses: %v", err)
+	}
+	existsInDB := make(map[time.Time]Expense)
+	invoiceIDToExpense := make(map[string]Expense)
+	for _, item := range expensesInDB {
+		existsInDB[item.Date] = item
+		if item.InvoiceID != "" {
+			invoiceIDToExpense[item.InvoiceID] = item
+		}
+	}
+
+	// Save the invoice PDFs to disk.
+	err = DoInBatches(20, expensesLive, func(expensesBatch []Expense) error {
+		var expensesBatchUpdated []Expense
+		for _, e := range expensesBatch {
+			if e.InvoiceID == "" {
+				continue
+			}
+
+			// No need to download if it is already present on disk.
+			expenseInDB, isInDB := invoiceIDToExpense[e.InvoiceID]
+			if isInDB && fileExists(expenseInDB.FilePath) {
+				continue
+			}
+			if !isInDB {
+				logutil.Debugf("expense with invoice_id %q not in DB yet", e.InvoiceID)
+			}
+			if isInDB && !fileExists(expenseInDB.FilePath) {
+				logutil.Debugf("file %q not found, downloading invoice %q", expenseInDB.FilePath, e.InvoiceID)
+			}
+
+			invoiceURL, err := getInvoiceURL(client, e.InvoiceID)
+			if err != nil {
+				return fmt.Errorf("while getting invoice URL: %v", err)
+			}
+			resp, err := http.Get(invoiceURL)
+			if err != nil {
+				return fmt.Errorf("while getting invoice: %v", err)
+			}
+			defer resp.Body.Close()
+			// Example:
+			//  x-amz-id-2: LYkuTg0aWoXYJfRSsy2CF+BBAFZJB7Fmt6pLoGb34Yta62/CDmp63ank88BDQQ2itWWHAWwGRAA=
+			//  x-amz-request-id: 1YW04QB3HZTWXHSN
+			//  Date: Fri, 05 Apr 2024 18:31:17 GMT
+			//  x-amz-replication-status: COMPLETED
+			//  Last-Modified: Tue, 02 Apr 2024 06:42:18 GMT
+			//  ETag: "3ce4db0dc63cd2ef935f316181b0fed5"
+			//  x-amz-server-side-encryption: AES256
+			//  x-amz-version-id: k628Oenqp4qoDYl3cNHu59gBK2PIBqpK
+			//  Content-Disposition: filename="ALPES%20CONTROLES%20-%20OSMIL802674431%20-%202024-02-16%20-%202431007J.pdf"
+			//  Accept-Ranges: bytes
+			//  Content-Type: application/pdf
+			//  Server: AmazonS3
+			//  Content-Length: 370642
+
+			// Grab the HTTP headers that contain the file type, size, and name.
+			// This is useful for debugging.
+			disposition := resp.Header.Get("Content-Disposition")
+			if !strings.HasPrefix(disposition, "attachment;") {
+				disposition = "attachment;" + disposition
+			}
+			logutil.Debugf("Content-Disposition: %s", disposition)
+
+			// Parse the filename from the Content-Disposition header.
+			// Example:
+			//     filename="example.pdf"
+			_, params, err := mime.ParseMediaType(disposition)
+			if err != nil {
+				return fmt.Errorf("while parsing Content-Disposition: %v", err)
+			}
+			filename := params["filename"]
+			if filename == "" {
+				logutil.Errorf("no filename in Content-Disposition header")
+				filename = e.InvoiceID + ".pdf"
+			}
+
+			// URL decode the filename.
+			filename, err = url.QueryUnescape(filename)
+			if err != nil {
+				return fmt.Errorf("while URL-decoding filename: %v", err)
+			}
+
+			// Replace all characters that are not allowed in a filename with an
+			// underscore.
+			// [^\d\.\-_~,;:\[\]\(\]]
+			filename = strings.Map(func(r rune) rune {
+				switch {
+				case 'a' <= r && r <= 'z', 'A' <= r && r <= 'Z', '0' <= r && r <= '9',
+					r == '.', r == '-', r == '_', r == '~', r == ',', r == ';', r == ':',
+					r == '[', r == ']', r == '(', r == ')' || r == ' ':
+					return r
+				default:
+					return '_'
+				}
+			}, filename)
+
+			var buf bytes.Buffer
+			_, err = io.Copy(&buf, resp.Body)
+			if err != nil {
+				return fmt.Errorf("while reading invoice: %v", err)
+			}
+
+			path := invoicesDir + "/" + filename
+			err = os.WriteFile(path, buf.Bytes(), 0644)
+			if err != nil {
+				return fmt.Errorf("while saving invoice to disk: %v", err)
+			}
+
+			e.FilePath = path
+
+			expensesBatchUpdated = append(expensesBatchUpdated, e)
+		}
+
+		var newExpensesInBatch, changedExpencesInBatch []Expense
+		for _, expInBatch := range expensesBatchUpdated {
+			expDB, found := existsInDB[expInBatch.Date]
+			if !found {
+				newExpensesInBatch = append(newExpensesInBatch, expInBatch)
+				logutil.Debugf("found new expense %q: %s", expInBatch.Date, expInBatch.Label)
+				continue
+			}
+
+			// Check if the expense has changed. Some fields are empty when they
+			// come from the live API (Filename, FilePath), so we don't compare
+			// them.
+			if expDB.InvoiceID != expInBatch.InvoiceID ||
+				expDB.Label != expInBatch.Label ||
+				expDB.AmountCredit != expInBatch.AmountCredit ||
+				expDB.AmountDebit != expInBatch.AmountDebit {
+				changedExpencesInBatch = append(changedExpencesInBatch, expInBatch)
+				logutil.Debugf("found changed expense %q: %s", expInBatch.Date, expInBatch.Label)
+			}
+		}
+
+		newOrChanged := append(newExpensesInBatch, changedExpencesInBatch...)
+		err = upsertExpensesWithDB(ctx, db, newOrChanged...)
+		if err != nil {
+			return fmt.Errorf("while saving expenses: %v", err)
+		}
+		logutil.Debugf("saved %d new expenses and updated %d expences to DB", len(newExpensesInBatch), len(changedExpencesInBatch))
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func upsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...Expense) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("while starting transaction: %v", err)
+	}
+	defer func() {
+		err = tx.Rollback()
+		if err != nil && err != sql.ErrTxDone {
+			logutil.Errorf("while rolling back transaction: %v", err)
+		}
+	}()
+
+	for _, e := range expense {
+		req := "UPDATE expenses SET invoice_id = ?, label = ?, credit = ?, debit = ?, file_path = ? where date = ?;"
+		values := []interface{}{e.InvoiceID, e.Label, e.AmountCredit, e.AmountDebit, e.FilePath, e.Date.Format(time.RFC3339)}
+		res, err := tx.ExecContext(ctx, req, values...)
+		if err != nil {
+			return fmt.Errorf("while updating expenses: %v", err)
+		}
+
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("while getting rows affected: %v", err)
+		}
+
+		// If no row was updated, insert a new one.
+		if n == 0 {
+			req := "insert into expenses (invoice_id, label, credit, debit, date, file_path) values (?, ?, ?, ?, ?, ?);"
+			values := []interface{}{e.InvoiceID, e.Label, e.AmountCredit, e.AmountDebit, e.Date.Format(time.RFC3339), e.FilePath}
+			_, err := tx.ExecContext(ctx, req, values...)
+			if err != nil {
+				return fmt.Errorf("while inserting expenses: %v", err)
+			}
+		}
+	}
+
+	logutil.Debugf("saved %d expenses to DB", len(expense))
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("while committing transaction: %v", err)
+	}
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func getExpensesDB(ctx context.Context, db *sql.DB) ([]Expense, error) {
+	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, credit, debit, date, file_path FROM expenses ORDER BY date DESC")
+	if err != nil {
+		return nil, fmt.Errorf("while querying database: %v", err)
+	}
+	defer rows.Close()
+
+	var expenses []Expense
+	for rows.Next() {
+		var e Expense
+		var date string
+		err = rows.Scan(&e.InvoiceID, &e.Label, &e.AmountCredit, &e.AmountDebit, &date, &e.FilePath)
+		if err != nil {
+			return nil, fmt.Errorf("while scanning row: %v", err)
+		}
+
+		e.Date, err = time.Parse(time.RFC3339, date)
+		if err != nil {
+			return nil, fmt.Errorf("while parsing 'date': %v", err)
+		}
+
+		e.Filename = filepath.Base(e.FilePath)
+
+		expenses = append(expenses, e)
+	}
+
+	return expenses, nil
 }
 
 func DoInBatches[T any](batchSize int, elmts []T, do func([]T) error) error {
@@ -717,6 +1096,11 @@ type Mission struct {
 	Description string      // "BONJOUR,\n\nVEUILLEZ ENREGISTER LE C02\t\nMERCI CORDIALEMENT"
 	Kind        MissionKind // "Incident" | "Repair"
 	WorkOrders  []WorkOrder
+}
+
+type MissionOrExpense struct {
+	Mission *Mission
+	Expense *Expense
 }
 
 type WorkOrder struct {
@@ -1287,6 +1671,11 @@ func (tr transportCurlLogs) RoundTrip(r *http.Request) (*http.Response, error) {
 // library seems to be the mostly used one, which says a lot about GraphQL's
 // maturity!
 func DoGraphQL[T any](client *http.Client, url, query string, variables map[string]interface{}, resp T) error {
+	// Minify the query.
+	query = strings.ReplaceAll(query, "\n", " ")
+	query = strings.ReplaceAll(query, "\t", " ")
+	query = regexp.MustCompile(`\s+`).ReplaceAllString(query, " ")
+
 	req := struct {
 		Query     string                 `json:"query"`
 		Variables map[string]interface{} `json:"variables"`
@@ -1346,4 +1735,388 @@ func DoGraphQL[T any](client *http.Client, url, query string, variables map[stri
 	}
 
 	return nil
+}
+
+type Supplier struct {
+	ID        string
+	Name      string
+	FirstName string
+	Activity  string
+}
+
+type Document struct {
+	ID               string
+	HashFile         string
+	MimeType         string
+	OriginalFilename string
+	Category         string
+	CreatedAt        string
+}
+
+type Contract struct {
+	ID          string
+	Label       string
+	Description string
+	Number      string
+	EndingDate  string
+	Supplier    Supplier
+	Documents   []Document
+}
+
+func getCouncilMissionSuppliersLive(client *http.Client, accountUUID string) ([]Contract, error) {
+	const getSuppliersQuery = `
+		query getCouncilMissionSuppliers(
+		  $accountUuid: EncodedID!
+		  $first: Int
+		  $after: Cursor
+		  $description: String
+		  $supplierFullname: String
+		  $endingDateFrom: String
+		  $endingDateTo: String
+		) {
+		  coownerAccount(uuid: $accountUuid) {
+		    uuid
+		    trusteeCouncil {
+		      supplierContracts(
+		        first: $first
+		        after: $after
+		        description: $description
+		        supplierFullname: $supplierFullname
+		        endingDateFrom: $endingDateFrom
+		        endingDateTo: $endingDateTo
+		      ) {
+		        pageInfo {
+		            endCursor
+		            hasNextPage
+		        }
+		        edges {
+		          node {
+		            id
+		            label
+		            description
+		            number
+		            endingDate
+		            supplier {
+		                id
+		                name
+		                firstName
+		                activity
+		            }
+		            documents {
+		                id
+		                hashFile
+		                mimeType
+		                originalFilename
+		                category
+		                createdAt
+		            }
+		          }
+		        }
+		      }
+		    }
+		  }
+		}`
+	var getCouncilMissionSuppliers struct {
+		Data struct {
+			CoownerAccount struct {
+				UUID           string `json:"uuid"`
+				TrusteeCouncil struct {
+					SupplierContracts struct {
+						PageInfo struct {
+							EndCursor   string `json:"endCursor"`
+							HasNextPage bool   `json:"hasNextPage"`
+						} `json:"pageInfo"`
+						Edges []struct {
+							Node struct {
+								ID          string `json:"id"`
+								Label       string `json:"label"`
+								Description string `json:"description"`
+								Number      string `json:"number"`
+								EndingDate  string `json:"endingDate"`
+								Supplier    struct {
+									ID        string `json:"id"`
+									Name      string `json:"name"`
+									FirstName string `json:"firstName"`
+									Activity  string `json:"activity"`
+								} `json:"supplier"`
+								Documents []struct {
+									ID               string `json:"id"`
+									HashFile         string `json:"hashFile"`
+									MimeType         string `json:"mimeType"`
+									OriginalFilename string `json:"originalFilename"`
+									Category         string `json:"category"`
+									CreatedAt        string `json:"createdAt"`
+								} `json:"documents"`
+							} `json:"node"`
+						} `json:"edges"`
+					} `json:"supplierContracts"`
+				} `json:"trusteeCouncil"`
+			} `json:"coownerAccount"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getSuppliersQuery, map[string]interface{}{
+		"accountUuid":      accountUUID,
+		"description":      "",
+		"supplierFullname": "",
+	}, &getCouncilMissionSuppliers)
+	if err != nil {
+		return nil, fmt.Errorf("error while querying getCouncilMissionSuppliers: %w", err)
+	}
+
+	var contracts []Contract
+	for _, edge := range getCouncilMissionSuppliers.Data.CoownerAccount.TrusteeCouncil.SupplierContracts.Edges {
+		contracts = append(contracts, Contract{
+			ID:          edge.Node.ID,
+			Label:       edge.Node.Label,
+			Description: edge.Node.Description,
+			Number:      edge.Node.Number,
+			EndingDate:  edge.Node.EndingDate,
+			Supplier: Supplier{
+				ID:   edge.Node.Supplier.ID,
+				Name: edge.Node.Supplier.Name,
+
+				FirstName: edge.Node.Supplier.FirstName,
+				Activity:  edge.Node.Supplier.Activity,
+			},
+			Documents: func() []Document {
+				var docs []Document
+				for _, doc := range edge.Node.Documents {
+					docs = append(docs, Document{
+						ID:               doc.ID,
+						HashFile:         doc.HashFile,
+						MimeType:         doc.MimeType,
+						OriginalFilename: doc.OriginalFilename,
+						Category:         doc.Category,
+						CreatedAt:        doc.CreatedAt,
+					})
+				}
+				return docs
+			}(),
+		})
+	}
+	return contracts, nil
+}
+
+type Expense struct {
+	InvoiceID    string // May be empty! Cannot be used as a key.
+	Label        string
+	Date         time.Time
+	AmountCredit int // Example: 42000
+	AmountDebit  int
+
+	// DB-only fields.
+	FilePath string // Example: "file/path/to/invoice.pdf". Empty when querying live.
+	Filename string // Example: "invoice.pdf". Empty when querying live.
+}
+
+func getInvoiceURL(client *http.Client, invoiceID string) (string, error) {
+	const getInvoiceURLQuery = `query getInvoiceURL($invoiceId: String!) {invoiceURL(invoiceId: $invoiceId)}`
+	var getInvoiceURLResp struct {
+		Data struct {
+			InvoiceURL string `json:"invoiceURL"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getInvoiceURLQuery, map[string]interface{}{
+		"invoiceId": invoiceID,
+	}, &getInvoiceURLResp)
+	if err != nil {
+		return "", fmt.Errorf("error while querying getInvoiceURLResp: %w", err)
+	}
+
+	return getInvoiceURLResp.Data.InvoiceURL, nil
+}
+
+func getExpensesLive(client *http.Client, accountUUID string) ([]Expense, error) {
+	const getBuildingAccountingCurrentQuery = `
+		query getBuildingAccountingCurrent($uuid: EncodedID!) {
+		  coownerAccount(uuid: $uuid) {
+		    uuid
+		    trusteeCouncil {
+		      bankBalance {value currency}
+		      accountingCurrent {
+		        id
+		        openingDate
+		        closingDate
+		        previousTotal {value currency}
+		        votedTotal {value currency}
+		        total {value currency}
+		        nextVotedTotal {value currency}
+		        allocations {
+				  id
+				  name
+				  code
+				  previousTotal {value currency}
+				  votedTotal {value currency}
+				  total {value currency}
+				  nextVotedTotal {value currency}
+				  expenseTypes {
+					id
+					allocationId
+					name
+					code
+					previousTotal {value currency}
+					votedTotal {value currency}
+					total {value currency}
+					nextVotedTotal {value currency}
+					expenses {
+					  invoiceId
+					  piece {
+						hashFile
+					  }
+					  label
+					  date
+					  amount {
+						... on Debit {
+						  value
+						  currency
+						  __typename
+						}
+						... on Credit {
+						  value
+						  currency
+						  __typename
+						}
+					  }
+					  isFromPreviousPeriod
+					}
+				  }
+		        }
+		      }
+		    }
+		  }
+		}`
+	var getBuildingAccountingCurrentResp struct {
+		Data struct {
+			CoownerAccount struct {
+				TrusteeCouncil struct {
+					BankBalance struct {
+						Value    int    `json:"value"`
+						Currency string `json:"currency"`
+					} `json:"bankBalance"`
+					AccountingCurrent struct {
+						ID            string `json:"id"`
+						OpeningDate   string `json:"openingDate"`
+						ClosingDate   string `json:"closingDate"`
+						PreviousTotal struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"previousTotal"`
+						VotedTotal struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"votedTotal"`
+						Total struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"total"`
+						NextVotedTotal struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"nextVotedTotal"`
+						Allocations []struct {
+							ID            string `json:"id"`
+							Name          string `json:"name"`
+							Code          string `json:"code"`
+							PreviousTotal struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"previousTotal"`
+							VotedTotal struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"votedTotal"`
+							Total struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"total"`
+							NextVotedTotal struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"nextVotedTotal"`
+							ExpenseTypes []struct {
+								ID            string `json:"id"`
+								AllocationID  string `json:"allocationId"`
+								Name          string `json:"name"`
+								Code          string `json:"code"`
+								PreviousTotal struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"previousTotal"`
+								VotedTotal struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"votedTotal"`
+								Total struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"total"`
+								NextVotedTotal struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"nextVotedTotal"`
+								Expenses []struct {
+									InvoiceID string `json:"invoiceId"`
+									Piece     struct {
+										HashFile string `json:"hashFile"`
+									} `json:"piece"`
+									Label string `json:"label"`
+									Date  string `json:"date"`
+									// This is a union type, "Debit" or "Credit".
+									Amount struct {
+										Value    int    `json:"value"`
+										Currency string `json:"currency"`
+										Typename string `json:"__typename"`
+									} `json:"amount"`
+									IsFromPreviousPeriod bool `json:"isFromPreviousPeriod"`
+								} `json:"expenses"`
+							} `json:"expenseTypes"`
+						} `json:"allocations"`
+					} `json:"accountingCurrent"`
+				} `json:"trusteeCouncil"`
+			} `json:"coownerAccount"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getBuildingAccountingCurrentQuery, map[string]interface{}{
+		"uuid": accountUUID,
+	}, &getBuildingAccountingCurrentResp)
+	if err != nil {
+		return nil, fmt.Errorf("error while querying getBuildingAccountingCurrentResp: %w", err)
+	}
+
+	var expenses []Expense
+	for _, allocation := range getBuildingAccountingCurrentResp.Data.CoownerAccount.TrusteeCouncil.AccountingCurrent.Allocations {
+		for _, expenseType := range allocation.ExpenseTypes {
+			for _, expense := range expenseType.Expenses {
+				var credit, debit int
+				switch expense.Amount.Typename {
+				case "Credit":
+					credit = expense.Amount.Value
+				case "Debit":
+					debit = expense.Amount.Value
+				default:
+					return nil, fmt.Errorf("unexpected typename %q for expense %+v", expense.Amount.Typename, expense)
+				}
+				var date time.Time
+				if expense.Date != "" {
+					var err error
+					date, err = time.Parse(time.RFC3339, expense.Date)
+					if err != nil {
+						return nil, fmt.Errorf("error parsing time: %w", err)
+					}
+				}
+				expenses = append(expenses, Expense{
+					InvoiceID:    expense.InvoiceID,
+					Label:        expense.Label,
+					Date:         date,
+					AmountCredit: credit,
+					AmountDebit:  debit,
+				})
+			}
+		}
+	}
+
+	return expenses, nil
 }
