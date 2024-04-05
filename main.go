@@ -463,48 +463,64 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, db *sql.DB
 		logutil.Debugf("found new item %q", m.ID)
 	}
 
-	// Watch out, one HTTP request per new mission is made here. There may be
-	// 200-300 missions, so this may take a while.
-	//
-	// Let's keep track of which mission IDs have been processed so that we can
-	// save to DB in batches. That's because (1) disk is slow on Synology so we
-	// need to batchSize, and (2) we don't want to lose all the work if the program
-	// crashes.
-	batchSize := 20
-	var missionIDs []string
-	var missionBatch []Mission
 	workOrders := make(map[string][]WorkOrder) // missionID -> work orders
 
-	for _, m := range newMissions {
-		wo, err := getWorkOrdersLive(client, uuid, m.ID)
-		if err != nil {
-			return nil, fmt.Errorf("while getting work orders: %v", err)
+	// Since HTTP request per new mission is made, and there may be 200-300
+	// missions, let's do them in batches of 20 so that we can save to DB in
+	// regularly so we don't lose all the work if the program crashes (takes a
+	// lot of time partly because Synology's disk is slow, partly because there
+	// are 200-300 HTTP calls to be made).
+	batchSize := 20
+	err = DoInBatches(batchSize, newMissions, func(batch []Mission) error {
+		for _, mission := range batch {
+			wo, err := getWorkOrdersLive(client, uuid, mission.ID)
+			if err != nil {
+				return fmt.Errorf("while getting work orders: %v", err)
+			}
+			workOrders[mission.ID] = wo
 		}
-		workOrders[m.ID] = wo
-		missionIDs = append(missionIDs, m.ID)
-		missionBatch = append(missionBatch, m)
 
-		if len(missionIDs) < batchSize {
-			continue
+		logutil.Debugf("saving work orders for %d missions to DB", len(batch))
+		missionIDs := make([]string, len(batch))
+		for _, m := range batch {
+			missionIDs = append(missionIDs, m.ID)
 		}
-
-		logutil.Debugf("saving work orders for %d missions to DB", len(missionBatch))
 		err = saveWorkOrdersToDB(ctx, db, missionIDs, workOrders)
 		if err != nil {
-			return nil, fmt.Errorf("while saving work orders: %v", err)
+			return fmt.Errorf("while saving work orders: %v", err)
 		}
-		missionIDs = nil
-		workOrders = make(map[string][]WorkOrder)
 
-		logutil.Debugf("saving %d missions to DB", len(missionBatch))
-		err = saveMissionsToDB(ctx, db, missionBatch...)
+		logutil.Debugf("saving %d missions to DB", batch)
+		err = saveMissionsToDB(ctx, db, batch...)
 		if err != nil {
-			return nil, fmt.Errorf("while saving missions: %v", err)
+			return fmt.Errorf("while saving missions: %v", err)
 		}
-		missionBatch = nil
-	}
+
+		return nil
+	})
 
 	return newMissions, nil
+}
+
+func DoInBatches[T any](batchSize int, elmts []T, do func([]T) error) error {
+	var batch []T
+
+	for i, e := range elmts {
+		batch = append(batch, e)
+
+		isLastElmt := i == len(elmts)-1
+		batchIsFull := len(batch) == batchSize
+
+		if batchIsFull || isLastElmt {
+			err := do(batch)
+			if err != nil {
+				return fmt.Errorf("while doing in batches: %v", err)
+			}
+			batch = nil
+		}
+	}
+
+	return nil
 }
 
 func saveWorkOrdersToDB(ctx context.Context, db *sql.DB, missionIDs []string, workOrdersMap map[string][]WorkOrder) error {
