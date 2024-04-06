@@ -26,7 +26,9 @@ with `bin/deploy-foncia`:
 
 ```bash
 docker container inspect foncia >/dev/null 2>/dev/null && docker rm -f foncia || true
-docker run -d --restart=always --name foncia -p 8080:8080 -v $HOME/foncia.sqlite:/foncia.sqlite \
+docker run -d --restart=always --name foncia -p 8080:8080 \
+  -v $HOME/foncia.sqlite:/foncia.sqlite \
+  -v $HOME/foncia_invoices:/invoices \
   -e FONCIA_PASSWORD=REDACTED \
   -e FONCIA_USERNAME=REDACTED \
   ghcr.io/maelvls/foncia:latest \

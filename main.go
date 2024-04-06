@@ -197,12 +197,14 @@ func getCreds() (string, secret) {
 }
 
 type tmlpData struct {
+	BasePath   string
 	SyncStatus string
 	Items      []MissionOrExpense
 	Version    string
 }
 
-var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
+var tmpl = template.Must(template.New("").Parse(`
+<!DOCTYPE html>
 <html>
 <head>
 <title>Interventions</title>
@@ -282,7 +284,7 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 					<td><small>
 						{{.Amount}}
 					</small></td>
-					<td><small><a href="/interventions/dl/{{.InvoiceID}}/{{.Filename}}">{{.Filename}}</a></small></td>
+					<td><small><a href="{{$.BasePath}}/interventions/dl/{{.InvoiceID}}/{{.Filename}}">{{.Filename}}</a></small></td>
 				</tr>
 				{{end}}
 			{{end}}
@@ -423,9 +425,9 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 
 		w.WriteHeader(302)
 		w.Header().Set("Location", defaultPath)
-		tmlpErr.Execute(w, tmlpErrData{
-			Error:   fmt.Sprintf(`Nothing here. Go to: %s`, defaultPath),
-			Version: version,
+		tmlpErr.Execute(w, map[string]interface{}{
+			"Error":   fmt.Sprintf(`Please go to %s`, defaultPath),
+			"Version": version,
 		})
 	}))
 
@@ -534,6 +536,7 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 		}
 
 		err = tmpl.Execute(w, tmlpData{
+			BasePath:   basePath,
 			SyncStatus: statusMsg,
 			Items:      combined,
 			Version:    version + " (" + date + ")"},
