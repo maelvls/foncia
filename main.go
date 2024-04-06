@@ -280,9 +280,7 @@ var tmpl = template.Must(template.New("").Parse(`<!DOCTYPE html>
 					<td>Expense</td>
 					<td>{{.Label}}</td>
 					<td><small>
-						Credit: {{.AmountCredit}} €
-						</br>
-						Debit: {{.AmountDebit}} €
+						{{.Amount}}
 					</small></td>
 					<td><small><a href="/interventions/dl/{{.InvoiceID}}/{{.Filename}}">{{.Filename}}</a></small></td>
 				</tr>
@@ -364,13 +362,19 @@ func createDB(ctx context.Context, path string) error {
 		create table IF NOT EXISTS expenses (
 			invoice_id TEXT,       -- can be empty
 			label TEXT,
-			credit INTEGER,
-			debit INTEGER,
+			amount INTEGER,
 			date TEXT,             -- time.RFC3339
 			file_path TEXT
 		);`)
 	if err != nil {
 		return fmt.Errorf("failed to create table 'work_orders': %w", err)
+	}
+	// Migrate "debit" to "amount" only if "debit" exists.
+	_, err = db.ExecContext(ctx, `ALTER TABLE expenses RENAME COLUMN debit TO amount;`)
+	if err != nil {
+		if !strings.Contains(err.Error(), "debit") {
+			return fmt.Errorf("failed to rename column 'debit' to 'amount': %w", err)
+		}
 	}
 	_, err = db.ExecContext(ctx, `create index IF NOT EXISTS idx_entries_started_at on missions (started_at);`)
 	if err != nil {
@@ -384,7 +388,7 @@ func createDB(ctx context.Context, path string) error {
 func getExpenseByInvoiceID(ctx context.Context, db *sql.DB, id string) (Expense, error) {
 	var e Expense
 	var date string
-	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, credit, debit, date, file_path FROM expenses WHERE invoice_id = ?", id).Scan(&e.InvoiceID, &e.Label, &e.AmountCredit, &e.AmountDebit, &date, &e.FilePath)
+	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, amount, date, file_path FROM expenses WHERE invoice_id = ?", id).Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath)
 	if err != nil {
 		return Expense{}, fmt.Errorf("while querying database: %w", err)
 	}
@@ -399,7 +403,7 @@ func getExpenseByInvoiceID(ctx context.Context, db *sql.DB, id string) (Expense,
 
 func logRequest(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		logutil.Debugf("request: %s %s", r.Method, r.URL)
+		logutil.Debugf("%s %s %s", r.RemoteAddr, r.Method, r.URL)
 		next(w, r)
 	}
 }
@@ -647,10 +651,35 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 	if err != nil {
 		return fmt.Errorf("while getting account UUID: %v", err)
 	}
-	expensesLive, err := getExpensesLive(client, uuid)
+	var expensesLive []Expense
+	expensesLive, err = getExpensesCurrentLive(client, uuid)
 	if err != nil {
 		return fmt.Errorf("while getting expenses: %v", err)
 	}
+	periods, err := getAccountingPeriodsLive(client, uuid)
+	if err != nil {
+		return fmt.Errorf("while getting accounting periods: %v", err)
+	}
+	for _, period := range periods {
+		cur, err := getBuildingAccountingRGDDLive(client, uuid, period.ID)
+		if err != nil {
+			return fmt.Errorf("while getting building accounting RGDD: %v", err)
+		}
+		expensesLive = append(expensesLive, cur...)
+	}
+
+	// Remove duplicates based on the label + date.
+	seen := make(map[string]struct{})
+	var expensesLiveUnique []Expense
+	for _, e := range expensesLive {
+		key := e.Label + e.Date.Format(time.RFC3339)
+		if _, found := seen[key]; found {
+			continue
+		}
+		seen[key] = struct{}{}
+		expensesLiveUnique = append(expensesLiveUnique, e)
+	}
+	expensesLive = expensesLiveUnique
 
 	expensesInDB, err := getExpensesDB(ctx, db)
 	if err != nil {
@@ -679,7 +708,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 				continue
 			}
 			if !isInDB {
-				logutil.Debugf("expense with invoice_id %q not in DB yet", e.InvoiceID)
+				logutil.Debugf("expense %s with invoice_id %q not found in DB", e.Date.Format(time.RFC3339), e.InvoiceID)
 			}
 			if isInDB && !fileExists(expenseInDB.FilePath) {
 				logutil.Debugf("file %q not found, downloading invoice %q", expenseInDB.FilePath, e.InvoiceID)
@@ -689,9 +718,13 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 			if err != nil {
 				return fmt.Errorf("while getting invoice URL: %v", err)
 			}
+			if invoiceURL == "" {
+				logutil.Infof("no invoice URL found for invoice ID %q, skipping download. Expense: %+v", e.InvoiceID, e)
+				continue
+			}
 			resp, err := http.Get(invoiceURL)
 			if err != nil {
-				return fmt.Errorf("while getting invoice: %v", err)
+				return fmt.Errorf("while downloading invoice: %v", err)
 			}
 			defer resp.Body.Close()
 			// Example:
@@ -715,7 +748,6 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 			if !strings.HasPrefix(disposition, "attachment;") {
 				disposition = "attachment;" + disposition
 			}
-			logutil.Debugf("Content-Disposition: %s", disposition)
 
 			// Parse the filename from the Content-Disposition header.
 			// Example:
@@ -776,13 +808,13 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 				continue
 			}
 
-			// Check if the expense has changed. Some fields are empty when they
-			// come from the live API (Filename, FilePath), so we don't compare
-			// them.
+			// Many expenses don't have an invoice PDF attached for a couple of
+			// weeks. That's why we want to update the invoice_id if we found
+			// that it changed. Note that some fields are unique to the database
+			// Expense (Filename, FilePath), that's why we don't compare them.
+			// The date and label are used as keys, so they are not compared.
 			if expDB.InvoiceID != expInBatch.InvoiceID ||
-				expDB.Label != expInBatch.Label ||
-				expDB.AmountCredit != expInBatch.AmountCredit ||
-				expDB.AmountDebit != expInBatch.AmountDebit {
+				expDB.Amount != expInBatch.Amount {
 				changedExpencesInBatch = append(changedExpencesInBatch, expInBatch)
 				logutil.Debugf("found changed expense %q: %s", expInBatch.Date, expInBatch.Label)
 			}
@@ -793,7 +825,6 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 		if err != nil {
 			return fmt.Errorf("while saving expenses: %v", err)
 		}
-		logutil.Debugf("saved %d new expenses and updated %d expences to DB", len(newExpensesInBatch), len(changedExpencesInBatch))
 		return nil
 	})
 	if err != nil {
@@ -816,30 +847,31 @@ func upsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...Expense) e
 	}()
 
 	for _, e := range expense {
-		req := "UPDATE expenses SET invoice_id = ?, label = ?, credit = ?, debit = ?, file_path = ? where date = ?;"
-		values := []interface{}{e.InvoiceID, e.Label, e.AmountCredit, e.AmountDebit, e.FilePath, e.Date.Format(time.RFC3339)}
+		req := "UPDATE expenses SET invoice_id = ?, amount = ?, file_path = ? where date = ? and label = ?;"
+		values := []interface{}{e.InvoiceID, e.Amount, e.FilePath, e.Date.Format(time.RFC3339), e.Label}
 		res, err := tx.ExecContext(ctx, req, values...)
 		if err != nil {
 			return fmt.Errorf("while updating expenses: %v", err)
 		}
 
+		// If no row was updated, insert a new one.
 		n, err := res.RowsAffected()
 		if err != nil {
 			return fmt.Errorf("while getting rows affected: %v", err)
 		}
-
-		// If no row was updated, insert a new one.
-		if n == 0 {
-			req := "insert into expenses (invoice_id, label, credit, debit, date, file_path) values (?, ?, ?, ?, ?, ?);"
-			values := []interface{}{e.InvoiceID, e.Label, e.AmountCredit, e.AmountDebit, e.Date.Format(time.RFC3339), e.FilePath}
+		if n > 0 {
+			logutil.Debugf("db: updated expense %q: %+v", e.Date, e)
+		} else {
+			req := "insert into expenses (invoice_id, label, amount, date, file_path) values (?, ?, ?, ?, ?);"
+			values := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339), e.FilePath}
 			_, err := tx.ExecContext(ctx, req, values...)
 			if err != nil {
 				return fmt.Errorf("while inserting expenses: %v", err)
 			}
+			logutil.Debugf("db: added expense %q: %+v", e.Date, e)
 		}
 	}
 
-	logutil.Debugf("saved %d expenses to DB", len(expense))
 	err = tx.Commit()
 	if err != nil {
 		return fmt.Errorf("while committing transaction: %v", err)
@@ -853,7 +885,7 @@ func fileExists(path string) bool {
 }
 
 func getExpensesDB(ctx context.Context, db *sql.DB) ([]Expense, error) {
-	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, credit, debit, date, file_path FROM expenses ORDER BY date DESC")
+	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path FROM expenses ORDER BY date DESC")
 	if err != nil {
 		return nil, fmt.Errorf("while querying database: %v", err)
 	}
@@ -863,7 +895,7 @@ func getExpensesDB(ctx context.Context, db *sql.DB) ([]Expense, error) {
 	for rows.Next() {
 		var e Expense
 		var date string
-		err = rows.Scan(&e.InvoiceID, &e.Label, &e.AmountCredit, &e.AmountDebit, &date, &e.FilePath)
+		err = rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath)
 		if err != nil {
 			return nil, fmt.Errorf("while scanning row: %v", err)
 		}
@@ -1898,12 +1930,22 @@ func getCouncilMissionSuppliersLive(client *http.Client, accountUUID string) ([]
 	return contracts, nil
 }
 
+type Amount int
+
+func (a Amount) String() string {
+	// 1234567890 -> 1234567,90 €
+	return fmt.Sprintf("%d,%02d €", a/100, a%100)
+}
+
+// I use the label + date as a key in the DB. This is because the date isn't
+// unique. During an update, we may end up duplicating the same expense, but
+// I'll solve that later if that ever happens.
 type Expense struct {
-	InvoiceID    string // May be empty! Cannot be used as a key.
-	Label        string
-	Date         time.Time
-	AmountCredit int // Example: 42000
-	AmountDebit  int
+	InvoiceID string    // May be empty! Cannot be used as a key.
+	PieceHash string    // May be empty! Cannot be used as a key.
+	Label     string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
+	Date      time.Time // May not be unique.
+	Amount    Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
 
 	// DB-only fields.
 	FilePath string // Example: "file/path/to/invoice.pdf". Empty when querying live.
@@ -1928,7 +1970,7 @@ func getInvoiceURL(client *http.Client, invoiceID string) (string, error) {
 	return getInvoiceURLResp.Data.InvoiceURL, nil
 }
 
-func getExpensesLive(client *http.Client, accountUUID string) ([]Expense, error) {
+func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense, error) {
 	const getBuildingAccountingCurrentQuery = `
 		query getBuildingAccountingCurrent($uuid: EncodedID!) {
 		  coownerAccount(uuid: $uuid) {
@@ -2090,12 +2132,12 @@ func getExpensesLive(client *http.Client, accountUUID string) ([]Expense, error)
 	for _, allocation := range getBuildingAccountingCurrentResp.Data.CoownerAccount.TrusteeCouncil.AccountingCurrent.Allocations {
 		for _, expenseType := range allocation.ExpenseTypes {
 			for _, expense := range expenseType.Expenses {
-				var credit, debit int
+				var amount int
 				switch expense.Amount.Typename {
 				case "Credit":
-					credit = expense.Amount.Value
+					amount = -expense.Amount.Value
 				case "Debit":
-					debit = expense.Amount.Value
+					amount = expense.Amount.Value
 				default:
 					return nil, fmt.Errorf("unexpected typename %q for expense %+v", expense.Amount.Typename, expense)
 				}
@@ -2108,15 +2150,347 @@ func getExpensesLive(client *http.Client, accountUUID string) ([]Expense, error)
 					}
 				}
 				expenses = append(expenses, Expense{
-					InvoiceID:    expense.InvoiceID,
-					Label:        expense.Label,
-					Date:         date,
-					AmountCredit: credit,
-					AmountDebit:  debit,
+					InvoiceID: expense.InvoiceID,
+					Label:     expense.Label,
+					Date:      date,
+					Amount:    Amount(amount),
 				})
 			}
 		}
 	}
 
+	return expenses, nil
+}
+
+type AccountingPeriod struct {
+	ID          string
+	Name        string
+	OpeningDate time.Time
+	ClosingDate time.Time
+	Status      string
+}
+
+//		query getAccountingPeriods($accountUuid: EncodedID!, $sortBy: [SortByType!], $status: [AccountingPeriodStatusEnum!], $closingDateTo: String, $first: Int, $before: Cursor, $after: Cursor) {
+//		  coownerAccount(uuid: $accountUuid) {
+//		    uuid
+//		    trusteeCouncil {
+//		      accountingPeriods(
+//		        first: $first
+//		        before: $before
+//		        after: $after
+//		        sortBy: $sortBy
+//		        status: $status
+//		        closingDateTo: $closingDateTo
+//		      ) {
+//		        totalCount
+//		        pageInfo {
+//		          startCursor
+//		          endCursor
+//		          hasPreviousPage
+//		          hasNextPage
+//		        }
+//		        edges {
+//		          node {
+//		            id
+//	             name
+//	             openingDate
+//	             closingDate
+//	             status
+//		          }
+//		        }
+//		      }
+//		    }
+//		  }
+//		}
+func getAccountingPeriodsLive(client *http.Client, accountUUID string) ([]AccountingPeriod, error) {
+	const getAccountingPeriodsQuery = `
+		query getAccountingPeriods($accountUuid: EncodedID!, $sortBy: [SortByType!], $status: [AccountingPeriodStatusEnum!], $closingDateTo: String, $first: Int, $before: Cursor, $after: Cursor) {
+		  coownerAccount(uuid: $accountUuid) {
+		    uuid
+		    trusteeCouncil {
+		      accountingPeriods(
+		        first: $first
+		        before: $before
+		        after: $after
+		        sortBy: $sortBy
+		        status: $status
+		        closingDateTo: $closingDateTo
+		      ) {
+		        totalCount
+		        pageInfo {
+		          startCursor
+		          endCursor
+		          hasPreviousPage
+		          hasNextPage
+		        }
+		        edges {
+		          node {
+		            id
+		            name
+		            openingDate
+		            closingDate
+		            status
+		          }
+		        }
+		      }
+		    }
+		  }
+		}`
+	var getAccountingPeriodsResp struct {
+		Data struct {
+			CoownerAccount struct {
+				TrusteeCouncil struct {
+					AccountingPeriods struct {
+						TotalCount int `json:"totalCount"`
+						PageInfo   struct {
+							StartCursor     string `json:"startCursor"`
+							EndCursor       string `json:"endCursor"`
+							HasPreviousPage bool   `json:"hasPreviousPage"`
+							HasNextPage     bool   `json:"hasNextPage"`
+						} `json:"pageInfo"`
+						Edges []struct {
+							Node struct {
+								ID          string `json:"id"`
+								Name        string `json:"name"`
+								OpeningDate string `json:"openingDate"`
+								ClosingDate string `json:"closingDate"`
+								Status      string `json:"status"`
+							} `json:"node"`
+						} `json:"edges"`
+					} `json:"accountingPeriods"`
+				} `json:"trusteeCouncil"`
+			} `json:"coownerAccount"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getAccountingPeriodsQuery, map[string]interface{}{
+		"accountUuid": accountUUID,
+	}, &getAccountingPeriodsResp)
+	if err != nil {
+		return nil, fmt.Errorf("error while querying getAccountingPeriodsResp: %w", err)
+	}
+
+	var periods []AccountingPeriod
+	for _, edge := range getAccountingPeriodsResp.Data.CoownerAccount.TrusteeCouncil.AccountingPeriods.Edges {
+		var openingDate, closingDate time.Time
+		if edge.Node.OpeningDate != "" {
+			var err error
+			openingDate, err = time.Parse(time.RFC3339, edge.Node.OpeningDate)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing time: %w", err)
+			}
+		}
+		if edge.Node.ClosingDate != "" {
+			var err error
+			closingDate, err = time.Parse(time.RFC3339, edge.Node.ClosingDate)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing time: %w", err)
+			}
+		}
+		periods = append(periods, AccountingPeriod{
+			ID:          edge.Node.ID,
+			Name:        edge.Node.Name,
+			OpeningDate: openingDate,
+			ClosingDate: closingDate,
+			Status:      edge.Node.Status,
+		})
+	}
+	return periods, nil
+}
+
+// query getBuildingAccountingRGDD($uuid: EncodedID!, $accountingPeriodId: String) {\n  coownerAccount(uuid: $uuid) {\n    uuid\n    trusteeCouncil {\n      pastAccountingRGDD(accountingPeriodId: $accountingPeriodId) {\n        totalToAllocate {\n          ...amount\n          __typename\n        }\n        totalVat {\n          ...amount\n          __typename\n        }\n        totalRecoverable {\n          ...amount\n          __typename\n        }\n        allocations {\n          ...allocation\n          __typename\n        }\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}\n\nfragment amount on Amount {\n  value\n  currency\n  __typename\n}\n\nfragment allocation on Allocation {\n  id\n  name\n  code\n  toAllocate {\n    ...amount\n    __typename\n  }\n  vat {\n    ...amount\n    __typename\n  }\n  recoverable {\n    ...amount\n    __typename\n  }\n  expenseTypes {\n    ...expenseType\n    __typename\n  }\n  __typename\n}\n\nfragment expenseType on ExpenseType {\n  id\n  allocationId\n  name\n  code\n  toAllocate {\n    ...amount\n    __typename\n  }\n  vat {\n    ...amount\n    __typename\n  }\n  recoverable {\n    ...amount\n    __typename\n  }\n  expenses {\n    ...expense\n    __typename\n  }\n  __typename\n}\n\nfragment expense on Expense {\n  id\n  label\n  date\n  invoiceId\n  piece {\n    hashFile\n    category\n    id\n    __typename\n  }\n  toAllocate {\n    ...amount\n    __typename\n  }\n  vat {\n    ...amount\n    __typename\n  }\n  recoverable {\n    ...amount\n    __typename\n  }\n  __typename\n}
+func getBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingPeriodID string) ([]Expense, error) {
+	const getBuildingAccountingRGDDQuery = `
+		query getBuildingAccountingRGDD($uuid: EncodedID!, $accountingPeriodId: String) {
+		  coownerAccount(uuid: $uuid) {
+		    uuid
+		    trusteeCouncil {
+		      pastAccountingRGDD(accountingPeriodId: $accountingPeriodId) {
+		        totalToAllocate {
+		          value
+		          currency
+		        }
+		        totalVat {
+		          value
+		          currency
+		        }
+		        totalRecoverable {
+		          value
+		          currency
+		        }
+		        allocations {
+		          id
+		          name
+		          code
+		          toAllocate {
+		            value
+		            currency
+		          }
+		          vat {
+		            value
+		            currency
+		          }
+		          recoverable {
+		            value
+		            currency
+		          }
+		          expenseTypes {
+		            id
+		            allocationId
+		            name
+		            code
+		            toAllocate {
+		              value
+		              currency
+		            }
+		            vat {
+		              value
+		              currency
+		            }
+		            recoverable {
+		              value
+		              currency
+		            }
+		            expenses {
+		              id
+		              label
+		              date
+		              invoiceId
+		              piece {
+		                hashFile
+		                category
+		                id
+		              }
+		              toAllocate {
+		                value
+		                currency
+		              }
+		              vat {
+		                value
+		                currency
+		              }
+		              recoverable {
+		                value
+		                currency
+		              }
+		            }
+		          }
+		        }
+		      }
+		    }
+		  }
+		}`
+	var getBuildingAccountingRGDDResp struct {
+		Data struct {
+			CoownerAccount struct {
+				TrusteeCouncil struct {
+					PastAccountingRGDD struct {
+						TotalToAllocate struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"totalToAllocate"`
+						TotalVat struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"totalVat"`
+						TotalRecoverable struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"totalRecoverable"`
+						Allocations []struct {
+							ID         string `json:"id"`
+							Name       string `json:"name"`
+							Code       string
+							ToAllocate struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"toAllocate"`
+							Vat struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"vat"`
+							Recoverable struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"recoverable"`
+							ExpenseTypes []struct {
+								ID           string `json:"id"`
+								AllocationID string `json:"allocationId"`
+								Name         string `json:"name"`
+								Code         string
+								ToAllocate   struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"toAllocate"`
+								Vat struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"vat"`
+								Recoverable struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"recoverable"`
+								Expenses []struct {
+									ID        string `json:"id"`
+									Label     string `json:"label"`
+									Date      string `json:"date"`
+									InvoiceID string `json:"invoiceId"`
+									Piece     struct {
+										HashFile string `json:"hashFile"`
+										Category string `json:"category"`
+										ID       string `json:"id"`
+									} `json:"piece"`
+									ToAllocate struct {
+										Value    int    `json:"value"`
+										Currency string `json:"currency"`
+									} `json:"toAllocate"`
+									Vat struct {
+										Value    int    `json:"value"`
+										Currency string `json:"currency"`
+									} `json:"vat"`
+									Recoverable struct {
+										Value    int    `json:"value"`
+										Currency string `json:"currency"`
+									} `json:"recoverable"`
+								} `json:"expenses"`
+							} `json:"expenseTypes"`
+						} `json:"allocations"`
+					} `json:"pastAccountingRGDD"`
+				} `json:"trusteeCouncil"`
+			} `json:"coownerAccount"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getBuildingAccountingRGDDQuery, map[string]interface{}{
+		"uuid":               accountUUID,
+		"accountingPeriodId": accountingPeriodID,
+	}, &getBuildingAccountingRGDDResp)
+
+	if err != nil {
+		return nil, fmt.Errorf("error while querying getBuildingAccountingRGDDResp: %w", err)
+	}
+
+	var expenses []Expense
+	for _, allocation := range getBuildingAccountingRGDDResp.Data.CoownerAccount.TrusteeCouncil.PastAccountingRGDD.Allocations {
+		for _, expenseType := range allocation.ExpenseTypes {
+			for _, expense := range expenseType.Expenses {
+				var date time.Time
+				if expense.Date != "" {
+					var err error
+					date, err = time.Parse(time.RFC3339, expense.Date)
+					if err != nil {
+						return nil, fmt.Errorf("error parsing time: %w", err)
+					}
+				}
+				expenses = append(expenses, Expense{
+					InvoiceID: expense.InvoiceID,
+					PieceHash: expense.Piece.HashFile,
+					Label:     expense.Label,
+					Date:      date,
+					Amount:    Amount(expense.ToAllocate.Value),
+				})
+			}
+		}
+	}
 	return expenses, nil
 }
