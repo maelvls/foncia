@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -1068,6 +1069,8 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 	return workOrderMap, nil
 }
 
+// The `client` given as input is only used to authenticate and is not used
+// after that. A fresh client is returned.
 func authenticatedClient(client *http.Client, username string, password secret) (*http.Client, error) {
 	enableDebugCurlLogs(client)
 
@@ -1240,9 +1243,46 @@ func Token(client *http.Client, username string, password secret) (token string,
 		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
 		return "", fmt.Errorf("authentication did not go well. No 'sso' query param was found in the Location header. Location header was %s", loc.String())
 	}
-	jwt := ssoParam[0]
-	logutil.Debugf("authentication: got jwt %q", jwt)
-	return jwt, nil
+	token = ssoParam[0]
+
+	// We parse the JWT to know when the token expires. We can't verify the JWT
+	// because we don't have the public key (and we don't need to verify it),
+	// but I trust that the `exp` claim is correct since I trust the server.
+	expiry, err := parseJWTExp(token)
+	if err != nil {
+		return "", fmt.Errorf("while parsing JWT: %w", err)
+	}
+	logutil.Debugf("authentication: token expires in %s (%s)", expiry.Sub(time.Now()).Round(time.Second), expiry)
+	logutil.Debugf("authentication: got jwt %q", token)
+	return token, nil
+}
+
+// Returns the expiry date of the given JWT. WARNING: This func doesn't verify
+// the JWT's signature! You must trust the source of the JWT.
+func parseJWTExp(token string) (time.Time, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}, fmt.Errorf("JWT has %d parts instead of 3", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, fmt.Errorf("while decoding JWT payload: %w", err)
+	}
+	var payloadMap map[string]interface{}
+	err = json.Unmarshal(payload, &payloadMap)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("while unmarshaling JWT payload: %w", err)
+	}
+	exp, found := payloadMap["exp"]
+	if !found {
+		return time.Time{}, fmt.Errorf("JWT payload does not contain 'exp'")
+	}
+	expInt, ok := exp.(float64)
+	if !ok {
+		return time.Time{}, fmt.Errorf("JWT payload 'exp' is not a number")
+	}
+	expTime := time.Unix(int64(expInt), 0)
+	return expTime, nil
 }
 
 // DO NOT USE. This function is kept for historical reasons.
