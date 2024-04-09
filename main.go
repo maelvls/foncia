@@ -115,27 +115,34 @@ func main() {
 		}
 
 		go func() {
-			items, err := authFetchSave(&http.Client{}, username, password, *invoicesDir, db)
+			newMissions, newExpenses, err := authFetchSave(&http.Client{}, username, password, *invoicesDir, db)
 			writeLastSync(err)
 			if err != nil {
 				logutil.Errorf("initial fetch: %v", err)
 			}
-			logutil.Debugf("initial fetch: %d new items", len(items))
+			logutil.Debugf("initial fetch: %d new missions and %d new expenses", len(newMissions), len(newExpenses))
 
 			for {
 				time.Sleep(10 * time.Minute)
 
 				logutil.Debugf("updating database by fetching from live")
-				newMissions, err := authFetchSave(&http.Client{}, username, password, *invoicesDir, db)
+				newMissions, newExpenses, err := authFetchSave(&http.Client{}, username, password, *invoicesDir, db)
 				writeLastSync(err)
 				if err != nil {
 					logutil.Errorf("while fetching and updating database: %v", err)
 				}
-				logutil.Debugf("found %d new items", len(newMissions))
+				logutil.Debugf("found %d new missions and %d new expenses", len(newMissions), len(newExpenses))
 				if len(newMissions) > 0 {
 					for _, e := range newMissions {
 						logutil.Infof("new: %s", e.Label)
-						err := ntfy(*ntfyTopic, fmt.Sprintf("%s: %s", e.Label, e.Description))
+						err := ntfy(*ntfyTopic, missionToNtfyMsg(e))
+						if err != nil {
+							logutil.Errorf("while sending notification: %v", err)
+							writeLastSync(err)
+						}
+					}
+					for _, e := range newExpenses {
+						err := ntfy(*ntfyTopic, fmt.Sprintf("New expense: %s", e.Label))
 						if err != nil {
 							logutil.Errorf("while sending notification: %v", err)
 							writeLastSync(err)
@@ -153,7 +160,7 @@ func main() {
 		username, password := getCreds()
 		client := &http.Client{}
 		enableDebugCurlLogs(client)
-		token, err := Token(client, username, password)
+		token, err := GetToken(client, username, password)
 		if err != nil {
 			logutil.Errorf("while authenticating: %v", err)
 			os.Exit(1)
@@ -167,24 +174,42 @@ func main() {
 	}
 }
 
+func missionToNtfyMsg(m Mission) string {
+	msg := m.Label
+	if m.Description != "" {
+		msg += ": " + m.Description
+	}
+
+	// Add the work orders.
+	wos := make([]string, len(m.WorkOrders))
+	for _, wo := range m.WorkOrders {
+		wos = append(wos, fmt.Sprintf("%s %s", wo.SupplierActivity, wo.Label))
+	}
+	if len(wos) > 0 {
+		msg += " (" + strings.Join(wos, ", ") + ")"
+	}
+
+	return msg
+}
+
 // Returns the new entries found.
-func authFetchSave(c *http.Client, username string, password secret, invoicesDir string, db *sql.DB) ([]Mission, error) {
+func authFetchSave(c *http.Client, username string, password secret, invoicesDir string, db *sql.DB) ([]Mission, []Expense, error) {
 	ctx := context.Background()
 
 	cl, err := authenticatedClient(c, username, password)
 	if err != nil {
-		return nil, fmt.Errorf("while authenticating: %v", err)
+		return nil, nil, fmt.Errorf("while authenticating: %v", err)
 	}
 	newMissions, err := syncLiveMissionsWithDB(ctx, cl, db)
 	if err != nil {
-		return nil, fmt.Errorf("while saving to database: %v", err)
+		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}
-	err = syncExpensesWithDB(ctx, cl, db, invoicesDir)
+	newExpenses, err := syncExpensesWithDB(ctx, cl, db, invoicesDir)
 	if err != nil {
-		return nil, fmt.Errorf("while saving to database: %v", err)
+		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}
 
-	return newMissions, nil
+	return newMissions, newExpenses, nil
 }
 
 func getCreds() (string, secret) {
@@ -640,34 +665,38 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, db *sql.DB
 
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	return newMissions, nil
 }
 
-func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, invoicesDir string) error {
+// Returns new expenses.
+func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, invoicesDir string) ([]Expense, error) {
 	// Create dir if missing.
 	err := os.MkdirAll(invoicesDir, 0755)
 	if err != nil {
-		return fmt.Errorf("while creating directory: %v", err)
+		return nil, fmt.Errorf("while creating directory: %v", err)
 	}
 
 	uuid, err := GetAccountUUID(client)
 	if err != nil {
-		return fmt.Errorf("while getting account UUID: %v", err)
+		return nil, fmt.Errorf("while getting account UUID: %v", err)
 	}
 	var expensesLive []Expense
 	expensesLive, err = getExpensesCurrentLive(client, uuid)
 	if err != nil {
-		return fmt.Errorf("while getting expenses: %v", err)
+		return nil, fmt.Errorf("while getting expenses: %v", err)
 	}
 	periods, err := getAccountingPeriodsLive(client, uuid)
 	if err != nil {
-		return fmt.Errorf("while getting accounting periods: %v", err)
+		return nil, fmt.Errorf("while getting accounting periods: %v", err)
 	}
 	for _, period := range periods {
 		cur, err := getBuildingAccountingRGDDLive(client, uuid, period.ID)
 		if err != nil {
-			return fmt.Errorf("while getting building accounting RGDD: %v", err)
+			return nil, fmt.Errorf("while getting building accounting RGDD: %v", err)
 		}
 		expensesLive = append(expensesLive, cur...)
 	}
@@ -687,7 +716,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 
 	expensesInDB, err := getExpensesDB(ctx, db)
 	if err != nil {
-		return fmt.Errorf("while getting existing expenses: %v", err)
+		return nil, fmt.Errorf("while getting existing expenses: %v", err)
 	}
 	existsInDB := make(map[time.Time]Expense)
 	invoiceIDToExpense := make(map[string]Expense)
@@ -698,6 +727,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 		}
 	}
 
+	var newExpenses []Expense
 	// Save the invoice PDFs to disk.
 	err = DoInBatches(20, expensesLive, func(expensesBatch []Expense) error {
 		var expensesBatchUpdated []Expense
@@ -824,18 +854,21 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 			}
 		}
 
+		newExpenses = append(newExpenses, newExpensesInBatch...)
+
 		newOrChanged := append(newExpensesInBatch, changedExpencesInBatch...)
 		err = upsertExpensesWithDB(ctx, db, newOrChanged...)
 		if err != nil {
 			return fmt.Errorf("while saving expenses: %v", err)
 		}
+
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return newExpenses, nil
 }
 
 func upsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...Expense) error {
@@ -956,6 +989,10 @@ func saveWorkOrdersToDB(ctx context.Context, db *sql.DB, missionIDs []string, wo
 			values = append(values, w.ID, missionID, w.Number, w.Label, w.RepairDateStart.Format(time.RFC3339), w.RepairDateEnd.Format(time.RFC3339), w.SupplierID, w.SupplierName, w.SupplierActivity)
 		}
 	}
+	// No need to do anything if there are no work orders to insert.
+	if len(values) == 0 {
+		return nil
+	}
 	req = strings.TrimSuffix(req, ",")
 	_, err := db.ExecContext(ctx, req, values...)
 	if err != nil {
@@ -1074,14 +1111,14 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 func authenticatedClient(client *http.Client, username string, password secret) (*http.Client, error) {
 	enableDebugCurlLogs(client)
 
-	token, err := Token(client, username, password)
+	token, err := GetToken(client, username, password)
 	if err != nil {
 		logutil.Errorf("while authenticating: %v", err)
 		os.Exit(1)
 	}
 
 	client = oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: token},
+		&oauth2.Token{AccessToken: string(token)},
 	))
 	enableDebugCurlLogs(client)
 
@@ -1162,21 +1199,27 @@ var (
 type secret string
 
 func (p secret) String() string {
-	return "[redacted]"
+	return "redacted"
 }
 
 func (p secret) Raw() string {
 	return string(p)
 }
 
+type Token string
+
+func (t Token) String() string {
+	return "redacted"
+}
+
 // After getting the token, create a client with the following:
 //
 //	client := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
-//	    &oauth2.Token{AccessToken: token},
+//	    &oauth2.GetToken{AccessToken: token},
 //	))
 //
 // The given client isn't mutated.
-func Token(client *http.Client, username string, password secret) (token string, _ error) {
+func GetToken(client *http.Client, username string, password secret) (Token, error) {
 	// Redirects don't make sense for HTML pages. For example, a 302 redirect
 	// might actually indicate an error.
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
@@ -1243,18 +1286,17 @@ func Token(client *http.Client, username string, password secret) (token string,
 		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
 		return "", fmt.Errorf("authentication did not go well. No 'sso' query param was found in the Location header. Location header was %s", loc.String())
 	}
-	token = ssoParam[0]
+	token := Token(ssoParam[0])
 
 	// We parse the JWT to know when the token expires. We can't verify the JWT
 	// because we don't have the public key (and we don't need to verify it),
 	// but I trust that the `exp` claim is correct since I trust the server.
-	expiry, err := parseJWTExp(token)
+	expiry, err := parseJWTExp(string(token))
 	if err != nil {
 		return "", fmt.Errorf("while parsing JWT: %w", err)
 	}
 	logutil.Debugf("authentication: token expires in %s (%s)", expiry.Sub(time.Now()).Round(time.Second), expiry)
-	logutil.Debugf("authentication: got jwt %q", token)
-	return token, nil
+	return Token(token), nil
 }
 
 // Returns the expiry date of the given JWT. WARNING: This func doesn't verify
