@@ -121,7 +121,7 @@ func main() {
 		}
 
 		go func() {
-			newMissions, newExpenses, err := authFetchSave(client, username, password, *invoicesDir, db)
+			newMissions, newExpenses, err := authFetchSave(client, *invoicesDir, db)
 			writeLastSync(err)
 			if err != nil {
 				logutil.Errorf("initial fetch: %v", err)
@@ -132,7 +132,7 @@ func main() {
 				time.Sleep(10 * time.Minute)
 
 				logutil.Debugf("updating database by fetching from live")
-				newMissions, newExpenses, err := authFetchSave(client, username, password, *invoicesDir, db)
+				newMissions, newExpenses, err := authFetchSave(client, *invoicesDir, db)
 				writeLastSync(err)
 				if err != nil {
 					logutil.Errorf("while fetching and updating database: %v", err)
@@ -189,7 +189,7 @@ func missionToNtfyMsg(m Mission) string {
 	// Add the work orders.
 	wos := make([]string, len(m.WorkOrders))
 	for _, wo := range m.WorkOrders {
-		wos = append(wos, fmt.Sprintf("%s %s", wo.SupplierActivity, wo.Label))
+		wos = append(wos, fmt.Sprintf("%s %s", wo.Supplier.Activity, wo.Label))
 	}
 	if len(wos) > 0 {
 		msg += " (" + strings.Join(wos, ", ") + ")"
@@ -199,14 +199,18 @@ func missionToNtfyMsg(m Mission) string {
 }
 
 // Returns the new entries found.
-func authFetchSave(c *http.Client, username string, password secret, invoicesDir string, db *sql.DB) ([]Mission, []Expense, error) {
+func authFetchSave(client *http.Client, invoicesDir string, db *sql.DB) ([]Mission, []Expense, error) {
 	ctx := context.Background()
 
-	newMissions, err := syncLiveMissionsWithDB(ctx, cl, db)
+	newMissions, err := syncLiveMissionsWithDB(ctx, client, db)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}
-	newExpenses, err := syncExpensesWithDB(ctx, cl, db, invoicesDir)
+	newExpenses, err := syncExpensesWithDB(ctx, client, db, invoicesDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("while saving to database: %v", err)
+	}
+	err = syncSuppliersWithDB(ctx, client, db, invoicesDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}
@@ -297,8 +301,11 @@ var tmpl = template.Must(template.New("").Parse(`
 								{{.Number}}
 								{{.Label}}
 								{{.RepairDateStart.Format "02/01/2006"}}–{{.RepairDateEnd.Format "02/01/2006"}}
-								{{.SupplierName}}
-								{{.SupplierActivity}}</br>
+								{{.Supplier.Name}}
+								{{.Supplier.Activity}}</br>
+								{{if .Supplier.Document.HashFile}}{{with .Supplier.Document}}
+									(<small><a href="{{$.BasePath}}/interventions/dl/contract/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small>)
+								{{end}}{{end}}
 							{{end}}
 						</small>
 					</td>
@@ -312,7 +319,7 @@ var tmpl = template.Must(template.New("").Parse(`
 					<td><small>
 						{{.Amount}}
 					</small></td>
-					<td><small><a href="{{$.BasePath}}/interventions/dl/{{.InvoiceID}}/{{.Filename}}">{{.Filename}}</a></small></td>
+					<td><small><a href="{{$.BasePath}}/interventions/dl/invoice/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
 				</tr>
 				{{end}}
 			{{end}}
@@ -372,8 +379,12 @@ func createDB(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create table 'missions': %w", err)
 	}
+	_, err = db.ExecContext(ctx, `create index IF NOT EXISTS idx_entries_started_at on missions (started_at);`)
+	if err != nil {
+		return fmt.Errorf("failed to create index 'idx_entries_started_at': %w", err)
+	}
 	_, err = db.ExecContext(ctx, `
-		create table IF NOT EXISTS work_orders (
+		CREATE TABLE IF NOT EXISTS work_orders (
 			id TEXT UNIQUE,
 			mission_id TEXT NOT NULL,
 			number TEXT,
@@ -389,15 +400,17 @@ func createDB(ctx context.Context, path string) error {
 		return fmt.Errorf("failed to create table 'work_orders': %w", err)
 	}
 	_, err = db.ExecContext(ctx, `
-		create table IF NOT EXISTS expenses (
+		CREATE TABLE IF NOT EXISTS expenses (
 			invoice_id TEXT,       -- can be empty
 			label TEXT,
 			amount INTEGER,
 			date TEXT,             -- time.RFC3339
-			file_path TEXT
-		);`)
+			file_path TEXT,
+			hash_file TEXT
+		);
+		`)
 	if err != nil {
-		return fmt.Errorf("failed to create table 'work_orders': %w", err)
+		return fmt.Errorf("failed to create table 'expenses': %w", err)
 	}
 	// Migrate "debit" to "amount" only if "debit" exists.
 	_, err = db.ExecContext(ctx, `ALTER TABLE expenses RENAME COLUMN debit TO amount;`)
@@ -406,19 +419,32 @@ func createDB(ctx context.Context, path string) error {
 			return fmt.Errorf("failed to rename column 'debit' to 'amount': %w", err)
 		}
 	}
-	_, err = db.ExecContext(ctx, `create index IF NOT EXISTS idx_entries_started_at on missions (started_at);`)
+	_, err = db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS suppliers (
+			id TEXT UNIQUE,
+			name TEXT,
+			activity TEXT
+		);
+		CREATE TABLE IF NOT EXISTS contract_documents (
+			id TEXT UNIQUE,
+			supplier_id TEXT NOT NULL,
+			file_path TEXT,
+			hash_file TEXT,
+			FOREIGN KEY(supplier_id) REFERENCES suppliers(id)
+		);
+		`)
 	if err != nil {
-		return fmt.Errorf("failed to create index: %w", err)
+		return fmt.Errorf("failed to create table 'contract_documents': %w", err)
 	}
 
 	return nil
 }
 
 // errors.Is(err, sql.NoRows) when not found.
-func getExpenseByInvoiceID(ctx context.Context, db *sql.DB, id string) (Expense, error) {
+func getExpenseByHashFile(ctx context.Context, db *sql.DB, hashFile string) (Expense, error) {
 	var e Expense
 	var date string
-	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, amount, date, file_path FROM expenses WHERE invoice_id = ?", id).Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath)
+	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file FROM expenses WHERE hash_file = ?", hashFile).Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile)
 	if err != nil {
 		return Expense{}, fmt.Errorf("while querying database: %w", err)
 	}
@@ -429,6 +455,17 @@ func getExpenseByInvoiceID(ctx context.Context, db *sql.DB, id string) (Expense,
 	e.Filename = filepath.Base(e.FilePath)
 
 	return e, nil
+}
+
+func getDocumentByHashFile(ctx context.Context, db *sql.DB, hashFile string) (Document, error) {
+	var d Document
+	err := db.QueryRowContext(ctx, "SELECT id, supplier_id, file_path FROM contract_documents WHERE hash_file = ?", hashFile).Scan(&d.ID, &d.SupplierID, &d.FilePath)
+	if err != nil {
+		return Document{}, fmt.Errorf("while querying database: %w", err)
+	}
+	d.Filename = filepath.Base(d.FilePath)
+
+	return d, nil
 }
 
 func logRequest(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
@@ -460,36 +497,50 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 	}))
 
 	// Download the invoice PDF. Example:
-	//  GET /interventions/dl/660d79500178f21ab3ffc357/invoice.pdf
-	//                        <invoiceId>              <filename>
+	//  GET /interventions/dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
+	//  GET /interventions/dl/contract/660d79500178f21ab3ffc357/contract.pdf
+	//                                 <hash_file>              <filename>
 	mux.HandleFunc("/interventions/dl/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Get filename and invoice ID.
+		// Get filename and hash file.
 		path, found := strings.CutPrefix(r.URL.Path, "/interventions/dl/")
 		if !found {
-			logutil.Errorf("was expecting a path like /interventions/dl/<invoiceId>/<filename> but got %q", r.URL.Path)
+			logutil.Errorf("was expecting a path like /interventions/dl/(invoice|contract)/<hash_file>/<filename> but got %q", r.URL.Path)
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 
-		parts := strings.SplitN(path, "/", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(path, "/", 3)
+		if len(parts) != 3 {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		invoiceID, _ := parts[0], parts[1]
+		typ, hashFile, _ := parts[0], parts[1], parts[2]
 
-		expense, err := getExpenseByInvoiceID(context.Background(), db, invoiceID)
-		if err != nil {
+		switch typ {
+		case "invoice":
+			expense, err := getExpenseByHashFile(context.Background(), db, hashFile)
+			if err != nil {
+				logutil.Errorf("while getting expense by hash file: %v", err)
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			http.ServeFile(w, r, expense.FilePath)
+		case "contract":
+			doc, err := getDocumentByHashFile(context.Background(), db, hashFile)
+			if err != nil {
+				logutil.Errorf("while getting document by hash file: %v", err)
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			http.ServeFile(w, r, doc.FilePath)
+		default:
 			http.Error(w, "not found", http.StatusNotFound)
-			return
 		}
-
-		http.ServeFile(w, r, expense.FilePath)
 	}))
 
 	mux.HandleFunc("/interventions", logRequest(func(w http.ResponseWriter, r *http.Request) {
@@ -644,7 +695,7 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, db *sql.DB
 		for _, mission := range batch {
 			orders, err := getWorkOrdersLive(client, uuid, mission.ID)
 			if err != nil {
-				return fmt.Errorf("while getting work orders: %v", err)
+				return fmt.Errorf("while getting work orders from API: %v", err)
 			}
 			workOrders[mission.ID] = orders
 		}
@@ -758,79 +809,10 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 				logutil.Infof("no invoice URL found for invoice ID %q, skipping download. Expense: %+v", e.InvoiceID, e)
 				continue
 			}
-			resp, err := http.Get(invoiceURL)
+			e.FilePath, err = download(invoiceURL, invoicesDir)
 			if err != nil {
 				return fmt.Errorf("while downloading invoice: %v", err)
 			}
-			defer resp.Body.Close()
-			// Example:
-			//  x-amz-id-2: LYkuTg0aWoXYJfRSsy2CF+BBAFZJB7Fmt6pLoGb34Yta62/CDmp63ank88BDQQ2itWWHAWwGRAA=
-			//  x-amz-request-id: 1YW04QB3HZTWXHSN
-			//  Date: Fri, 05 Apr 2024 18:31:17 GMT
-			//  x-amz-replication-status: COMPLETED
-			//  Last-Modified: Tue, 02 Apr 2024 06:42:18 GMT
-			//  ETag: "3ce4db0dc63cd2ef935f316181b0fed5"
-			//  x-amz-server-side-encryption: AES256
-			//  x-amz-version-id: k628Oenqp4qoDYl3cNHu59gBK2PIBqpK
-			//  Content-Disposition: filename="ALPES%20CONTROLES%20-%20OSMIL802674431%20-%202024-02-16%20-%202431007J.pdf"
-			//  Accept-Ranges: bytes
-			//  Content-Type: application/pdf
-			//  Server: AmazonS3
-			//  Content-Length: 370642
-
-			// Grab the HTTP headers that contain the file type, size, and name.
-			// This is useful for debugging.
-			disposition := resp.Header.Get("Content-Disposition")
-			if !strings.HasPrefix(disposition, "attachment;") {
-				disposition = "attachment;" + disposition
-			}
-
-			// Parse the filename from the Content-Disposition header.
-			// Example:
-			//     filename="example.pdf"
-			_, params, err := mime.ParseMediaType(disposition)
-			if err != nil {
-				return fmt.Errorf("while parsing Content-Disposition: %v", err)
-			}
-			filename := params["filename"]
-			if filename == "" {
-				logutil.Errorf("no filename in Content-Disposition header")
-				filename = e.InvoiceID + ".pdf"
-			}
-
-			// URL decode the filename.
-			filename, err = url.QueryUnescape(filename)
-			if err != nil {
-				return fmt.Errorf("while URL-decoding filename: %v", err)
-			}
-
-			// Replace all characters that are not allowed in a filename with an
-			// underscore.
-			// [^\d\.\-_~,;:\[\]\(\]]
-			filename = strings.Map(func(r rune) rune {
-				switch {
-				case 'a' <= r && r <= 'z', 'A' <= r && r <= 'Z', '0' <= r && r <= '9',
-					r == '.', r == '-', r == '_', r == '~', r == ',', r == ';', r == ':',
-					r == '[', r == ']', r == '(', r == ')' || r == ' ':
-					return r
-				default:
-					return '_'
-				}
-			}, filename)
-
-			var buf bytes.Buffer
-			_, err = io.Copy(&buf, resp.Body)
-			if err != nil {
-				return fmt.Errorf("while reading invoice: %v", err)
-			}
-
-			path := invoicesDir + "/" + filename
-			err = os.WriteFile(path, buf.Bytes(), 0644)
-			if err != nil {
-				return fmt.Errorf("while saving invoice to disk: %v", err)
-			}
-
-			e.FilePath = path
 
 			expensesBatchUpdated = append(expensesBatchUpdated, e)
 		}
@@ -850,7 +832,8 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 			// Expense (Filename, FilePath), that's why we don't compare them.
 			// The date and label are used as keys, so they are not compared.
 			if expDB.InvoiceID != expInBatch.InvoiceID ||
-				expDB.Amount != expInBatch.Amount {
+				expDB.Amount != expInBatch.Amount ||
+				expDB.HashFile != expInBatch.HashFile {
 				changedExpencesInBatch = append(changedExpencesInBatch, expInBatch)
 				logutil.Debugf("found changed expense %q: %s", expInBatch.Date, expInBatch.Label)
 			}
@@ -873,6 +856,221 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 	return newExpenses, nil
 }
 
+// Returns the path to the downloaded file relative to the current folder.
+// Example, if `invoicesDir` is "invoices":
+//
+//	path:     "invoices/2024-04-05_2APF.pdf"
+func download(fileURL string, invoicesDir string) (path string, _ error) {
+	// No need to use the authenticated client here since the URL is
+	// authenticated using one of the query parameters.
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return "", fmt.Errorf("while downloading invoice: %v", err)
+	}
+	defer resp.Body.Close()
+	// Example:
+	//  x-amz-id-2: LYkuTg0aWoXYJfRSsy2CF+BBAFZJB7Fmt6pLoGb34Yta62/CDmp63ank88BDQQ2itWWHAWwGRAA=
+	//  x-amz-request-id: 1YW04QB3HZTWXHSN
+	//  Date: Fri, 05 Apr 2024 18:31:17 GMT
+	//  x-amz-replication-status: COMPLETED
+	//  Last-Modified: Tue, 02 Apr 2024 06:42:18 GMT
+	//  ETag: "3ce4db0dc63cd2ef935f316181b0fed5"
+	//  x-amz-server-side-encryption: AES256
+	//  x-amz-version-id: k628Oenqp4qoDYl3cNHu59gBK2PIBqpK
+	//  Content-Disposition: filename="ALPES%20CONTROLES%20-%20OSMIL802674431%20-%202024-02-16%20-%202431007J.pdf"
+	//  Accept-Ranges: bytes
+	//  Content-Type: application/pdf
+	//  Server: AmazonS3
+	//  Content-Length: 370642
+
+	// Grab the HTTP headers that contain the file type, size, and name.
+	// This is useful for debugging.
+	disposition := resp.Header.Get("Content-Disposition")
+	if !strings.HasPrefix(disposition, "attachment;") {
+		disposition = "attachment;" + disposition
+	}
+
+	// Parse the filename from the Content-Disposition header.
+	// Example:
+	//     filename="example.pdf"
+	_, params, err := mime.ParseMediaType(disposition)
+	if err != nil {
+		return "", fmt.Errorf("while parsing Content-Disposition: %v", err)
+	}
+	filename := params["filename"]
+	if filename == "" {
+		return "", fmt.Errorf("no filename in Content-Disposition header")
+	}
+
+	// URL decode the filename.
+	filename, err = url.QueryUnescape(filename)
+	if err != nil {
+		return "", fmt.Errorf("while URL-decoding filename: %v", err)
+	}
+
+	// Replace all characters that are not allowed in a filename with an
+	// underscore.
+	// [^\d\.\-_~,;:\[\]\(\]]
+	filename = strings.Map(func(r rune) rune {
+		switch {
+		case 'a' <= r && r <= 'z', 'A' <= r && r <= 'Z', '0' <= r && r <= '9',
+			r == '.', r == '-', r == '_', r == '~', r == ',', r == ';', r == ':',
+			r == '[', r == ']', r == '(', r == ')' || r == ' ':
+			return r
+		default:
+			return '_'
+		}
+	}, filename)
+
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("while reading file: %v", err)
+	}
+
+	path = invoicesDir + "/" + filename
+	err = os.WriteFile(path, buf.Bytes(), 0644)
+	if err != nil {
+		return "", fmt.Errorf("while saving file to disk: %v", err)
+	}
+
+	return path, nil
+}
+
+func syncSuppliersWithDB(ctx context.Context, client *http.Client, db *sql.DB, invoicesDir string) error {
+	uuid, err := GetAccountUUID(client)
+	if err != nil {
+		return fmt.Errorf("while getting account UUID: %v", err)
+	}
+
+	contracts, err := getCouncilMissionSuppliersLive(client, uuid)
+	if err != nil {
+		return fmt.Errorf("while getting suppliers: %v", err)
+	}
+
+	var suppliers []Supplier
+	var documents []Document
+
+	for _, c := range contracts {
+		suppliers = append(suppliers, c.Supplier)
+		for _, d := range c.Documents {
+			fileURL, err := getDocumentURL(client, d.HashFile)
+			if err != nil {
+				return fmt.Errorf("while getting document URL: %v", err)
+			}
+
+			d.SupplierID = c.Supplier.ID
+			d.FilePath, err = download(fileURL, invoicesDir)
+			if err != nil {
+				return fmt.Errorf("while downloading document: %v", err)
+			}
+			d.Filename = filepath.Base(d.FilePath)
+
+			documents = append(documents, d)
+		}
+	}
+
+	err = upsertSuppliersToDB(ctx, db, suppliers)
+	if err != nil {
+		return fmt.Errorf("while saving suppliers: %v", err)
+	}
+
+	err = upsertDocumentsWithDB(ctx, db, documents)
+	if err != nil {
+		return fmt.Errorf("while saving documents: %v", err)
+	}
+
+	return nil
+}
+
+func upsertSuppliersToDB(ctx context.Context, db *sql.DB, suppliers []Supplier) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("while starting transaction: %v", err)
+	}
+	defer func() {
+		err = tx.Rollback()
+		if err != nil && err != sql.ErrTxDone {
+			logutil.Errorf("while rolling back transaction: %v", err)
+		}
+	}()
+
+	for _, s := range suppliers {
+		req := "UPDATE suppliers SET name = ?, activity = ? WHERE id = ?;"
+		res, err := tx.ExecContext(ctx, req, s.Name, s.Activity, s.ID)
+		if err != nil {
+			return fmt.Errorf("while updating suppliers: %v", err)
+		}
+
+		// If no row was updated, insert a new one.
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("while getting rows affected: %v", err)
+		}
+		if n > 0 {
+			logutil.Debugf("db: updated supplier %q: %+v", s.ID, s)
+			continue
+		} else {
+			req := "INSERT INTO suppliers (id, name, activity) VALUES (?, ?, ?);"
+			_, err := tx.ExecContext(ctx, req, s.ID, s.Name, s.Activity)
+			if err != nil {
+				return fmt.Errorf("while inserting suppliers: %v", err)
+			}
+			logutil.Debugf("db: added supplier %q: %+v", s.ID, s)
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("while committing transaction: %v", err)
+	}
+	return nil
+}
+
+func upsertDocumentsWithDB(ctx context.Context, db *sql.DB, documents []Document) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("while starting transaction: %v", err)
+	}
+	defer func() {
+		err = tx.Rollback()
+		if err != nil && err != sql.ErrTxDone {
+			logutil.Errorf("while rolling back transaction: %v", err)
+		}
+	}()
+
+	for _, d := range documents {
+		req := "UPDATE contract_documents SET supplier_id = ?, file_path = ?, hash_file = ?  WHERE id = ?;"
+		res, err := tx.ExecContext(ctx, req, d.SupplierID, d.FilePath, d.HashFile, d.ID)
+		if err != nil {
+			return fmt.Errorf("while updating documents: %v", err)
+		}
+
+		// If no row was updated, insert a new one.
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("while getting rows affected: %v", err)
+		}
+		if n > 0 {
+			logutil.Debugf("db: updated document %q: %+v", d.ID, d)
+			continue
+		} else {
+			req := "INSERT INTO contract_documents (id, supplier_id, file_path, hash_file) VALUES (?, ?, ?, ?);"
+			_, err := tx.ExecContext(ctx, req, d.ID, d.SupplierID, d.FilePath, d.HashFile)
+			if err != nil {
+				return fmt.Errorf("while inserting into contract_documents: %v", err)
+			}
+			logutil.Debugf("db: added document %q: %+v", d.ID, d)
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("while committing transaction: %v", err)
+	}
+	return nil
+}
+
 func upsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...Expense) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -886,8 +1084,8 @@ func upsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...Expense) e
 	}()
 
 	for _, e := range expense {
-		req := "UPDATE expenses SET invoice_id = ?, amount = ?, file_path = ? where date = ? and label = ?;"
-		values := []interface{}{e.InvoiceID, e.Amount, e.FilePath, e.Date.Format(time.RFC3339), e.Label}
+		req := "UPDATE expenses SET invoice_id = ?, amount = ?, file_path = ?, hash_file = ? where date = ? and label = ?;"
+		values := []interface{}{e.InvoiceID, e.Amount, e.FilePath, e.HashFile, e.Date.Format(time.RFC3339), e.Label}
 		res, err := tx.ExecContext(ctx, req, values...)
 		if err != nil {
 			return fmt.Errorf("while updating expenses: %v", err)
@@ -901,8 +1099,8 @@ func upsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...Expense) e
 		if n > 0 {
 			logutil.Debugf("db: updated expense %q: %+v", e.Date, e)
 		} else {
-			req := "insert into expenses (invoice_id, label, amount, date, file_path) values (?, ?, ?, ?, ?);"
-			values := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339), e.FilePath}
+			req := "INSERT INTO expenses (invoice_id, label, amount, date, file_path, hash_file) VALUES (?, ?, ?, ?, ?, ?);"
+			values := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339), e.FilePath, e.HashFile}
 			_, err := tx.ExecContext(ctx, req, values...)
 			if err != nil {
 				return fmt.Errorf("while inserting expenses: %v", err)
@@ -924,7 +1122,7 @@ func fileExists(path string) bool {
 }
 
 func getExpensesDB(ctx context.Context, db *sql.DB) ([]Expense, error) {
-	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path FROM expenses ORDER BY date DESC")
+	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file FROM expenses ORDER BY date DESC")
 	if err != nil {
 		return nil, fmt.Errorf("while querying database: %v", err)
 	}
@@ -934,7 +1132,7 @@ func getExpensesDB(ctx context.Context, db *sql.DB) ([]Expense, error) {
 	for rows.Next() {
 		var e Expense
 		var date string
-		err = rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath)
+		err = rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile)
 		if err != nil {
 			return nil, fmt.Errorf("while scanning row: %v", err)
 		}
@@ -974,7 +1172,7 @@ func DoInBatches[T any](batchSize int, elmts []T, do func([]T) error) error {
 }
 
 func saveWorkOrdersToDB(ctx context.Context, db *sql.DB, missionIDs []string, workOrdersMap map[string][]WorkOrder) error {
-	if len(workOrdersMap) == 0 {
+	if len(missionIDs) == 0 {
 		return nil
 	}
 
@@ -983,12 +1181,11 @@ func saveWorkOrdersToDB(ctx context.Context, db *sql.DB, missionIDs []string, wo
 	for _, missionID := range missionIDs {
 		workOrders, found := workOrdersMap[missionID]
 		if !found {
-			logutil.Debugf("no work orders for mission %q", missionID)
 			continue
 		}
 		for _, w := range workOrders {
 			req += "(?, ?, ?, ?, ?, ?, ?, ?, ?),"
-			values = append(values, w.ID, missionID, w.Number, w.Label, w.RepairDateStart.Format(time.RFC3339), w.RepairDateEnd.Format(time.RFC3339), w.SupplierID, w.SupplierName, w.SupplierActivity)
+			values = append(values, w.ID, missionID, w.Number, w.Label, w.RepairDateStart.Format(time.RFC3339), w.RepairDateEnd.Format(time.RFC3339), w.Supplier.ID, w.Supplier.Name, w.Supplier.Activity)
 		}
 	}
 	// No need to do anything if there are no work orders to insert.
@@ -1049,7 +1246,7 @@ func getMissionsDB(ctx context.Context, db *sql.DB) ([]Mission, error) {
 	}
 	workOrderMap, err := getWorkOrdersDB(ctx, db, missionIDs...)
 	if err != nil {
-		return nil, fmt.Errorf("while getting work orders: %v", err)
+		return nil, fmt.Errorf("while getting work orders from DB: %v", err)
 	}
 
 	for i := range missions {
@@ -1067,8 +1264,15 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 	if len(missionIDs) == 0 {
 		return nil, nil
 	}
-
-	req := "select id, mission_id, number, label, repair_date_start, repair_date_end, supplier_id, supplier_name, supplier_activity from work_orders where mission_id in ("
+	// Join the tables work_orders with suppliers and contract_documents.
+	req := `SELECT
+				w.id, w.mission_id, w.number, w.label, w.repair_date_start, w.repair_date_end, w.supplier_id,
+				s.name, s.activity,
+				d.id, d.file_path, d.hash_file
+			FROM work_orders w
+			LEFT JOIN suppliers s ON s.id = w.supplier_id
+			LEFT JOIN contract_documents d ON d.supplier_id = w.supplier_id
+			WHERE w.mission_id in (`
 	var values []interface{}
 	for _, id := range missionIDs {
 		req += "?,"
@@ -1086,12 +1290,23 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 	workOrderMap := make(map[string][]WorkOrder)
 	for rows.Next() {
 		var wo WorkOrder
-		var repairDateStart, repairDateEnd string
-		var missionID string
-		err = rows.Scan(&wo.ID, &missionID, &wo.Number, &wo.Label, &repairDateStart, &repairDateEnd, &wo.SupplierID, &wo.SupplierName, &wo.SupplierActivity)
+		var missionID, repairDateStart, repairDateEnd string
+		var supplName, supplActivity sql.NullString
+		var docID, docFilePath, docHashFile sql.NullString
+		err = rows.Scan(
+			&wo.ID, &missionID, &wo.Number, &wo.Label, &repairDateStart, &repairDateEnd, &wo.Supplier.ID,
+			&supplName, &supplActivity,
+			&docID, &docFilePath, &docHashFile,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("while scanning row: %v", err)
 		}
+
+		wo.Supplier.Name = supplName.String
+		wo.Supplier.Activity = supplActivity.String
+		wo.Supplier.Document.ID = docID.String
+		wo.Supplier.Document.FilePath = docFilePath.String
+		wo.Supplier.Document.HashFile = docHashFile.String
 
 		wo.RepairDateStart, err = time.Parse(time.RFC3339, repairDateStart)
 		if err != nil {
@@ -1101,6 +1316,7 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 		if err != nil {
 			return nil, fmt.Errorf("while parsing 'repair_date_end': %v", err)
 		}
+		wo.Supplier.Document.Filename = filepath.Base(wo.Supplier.Document.FilePath)
 
 		workOrderMap[missionID] = append(workOrderMap[missionID], wo)
 	}
@@ -1181,14 +1397,12 @@ type MissionOrExpense struct {
 }
 
 type WorkOrder struct {
-	ID               string    // "64850e80df57eb4ade3cf63c"
-	Number           string    // "OSMIL802702875"
-	Label            string    // "BOUVIER SECURITE INCENDIE - DEMANDE INTERVENTION P"
-	RepairDateStart  time.Time // "2022-10-18T22:00:00.000Z"
-	RepairDateEnd    time.Time // "2022-10-18T22:00:00.000Z"
-	SupplierID       string    // "64850e809b58ffb817f73b20"
-	SupplierName     string    // ""
-	SupplierActivity string    // "MFEU"
+	ID              string    // "64850e80df57eb4ade3cf63c"
+	Number          string    // "OSMIL802702875"
+	Label           string    // "BOUVIER SECURITE INCENDIE - DEMANDE INTERVENTION P"
+	RepairDateStart time.Time // "2022-10-18T22:00:00.000Z"
+	RepairDateEnd   time.Time // "2022-10-18T22:00:00.000Z"
+	Supplier        Supplier
 }
 
 type MissionKind string
@@ -1747,14 +1961,17 @@ func getWorkOrdersLive(client *http.Client, accountUUID, missionID string) ([]Wo
 		}
 
 		orders = append(orders, WorkOrder{
-			ID:               edge.Node.ID,
-			Number:           edge.Node.Number,
-			Label:            edge.Node.Label,
-			RepairDateStart:  start,
-			RepairDateEnd:    end,
-			SupplierID:       edge.Node.Supplier.ID,
-			SupplierName:     edge.Node.Supplier.Name,
-			SupplierActivity: edge.Node.Supplier.Activity,
+			ID:              edge.Node.ID,
+			Number:          edge.Node.Number,
+			Label:           edge.Node.Label,
+			RepairDateStart: start,
+			RepairDateEnd:   end,
+			Supplier: Supplier{
+				ID:        edge.Node.Supplier.ID,
+				Name:      edge.Node.Supplier.Name,
+				FirstName: edge.Node.Supplier.FirstName,
+				Activity:  edge.Node.Supplier.Activity,
+			},
 		})
 	}
 
@@ -1860,29 +2077,43 @@ func DoGraphQL[T any](client *http.Client, url, query string, variables map[stri
 }
 
 type Supplier struct {
-	ID        string
-	Name      string
-	FirstName string
-	Activity  string
+	ID       string
+	Name     string // Examples: "2NRT-POMPES ENVIRONNEMENT"
+	Activity string // Examples: "PLOM", "ADBE", "ISOL"
+
+	// DB-only fields.
+	Document Document
+
+	// Live-only fields.
+	FirstName string // Almost always "null".
 }
 
 type Document struct {
-	ID               string
-	HashFile         string
-	MimeType         string
-	OriginalFilename string
-	Category         string
-	CreatedAt        string
+	ID       string
+	HashFile string // Example: "64850e805e5793033297f476"
+
+	// DB-only fields.
+	SupplierID string
+	FilePath   string // Example: "invoices/2023-03-09_2apf.pdf"
+	Filename   string // Example: "2023-03-09_2apf.pdf"
+
+	// Live-only fields.
+	OriginalFilename string // Example: "2023-03-09_2apf.pdf"
+	MimeType         string // Example: "application/pdf"
+	Category         string // Example: "contract"
+	CreatedAt        time.Time
 }
 
 type Contract struct {
+	Supplier  Supplier
+	Documents []Document
+
+	// Live-only fields.
 	ID          string
 	Label       string
 	Description string
 	Number      string
 	EndingDate  string
-	Supplier    Supplier
-	Documents   []Document
 }
 
 func getCouncilMissionSuppliersLive(client *http.Client, accountUUID string) ([]Contract, error) {
@@ -2004,13 +2235,18 @@ func getCouncilMissionSuppliersLive(client *http.Client, accountUUID string) ([]
 			Documents: func() []Document {
 				var docs []Document
 				for _, doc := range edge.Node.Documents {
+					createdAt, err := time.Parse(time.RFC3339, doc.CreatedAt)
+					if err != nil {
+						logutil.Debugf("error parsing time: %v", err)
+						return nil
+					}
 					docs = append(docs, Document{
 						ID:               doc.ID,
 						HashFile:         doc.HashFile,
 						MimeType:         doc.MimeType,
 						OriginalFilename: doc.OriginalFilename,
 						Category:         doc.Category,
-						CreatedAt:        doc.CreatedAt,
+						CreatedAt:        createdAt,
 					})
 				}
 				return docs
@@ -2032,7 +2268,7 @@ func (a Amount) String() string {
 // I'll solve that later if that ever happens.
 type Expense struct {
 	InvoiceID string    // May be empty! Cannot be used as a key.
-	PieceHash string    // May be empty! Cannot be used as a key.
+	HashFile  string    // May be empty! Cannot be used as a key.
 	Label     string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
 	Date      time.Time // May not be unique.
 	Amount    Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
@@ -2058,6 +2294,24 @@ func getInvoiceURL(client *http.Client, invoiceID string) (string, error) {
 	}
 
 	return getInvoiceURLResp.Data.InvoiceURL, nil
+}
+
+func getDocumentURL(client *http.Client, hash string) (string, error) {
+	const getDocumentURLQuery = `query getDocumentURL($hash: String!) {documentURL(hash: $hash)}`
+	var getDocumentURLResp struct {
+		Data struct {
+			DocumentURL string `json:"documentURL"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getDocumentURLQuery, map[string]interface{}{
+		"hash": hash,
+	}, &getDocumentURLResp)
+	if err != nil {
+		return "", fmt.Errorf("error while querying getDocumentURL: %w", err)
+	}
+
+	return getDocumentURLResp.Data.DocumentURL, nil
 }
 
 func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense, error) {
@@ -2574,7 +2828,7 @@ func getBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 				}
 				expenses = append(expenses, Expense{
 					InvoiceID: expense.InvoiceID,
-					PieceHash: expense.Piece.HashFile,
+					HashFile:  expense.Piece.HashFile,
 					Label:     expense.Label,
 					Date:      date,
 					Amount:    Amount(expense.ToAllocate.Value),
