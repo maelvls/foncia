@@ -98,6 +98,12 @@ func main() {
 			os.Exit(1)
 		}
 
+		client, err := authenticatedClient(&http.Client{}, username, password)
+		if err != nil {
+			logutil.Errorf("while authenticating client: %v", err)
+			os.Exit(1)
+		}
+
 		m := sync.RWMutex{}
 		lastSyncErr := error(nil)
 		lastSync := time.Time{}
@@ -115,7 +121,7 @@ func main() {
 		}
 
 		go func() {
-			newMissions, newExpenses, err := authFetchSave(&http.Client{}, username, password, *invoicesDir, db)
+			newMissions, newExpenses, err := authFetchSave(client, username, password, *invoicesDir, db)
 			writeLastSync(err)
 			if err != nil {
 				logutil.Errorf("initial fetch: %v", err)
@@ -126,7 +132,7 @@ func main() {
 				time.Sleep(10 * time.Minute)
 
 				logutil.Debugf("updating database by fetching from live")
-				newMissions, newExpenses, err := authFetchSave(&http.Client{}, username, password, *invoicesDir, db)
+				newMissions, newExpenses, err := authFetchSave(client, username, password, *invoicesDir, db)
 				writeLastSync(err)
 				if err != nil {
 					logutil.Errorf("while fetching and updating database: %v", err)
@@ -196,10 +202,6 @@ func missionToNtfyMsg(m Mission) string {
 func authFetchSave(c *http.Client, username string, password secret, invoicesDir string, db *sql.DB) ([]Mission, []Expense, error) {
 	ctx := context.Background()
 
-	cl, err := authenticatedClient(c, username, password)
-	if err != nil {
-		return nil, nil, fmt.Errorf("while authenticating: %v", err)
-	}
 	newMissions, err := syncLiveMissionsWithDB(ctx, cl, db)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
@@ -1106,18 +1108,18 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 	return workOrderMap, nil
 }
 
-// The `client` given as input is only used to authenticate and is not used
+// The `authClient` given as input is only used to authenticate and is not used
 // after that. A fresh client is returned.
-func authenticatedClient(client *http.Client, username string, password secret) (*http.Client, error) {
-	enableDebugCurlLogs(client)
+func authenticatedClient(authClient *http.Client, username string, password secret) (*http.Client, error) {
+	enableDebugCurlLogs(authClient)
 
-	token, err := GetToken(client, username, password)
+	token, err := GetToken(authClient, username, password)
 	if err != nil {
 		logutil.Errorf("while authenticating: %v", err)
 		os.Exit(1)
 	}
 
-	client = oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
+	client := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: string(token)},
 	))
 	enableDebugCurlLogs(client)
@@ -1211,6 +1213,9 @@ type Token string
 func (t Token) String() string {
 	return "redacted"
 }
+
+// Implements the oauth2.TokenSource interface.
+type FonciaAuth string
 
 // After getting the token, create a client with the following:
 //
