@@ -832,11 +832,15 @@ func (a Amount) String() string {
 // unique. During an update, we may end up duplicating the same expense, but
 // I'll solve that later if that ever happens.
 type Expense struct {
-	InvoiceID string    // May be empty! Cannot be used as a key.
-	HashFile  string    // May be empty! Cannot be used as a key.
-	Label     string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
-	Date      time.Time // May not be unique.
-	Amount    Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
+	InvoiceID string // Only set when a document is attached.
+	// The hash file comes from AWS S3. For example, the URL will look like this:
+	//  https://fon-mil-prod-plato-prv.s3.eu-west-3.amazonaws.com/9/d/8/7/b/64850e800e5a086a68e9d87b?...
+	//                                                                      <------- hashFile ------>
+	// I don't know how to calculate this hash file from the document's content.
+	HashFile string    // Only set when a document is attached.
+	Label    string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
+	Date     time.Time // May not be unique.
+	Amount   Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
 
 	// DB-only fields.
 	FilePath string // Example: "file/path/to/invoice.pdf". Empty when querying live.
