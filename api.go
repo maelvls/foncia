@@ -1060,6 +1060,7 @@ func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense,
 				}
 				expenses = append(expenses, Expense{
 					InvoiceID: expense.InvoiceID,
+					HashFile:  expense.Piece.HashFile,
 					Label:     expense.Label,
 					Date:      date,
 					Amount:    Amount(amount),
