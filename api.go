@@ -777,6 +777,7 @@ func getCouncilMissionSuppliersLive(client *http.Client, accountUUID string) ([]
 		"accountUuid":      accountUUID,
 		"description":      "",
 		"supplierFullname": "",
+		"first":            100,
 	}, &getCouncilMissionSuppliers)
 	if err != nil {
 		return nil, fmt.Errorf("error while querying getCouncilMissionSuppliers: %w", err)
@@ -847,6 +848,9 @@ type Expense struct {
 	Filename string // Example: "invoice.pdf". Empty when querying live.
 }
 
+// Important: don't call getInvoiceURL if invoiceID exists but the hashFile is
+// empty. If that's the case, the invoice PDF doesn't exist, and getInvoiceURL
+// will return an empty URL.
 func getInvoiceURL(client *http.Client, invoiceID string) (string, error) {
 	const getInvoiceURLQuery = `query getInvoiceURL($invoiceId: String!) {invoiceURL(invoiceId: $invoiceId)}`
 	var getInvoiceURLResp struct {

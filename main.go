@@ -664,7 +664,11 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, db *sql.DB, in
 	err = DoInBatches(20, expensesLive, func(expensesBatch []Expense) error {
 		var expensesBatchUpdated []Expense
 		for _, e := range expensesBatch {
-			if e.InvoiceID == "" {
+			// I noticed that certain expenses have an invoiceID but no PDF
+			// document attached, and that appears to be the case when the
+			// hashFile is empty. So I skip downloading when there is no
+			// invoiceID or when the hashFile is empty.
+			if e.InvoiceID == "" || e.HashFile == "" {
 				continue
 			}
 
