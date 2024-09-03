@@ -220,6 +220,7 @@ func getCreds() (string, secret) {
 type tmlpData struct {
 	BasePath   string
 	SyncStatus string
+	NtfyTopic  string
 	Items      []MissionOrExpense
 	Version    string
 }
@@ -264,16 +265,16 @@ var tmpl = template.Must(template.New("").Parse(`
 	</style>
 </head>
 <body>
-	<h1>Interventions</h1>
-	<p>{{.SyncStatus}}</p>
+	<h1>Interventions et factures TERRA NOSTRA 2</h1>
+	<p>Vous pouvez recevoir les notifications en allant sur <a href="https://ntfy.sh/{{.NtfyTopic}}">https://ntfy.sh/{{.NtfyTopic}}</a>. <small>Statut : {{.SyncStatus}}</small></p>
 	<table>
 		<thead>
 			<tr>
-				<th>Started At</th>
-				<th>Status</th>
+				<th>Date</th>
+				<th>Type et statut</th>
 				<th>Label</th>
 				<th>Description</th>
-				<th>Work Orders</th>
+				<th>Facture ou ordre de service</th>
 			</tr>
 		</thead>
 		<tbody>
@@ -481,16 +482,17 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 		when, err := lastSync()
 		switch {
 		case when.IsZero():
-			statusMsg = "No sync has been done yet."
+			statusMsg = "Aucune synchro n'a été faite."
 		case err != nil:
-			statusMsg = fmt.Sprintf("Last sync failed %s ago: %v", time.Since(when).Truncate(time.Second), err)
+			statusMsg = fmt.Sprintf("La dernière synchro a échoué il y a %s. Erreur : %v", time.Since(when).Truncate(time.Second), err)
 		default:
-			statusMsg = fmt.Sprintf("Last sync succeeded %s ago", time.Since(when).Truncate(time.Second))
+			statusMsg = fmt.Sprintf("La dernière synchro a échoué il y a %s.", time.Since(when).Truncate(time.Second))
 		}
 
 		err = tmpl.Execute(w, tmlpData{
 			BasePath:   basePath,
 			SyncStatus: statusMsg,
+			NtfyTopic:  *ntfyTopic,
 			Items:      combined,
 			Version:    version + " (" + date + ")"},
 		)
