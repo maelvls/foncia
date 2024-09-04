@@ -262,7 +262,7 @@ var tmpl = template.Must(template.New("").Parse(`
 </head>
 <body>
 	<h1>Interventions et factures TERRA NOSTRA 2</h1>
-	<p>Vous pouvez recevoir les notifications en allant sur <a href="https://ntfy.sh/{{.NtfyTopic}}">https://ntfy.sh/{{.NtfyTopic}}</a>. <small>Statut : {{.SyncStatus}}</small></p>
+	<p>Vous pouvez recevoir les notifications sur ordinateur sur <a href="https://ntfy.sh/{{.NtfyTopic}}">https://ntfy.sh/{{.NtfyTopic}}</a> ou en téléchargeant l'app Ntfy et en ajoutant le topic "{{.NtfyTopic}}". <small>Statut : {{.SyncStatus}}</small></p>
 	<table>
 		<thead>
 			<tr>
