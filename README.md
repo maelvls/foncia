@@ -2,7 +2,10 @@
 
 The `foncia` CLI lets you list all "missionRepairs" and "missionIncidents". It
 also lets you create a server that notifies you using ntfy.sh when a new
-"missionIncident" or "missionRepair" is created.
+"missionIncident" or "missionRepair" is created. Example:
+
+![suivi-foncia](https://github.com/user-attachments/assets/a7cfef68-5432-4756-9244-9c866e43a298)
+
 
 I've created this for two reasons:
 
