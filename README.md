@@ -18,8 +18,8 @@ I've created this for two reasons:
 ```bash
 KO_DOCKER_REPO=ghcr.io/maelvls/foncia KO_DEFAULTBASEIMAGE=alpine \
   ko build . --bare --tarball /tmp/out.tar --push=false
-ssh remote /usr/local/bin/docker load </tmp/out.tar
-ssh remote sh -lc bin/deploy-foncia
+ssh synology /usr/local/bin/docker load </tmp/out.tar
+ssh synology sh -lc bin/deploy-foncia
 ```
 
 with `bin/deploy-foncia`:
@@ -36,4 +36,12 @@ docker run -d --restart=always --name foncia -p 8080:8080 \
   --db /foncia.sqlite \
   --ntfy-topic REDACTED \
   serve
+```
+
+### Who?
+
+```
+ssh synology /usr/local/bin/docker logs caddy 2>&1 | grep '^{' | jq --slurp '.[]|select(.logger=="security")|"\(.msg)\t\(.user.email)"' -r
+ssh synology /usr/local/bin/docker logs caddy 2>&1 >/dev/null --follow | grep '"logger":"security"'
+docker logs caddy --follow 2>&1 | grep '^{' | jq 'select(.logger == "security")'
 ```
