@@ -65,10 +65,6 @@ func main() {
 	case "version":
 		fmt.Println(version)
 	case "serve":
-		if *serveBasePath != "" && !strings.HasPrefix(*serveBasePath, "/") {
-			logutil.Errorf("basepath must start with a slash")
-			os.Exit(1)
-		}
 		logutil.Infof("version: %s (%s)", version, date)
 		username, password := getCreds()
 
@@ -350,7 +346,18 @@ func logRequest(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc 
 	}
 }
 
+// The basePath should always start with a slash and not end with a slash. If
+// you want to given an empty base path, don't give "/". Instead, give "".
 func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret, lastSync func() (time.Time, error)) {
+	if basePath != "" && !strings.HasPrefix(basePath, "/") {
+		logutil.Errorf("base path must start with a slash or be an empty string")
+		os.Exit(1)
+	}
+	if strings.HasSuffix(basePath, "/") {
+		logutil.Errorf("base path must not end with a slash; if you want to give the base path /, give an empty string instead")
+		os.Exit(1)
+	}
+
 	defaultPath := basePath + "/interventions"
 
 	client := &http.Client{}
