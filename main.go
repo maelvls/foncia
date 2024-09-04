@@ -493,7 +493,7 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 		case err != nil:
 			statusMsg = fmt.Sprintf("La dernière synchro a échoué il y a %s. Erreur : %v", time.Since(when).Truncate(time.Second), err)
 		default:
-			statusMsg = fmt.Sprintf("La dernière synchro a échoué il y a %s.", time.Since(when).Truncate(time.Second))
+			statusMsg = fmt.Sprintf("La dernière synchro a réussi il y a %s.", time.Since(when).Truncate(time.Second))
 		}
 
 		err = tmpl.Execute(w, tmlpData{
