@@ -38,13 +38,15 @@ docker run -d --restart=always --name foncia -p 8080:8080 \
   --debug \
   --db /foncia.sqlite \
   --ntfy-topic REDACTED \
+  --basepath "/foncia" \
+  --baseurl https://suivi-foncia \
   serve
 ```
 
 ### Who?
 
-```
-ssh synology /usr/local/bin/docker logs caddy 2>&1 | grep '^{' | jq --slurp '.[]|select(.logger=="security")|"\(.msg)\t\(.user.email)"' -r
+```sh
+ssh synology /usr/local/bin/docker logs caddy 2>&1 | grep '^{' | jq --slurp '.[]|select(.logger=="security")|"\(.ts|strftime("%Y-%m-%d %H:%M:%S"))\t\(.msg)\t\(.user.email)"' -r | grep -vE 'successfully configured OAuth 2.0|provisioned app instance|provisioning app instance' | uniq
 ssh synology /usr/local/bin/docker logs caddy 2>&1 >/dev/null --follow | grep '"logger":"security"'
 docker logs caddy --follow 2>&1 | grep '^{' | jq 'select(.logger == "security")'
 ```
