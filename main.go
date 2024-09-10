@@ -26,10 +26,18 @@ var (
 
 	serveBasePath = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
 	serveAddr     = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
+	serveBaseURL  = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications. If empty, --addr is used.")
 	dbOnly        = flag.Bool("db-only", false, "When set, no HTTP request is made, and everything is fetched from the DB.")
 	dbPath        = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
 	ntfyTopic     = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/.")
 	invoicesDir   = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
+
+	// In order to test the Ntfy integration, you can use --sync-period=10s and
+	// manually remove the last item from the DB:
+	//
+	//  sqlite3 foncia.sqlite 'delete from missions where id = (select id from missions limit 1);'
+	//  sqlite3 foncia.sqlite 'delete from expenses where invoice_id = (select invoice_id from expenses limit 1);'
+	syncPeriod = flag.Duration("sync-period", 10*time.Minute, "Period at which to sync with the live API.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
 )
@@ -105,6 +113,15 @@ func main() {
 			return lastSync, lastSyncErr
 		}
 
+		serveBaseURL := *serveBaseURL
+		if strings.HasSuffix(serveBaseURL, "/") {
+			logutil.Errorf("base URL must not end with a slash, or must be empty")
+			os.Exit(1)
+		}
+		if serveBaseURL == "" {
+			serveBaseURL = "http://" + *serveAddr
+		}
+
 		go func() {
 			newMissions, newExpenses, err := authFetchSave(client, *invoicesDir, db)
 			writeLastSync(err)
@@ -114,7 +131,7 @@ func main() {
 			logutil.Debugf("initial fetch: %d new missions and %d new expenses", len(newMissions), len(newExpenses))
 
 			for {
-				time.Sleep(10 * time.Minute)
+				time.Sleep(*syncPeriod)
 
 				logutil.Debugf("updating database by fetching from live")
 				newMissions, newExpenses, err := authFetchSave(client, *invoicesDir, db)
@@ -122,22 +139,32 @@ func main() {
 				if err != nil {
 					logutil.Errorf("while fetching and updating database: %v", err)
 				}
-				logutil.Debugf("found %d new missions and %d new expenses", len(newMissions), len(newExpenses))
-				if len(newMissions) > 0 {
-					for _, e := range newMissions {
-						logutil.Infof("new: %s", e.Label)
-						err := ntfy(*ntfyTopic, missionToNtfyMsg(e))
-						if err != nil {
-							logutil.Errorf("while sending notification: %v", err)
-							writeLastSync(err)
-						}
+
+				if len(newMissions) > 0 || len(newExpenses) > 0 {
+					logutil.Debugf("found %d new missions and %d new expenses", len(newMissions), len(newExpenses))
+				} else {
+					logutil.Debugf("no new mission and no new expense")
+				}
+				for _, e := range newMissions {
+					logutil.Infof("new mission: %s", e.Label)
+					err := ntfy(*ntfyTopic, missionToNtfyMsg(serveBaseURL, *serveBasePath, e))
+					if err != nil {
+						logutil.Errorf("while sending notification: %v", err)
+						writeLastSync(err)
 					}
-					for _, e := range newExpenses {
-						err := ntfy(*ntfyTopic, fmt.Sprintf("New expense: %s", e.Label))
-						if err != nil {
-							logutil.Errorf("while sending notification: %v", err)
-							writeLastSync(err)
-						}
+				}
+				for _, e := range newExpenses {
+					logutil.Infof("new expense: %s", e.Label)
+					err := ntfy(*ntfyTopic, ntfyMsg{
+						HeaderTitle:    "Nouvelle facture",
+						HeaderTags:     "money",
+						Body:           e.Label + " (" + e.Amount.String() + ")",
+						HeaderPriority: "default",
+						HeaderClick:    serveBaseURL + *serveBasePath + "/interventions#" + e.InvoiceID,
+					})
+					if err != nil {
+						logutil.Errorf("while sending notification: %v", err)
+						writeLastSync(err)
 					}
 				}
 			}
@@ -147,6 +174,34 @@ func main() {
 	case "list":
 		username, password := getCreds()
 		ListCmd(username, password)
+	case "rm-last-expense":
+		path := *dbPath
+		logutil.Debugf("using sqlite3 database file %q", path)
+
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			logutil.Errorf("while opening database: %v", err)
+			os.Exit(1)
+		}
+		err = rmLastExpenseDB(db)
+		if err != nil {
+			logutil.Errorf("while removing last expense: %v", err)
+			os.Exit(1)
+		}
+	case "rm-last-mission":
+		path := *dbPath
+		logutil.Debugf("using sqlite3 database file %q", path)
+
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			logutil.Errorf("while opening database: %v", err)
+			os.Exit(1)
+		}
+		err = rmLastMissionDB(db)
+		if err != nil {
+			logutil.Errorf("while removing last expense: %v", err)
+			os.Exit(1)
+		}
 	case "token":
 		username, password := getCreds()
 		client := &http.Client{}
@@ -165,7 +220,22 @@ func main() {
 	}
 }
 
-func missionToNtfyMsg(m Mission) string {
+// Example:
+//
+//	POST https://ntfy.sh/my_topic
+//	Content-Type: text/plain
+//	Title: Unauthorized access detected
+//	Priority: urgent
+//	Tags: warning,skull
+type ntfyMsg struct {
+	HeaderTitle    string // Title of the notification.
+	HeaderPriority string // Notif proprity: max/urgent, high, default, low, min.
+	HeaderTags     string // Comma-separated emoji shortcodes: warning, skull, etc.
+	HeaderClick    string // URL to open when clicking on the notification.
+	Body           string // Content of the notification.
+}
+
+func missionToNtfyMsg(baseURL, basePath string, m Mission) ntfyMsg {
 	msg := m.Label
 	if m.Description != "" {
 		msg += ": " + m.Description
@@ -180,7 +250,12 @@ func missionToNtfyMsg(m Mission) string {
 		msg += " (" + strings.Join(wos, ", ") + ")"
 	}
 
-	return msg
+	return ntfyMsg{
+		HeaderTitle: "Nouvelle intervention",
+		HeaderTags:  "tools",
+		HeaderClick: baseURL + basePath + "/interventions#" + m.ID,
+		Body:        msg,
+	}
 }
 
 // Returns the new entries found.
@@ -276,8 +351,8 @@ var tmpl = template.Must(template.New("").Parse(`
 		<tbody>
 			{{range .Items}}
 				{{with .Mission}}
-				<tr>
-					<td>{{.StartedAt.Format "02 Jan 2006"}}</td>
+				<tr id="{{ .ID }}">
+					<td><a href="{{$.BasePath}}/interventions#{{ .ID }}">{{.StartedAt.Format "02 Jan 2006"}}</a></td>
 					<td>{{ .Kind }} {{ .Number }}</br><small>{{ .Status }}</small></td>
 					<td>{{.Label}}</td>
 					<td><small>{{.Description}}</small></td>
@@ -298,9 +373,9 @@ var tmpl = template.Must(template.New("").Parse(`
 				</tr>
 				{{end}}
 				{{with .Expense}}
-				<tr>
-					<td>{{.Date.Format "02 Jan 2006"}}</td>
-					<td>Expense</td>
+				<tr id="{{.InvoiceID}}">
+					<td><a href="{{$.BasePath}}/interventions#{{ .InvoiceID }}">{{.Date.Format "02 Jan 2006"}}</a></td>
+					<td>Facture</td>
 					<td>{{.Label}}</td>
 					<td><small>
 						{{.Amount}}
@@ -526,15 +601,32 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 }
 
 // This function comes from an MIT-licensed project from github.com/SgtCoDFish.
-func ntfy(topic, message string) error {
+func ntfy(topic string, msg ntfyMsg) error {
 	client := &http.Client{Timeout: 5 * time.Second}
+	// Create request without doing it.
 
-	ntfyMessage := strings.NewReader(
-		fmt.Sprintf("%s", message),
-	)
+	req, err := http.NewRequest("POST", "https://ntfy.sh/"+topic, strings.NewReader(msg.Body))
+	if err != nil {
+		return fmt.Errorf("while creating request: %v", err)
+	}
 
-	_, err := client.Post(fmt.Sprintf("https://ntfy.sh/%s", topic), "text/plain", ntfyMessage)
-	return err
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Title", msg.HeaderTitle)
+	req.Header.Set("Priority", msg.HeaderPriority)
+	req.Header.Set("Tags", msg.HeaderTags)
+	req.Header.Set("Click", msg.HeaderClick)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("while sending request: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body := make([]byte, 1<<20) // Max. 1MiB.
+		n, _ := resp.Body.Read(body)
+		return fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, body[:n])
+	}
+
+	return nil
 }
 
 // Returns the new items.

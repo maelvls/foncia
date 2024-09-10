@@ -275,7 +275,7 @@ func saveWorkOrdersToDB(ctx context.Context, db *sql.DB, missionIDs []string, wo
 	req = strings.TrimSuffix(req, ",")
 	_, err := db.ExecContext(ctx, req, values...)
 
-	logutil.Debugf("sql saveWorkOrdersToDB: %s with:\n", req, fprintfValues(values, ",", "\n", 9))
+	logutil.Debugf("sql saveWorkOrdersToDB: %s with:%s", req, fprintfValues(values, ",", "\n", 9))
 	if err != nil {
 		return fmt.Errorf("while inserting work orders: %v", err)
 	}
@@ -457,4 +457,25 @@ func getExpensesDB(ctx context.Context, db *sql.DB) ([]Expense, error) {
 	}
 
 	return expenses, nil
+}
+
+func rmLastExpenseDB(db *sql.DB) error {
+	_, err := db.Exec("DELETE FROM expenses WHERE rowid = (SELECT max(rowid) FROM expenses);")
+	if err != nil {
+		return fmt.Errorf("while deleting last expense: %v", err)
+	}
+	return nil
+}
+func rmLastMissionDB(db *sql.DB) error {
+	// First, remove the work orders associated with the last mission.
+	_, err := db.Exec("DELETE FROM work_orders WHERE mission_id = (SELECT id FROM missions ORDER BY started_at DESC LIMIT 1);")
+	if err != nil {
+		return fmt.Errorf("while deleting work orders: %v", err)
+	}
+
+	_, err = db.Exec("DELETE FROM missions WHERE id = (SELECT id FROM missions ORDER BY started_at DESC LIMIT 1);")
+	if err != nil {
+		return fmt.Errorf("while deleting last mission: %v", err)
+	}
+	return nil
 }
