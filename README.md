@@ -32,6 +32,8 @@ docker container inspect foncia >/dev/null 2>/dev/null && docker rm -f foncia ||
 docker run -d --restart=always --name foncia -p 8080:8080 \
   -v $HOME/foncia.sqlite:/foncia.sqlite \
   -v $HOME/foncia_invoices:/invoices \
+  -v $HOME/foncia-header.html:/foncia-header.html \
+  -v $HOME/foncia_invoices:/invoices \
   -e FONCIA_PASSWORD=REDACTED \
   -e FONCIA_USERNAME=REDACTED \
   ghcr.io/maelvls/foncia:latest \
@@ -40,6 +42,7 @@ docker run -d --restart=always --name foncia -p 8080:8080 \
   --ntfy-topic REDACTED \
   --basepath "/foncia" \
   --baseurl https://suivi-foncia \
+  --header-file /foncia-header.html \
   serve
 ```
 

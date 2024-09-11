@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -24,13 +25,14 @@ var (
 	// EnableDebug enables debugFlag logs.
 	debugFlag = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
 
-	serveBasePath = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
-	serveAddr     = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
-	serveBaseURL  = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications. If empty, --addr is used.")
-	dbOnly        = flag.Bool("db-only", false, "When set, no HTTP request is made, and everything is fetched from the DB.")
-	dbPath        = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
-	ntfyTopic     = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/.")
-	invoicesDir   = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
+	serveBasePath  = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
+	serveAddr      = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
+	serveBaseURL   = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications. If empty, --addr is used.")
+	dbOnly         = flag.Bool("db-only", false, "When set, no HTTP request is made, and everything is fetched from the DB.")
+	dbPath         = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
+	ntfyTopic      = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/.")
+	invoicesDir    = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
+	htmlHeaderFile = flag.String("header-file", "", "File containing an HTML header to be added to the top of the page. Can contain Go template syntax. The template is executed with the following data: {BasePath, SyncStatus, NtfyTopic, Items, Version}.")
 
 	// In order to test the Ntfy integration, you can use --sync-period=10s and
 	// manually remove the last item from the DB:
@@ -307,7 +309,14 @@ type tmlpData struct {
 	Version    string
 }
 
-var tmpl = template.Must(template.New("").Parse(`
+var defaultHeaderTmpl = `
+<p>
+	Notifications: <a href="https://ntfy.sh/{{.NtfyTopic}}">https://ntfy.sh/{{.NtfyTopic}}</a>.
+	<small>Statut : {{.SyncStatus}}</small>
+</p>
+`
+
+var tmpl = template.Must(template.New("base").Parse(`
 <!DOCTYPE html>
 <html>
 <head>
@@ -348,7 +357,9 @@ var tmpl = template.Must(template.New("").Parse(`
 </head>
 <body>
 	<h1>Interventions et factures TERRA NOSTRA 2</h1>
-	<p>Vous pouvez recevoir les notifications sur ordinateur sur <a href="https://ntfy.sh/{{.NtfyTopic}}">https://ntfy.sh/{{.NtfyTopic}}</a> ou en téléchargeant l'app Ntfy et en ajoutant le topic "{{.NtfyTopic}}". <small>Statut : {{.SyncStatus}}</small></p>
+
+	{{ template "header" . }}
+
 	<table>
 		<thead>
 			<tr>
@@ -445,6 +456,34 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 	}
 
 	defaultPath := basePath + "/interventions"
+
+	var headerContents string = defaultHeaderTmpl
+	if *htmlHeaderFile != "" {
+		f, err := os.Open(*htmlHeaderFile)
+		if err != nil {
+			logutil.Errorf("while opening HTML header file: %v", err)
+			os.Exit(1)
+		}
+
+		bytes, err := io.ReadAll(f)
+		if err != nil {
+			logutil.Errorf("while reading HTML header file: %v", err)
+			os.Exit(1)
+		}
+		err = f.Close()
+		if err != nil {
+			logutil.Errorf("while closing HTML header file: %v", err)
+			os.Exit(1)
+		}
+
+		headerContents = string(bytes)
+	}
+
+	_, err := tmpl.New("header").Parse(headerContents)
+	if err != nil {
+		logutil.Errorf("while parsing HTML header file %s: %v", *htmlHeaderFile, err)
+		os.Exit(1)
+	}
 
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
