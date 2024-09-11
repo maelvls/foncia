@@ -25,7 +25,7 @@ var (
 	// EnableDebug enables debugFlag logs.
 	debugFlag = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
 
-	serveBasePath  = flag.String("basepath", "", "Base path to serve the API on. For example, if set to /api, the API will be served on /api/interventions. Useful for reverse proxies. Must start with a slash.")
+	serveBasePath  = flag.String("basepath", "", "Base path, useful for reverse proxies. Must start with a slash or be empty.")
 	serveAddr      = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
 	serveBaseURL   = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications. If empty, --addr is used.")
 	dbOnly         = flag.Bool("db-only", false, "When set, no HTTP request is made, and everything is fetched from the DB.")
@@ -34,7 +34,7 @@ var (
 	invoicesDir    = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
 	htmlHeaderFile = flag.String("header-file", "", "File containing an HTML header to be added to the top of the page. Can contain Go template syntax. The template is executed with the following data: {BasePath, SyncStatus, NtfyTopic, Items, Version}.")
 
-	// In order to test the Ntfy integration, you can use --sync-period=10s and
+	// In order to test the Ntfy integration, you can use --sync-period=1m and
 	// manually remove the last item from the DB:
 	//
 	//  go run . rm-last-expense
@@ -45,7 +45,9 @@ var (
 )
 
 var (
-	// version is the version of the binary. It is set at build time.
+	// These don't need to be set manually at build time with -ldflags because
+	// `go build` will set them for you thanks to the ReadBuildInfo() below, as
+	// long as the build is made from a Git checkout.
 	version = "unknown"
 	date    = "unknown"
 )
@@ -161,7 +163,7 @@ func main() {
 						HeaderTags:     "tools",
 						HeaderTitle:    "Nouvelle intervention",
 						Body:           missionToNtfyBody(e),
-						HeaderClick:    serveBaseURL + *serveBasePath + "/interventions#" + e.ID,
+						HeaderClick:    serveBaseURL + *serveBasePath + "#" + e.ID,
 						HeaderPriority: "default",
 					})
 					if err != nil {
@@ -175,7 +177,7 @@ func main() {
 						HeaderTags:     "money",
 						HeaderTitle:    "Nouvelle facture",
 						Body:           e.Label + " (" + e.Amount.String() + ")",
-						HeaderClick:    serveBaseURL + *serveBasePath + "/interventions#" + e.InvoiceID,
+						HeaderClick:    serveBaseURL + *serveBasePath + "#" + e.InvoiceID,
 						HeaderPriority: "default",
 					})
 					if err != nil {
@@ -374,7 +376,7 @@ var tmpl = template.Must(template.New("base").Parse(`
 			{{range .Items}}
 				{{with .Mission}}
 				<tr id="{{ .ID }}">
-					<td><a href="{{$.BasePath}}/interventions#{{ .ID }}">{{.StartedAt.Format "02 Jan 2006"}}</a></td>
+					<td><a href="{{$.BasePath}}#{{ .ID }}">{{.StartedAt.Format "02 Jan 2006"}}</a></td>
 					<td>{{ .Kind }} {{ .Number }}</br><small>{{ .Status }}</small></td>
 					<td>{{.Label}}</td>
 					<td><small>{{.Description}}</small></td>
@@ -387,7 +389,7 @@ var tmpl = template.Must(template.New("base").Parse(`
 								{{.Supplier.Name}}
 								{{.Supplier.Activity}}</br>
 								{{if .Supplier.Document.HashFile}}{{with .Supplier.Document}}
-									(<small><a href="{{$.BasePath}}/interventions/dl/contract/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small>)
+									(<small><a href="{{$.BasePath}}/dl/contract/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small>)
 								{{end}}{{end}}
 							{{end}}
 						</small>
@@ -396,13 +398,13 @@ var tmpl = template.Must(template.New("base").Parse(`
 				{{end}}
 				{{with .Expense}}
 				<tr id="{{.InvoiceID}}">
-					<td><a href="{{$.BasePath}}/interventions#{{ .InvoiceID }}">{{.Date.Format "02 Jan 2006"}}</a></td>
+					<td><a href="{{$.BasePath}}#{{ .InvoiceID }}">{{.Date.Format "02 Jan 2006"}}</a></td>
 					<td>Facture</td>
 					<td>{{.Label}}</td>
 					<td><small>
 						{{.Amount}}
 					</small></td>
-					<td><small><a href="{{$.BasePath}}/interventions/dl/invoice/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
+					<td><small><a href="{{$.BasePath}}/dl/invoice/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
 				</tr>
 				{{end}}
 			{{end}}
@@ -455,8 +457,6 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 		os.Exit(1)
 	}
 
-	defaultPath := basePath + "/interventions"
-
 	var headerContents string = defaultHeaderTmpl
 	if *htmlHeaderFile != "" {
 		f, err := os.Open(*htmlHeaderFile)
@@ -489,34 +489,21 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 	enableDebugCurlLogs(client)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", logRequest(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		w.WriteHeader(302)
-		w.Header().Set("Location", defaultPath)
-		tmlpErr.Execute(w, map[string]interface{}{
-			"Error":   fmt.Sprintf(`Please go to %s`, defaultPath),
-			"Version": version,
-		})
-	}))
 
 	// Download the invoice PDF. Example:
-	//  GET /interventions/dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
-	//  GET /interventions/dl/contract/660d79500178f21ab3ffc357/contract.pdf
+	//  GET /dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
+	//  GET /dl/contract/660d79500178f21ab3ffc357/contract.pdf
 	//                                 <hash_file>              <filename>
-	mux.HandleFunc("/interventions/dl/", logRequest(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/dl/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		// Get filename and hash file.
-		path, found := strings.CutPrefix(r.URL.Path, "/interventions/dl/")
+		path, found := strings.CutPrefix(r.URL.Path, "/dl/")
 		if !found {
-			logutil.Errorf("was expecting a path like /interventions/dl/(invoice|contract)/<hash_file>/<filename> but got %q", r.URL.Path)
+			logutil.Errorf("was expecting a path like /dl/(invoice|contract)/<hash_file>/<filename> but got %q", r.URL.Path)
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -550,7 +537,7 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 		}
 	}))
 
-	mux.HandleFunc("/interventions", logRequest(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -641,7 +628,7 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 		os.Exit(1)
 	}
 	logutil.Infof("listening on %v", listner.Addr())
-	logutil.Infof("url: http://%s%s", listner.Addr(), defaultPath)
+	logutil.Infof("url: http://%s%s", listner.Addr(), basePath)
 
 	err = http.Serve(listner, mux)
 	if err != nil {
