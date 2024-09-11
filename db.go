@@ -479,3 +479,28 @@ func rmLastMissionDB(db *sql.DB) error {
 	}
 	return nil
 }
+
+// We consider that the database is empty when there are no missions and no
+// expenses.
+func isEmptyDB(ctx context.Context, db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM missions;").Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("while querying database: %v", err)
+	}
+
+	if n > 0 {
+		return false, nil
+	}
+
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM expenses;").Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("while querying database: %v", err)
+	}
+
+	if n > 0 {
+		return false, nil
+	}
+
+	return true, nil
+}

@@ -35,8 +35,8 @@ var (
 	// In order to test the Ntfy integration, you can use --sync-period=10s and
 	// manually remove the last item from the DB:
 	//
-	//  sqlite3 foncia.sqlite 'delete from missions where id = (select id from missions limit 1);'
-	//  sqlite3 foncia.sqlite 'delete from expenses where invoice_id = (select invoice_id from expenses limit 1);'
+	//  go run . rm-last-expense
+	//  go run . rm-last-mission
 	syncPeriod = flag.Duration("sync-period", 10*time.Minute, "Period at which to sync with the live API.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
@@ -123,16 +123,20 @@ func main() {
 		}
 
 		go func() {
-			newMissions, newExpenses, err := authFetchSave(client, *invoicesDir, db)
-			writeLastSync(err)
+			// When the database is empty, we do an initial fetch to populate
+			// it; since it most likely means that these items aren't new, we
+			// don't send Ntfy notifications.
+			var skipNotif bool
+			empty, err := isEmptyDB(context.Background(), db)
 			if err != nil {
-				logutil.Errorf("initial fetch: %v", err)
+				logutil.Errorf("while checking if database is empty: %v", err)
+				os.Exit(1)
 			}
-			logutil.Debugf("initial fetch: %d new missions and %d new expenses", len(newMissions), len(newExpenses))
+			if empty {
+				skipNotif = true
+			}
 
 			for {
-				time.Sleep(*syncPeriod)
-
 				logutil.Debugf("updating database by fetching from live")
 				newMissions, newExpenses, err := authFetchSave(client, *invoicesDir, db)
 				writeLastSync(err)
@@ -145,9 +149,19 @@ func main() {
 				} else {
 					logutil.Debugf("no new mission and no new expense")
 				}
+				if skipNotif {
+					skipNotif = false
+					continue
+				}
 				for _, e := range newMissions {
 					logutil.Infof("new mission: %s", e.Label)
-					err := ntfy(*ntfyTopic, missionToNtfyMsg(serveBaseURL, *serveBasePath, e))
+					err := ntfy(*ntfyTopic, ntfyMsg{
+						HeaderTags:     "tools",
+						HeaderTitle:    "Nouvelle intervention",
+						Body:           missionToNtfyBody(e),
+						HeaderClick:    serveBaseURL + *serveBasePath + "/interventions#" + e.ID,
+						HeaderPriority: "default",
+					})
 					if err != nil {
 						logutil.Errorf("while sending notification: %v", err)
 						writeLastSync(err)
@@ -156,17 +170,19 @@ func main() {
 				for _, e := range newExpenses {
 					logutil.Infof("new expense: %s", e.Label)
 					err := ntfy(*ntfyTopic, ntfyMsg{
-						HeaderTitle:    "Nouvelle facture",
 						HeaderTags:     "money",
+						HeaderTitle:    "Nouvelle facture",
 						Body:           e.Label + " (" + e.Amount.String() + ")",
-						HeaderPriority: "default",
 						HeaderClick:    serveBaseURL + *serveBasePath + "/interventions#" + e.InvoiceID,
+						HeaderPriority: "default",
 					})
 					if err != nil {
 						logutil.Errorf("while sending notification: %v", err)
 						writeLastSync(err)
 					}
 				}
+
+				time.Sleep(*syncPeriod)
 			}
 		}()
 
@@ -235,7 +251,7 @@ type ntfyMsg struct {
 	Body           string // Content of the notification.
 }
 
-func missionToNtfyMsg(baseURL, basePath string, m Mission) ntfyMsg {
+func missionToNtfyBody(m Mission) string {
 	msg := m.Label
 	if m.Description != "" {
 		msg += ": " + m.Description
@@ -250,12 +266,7 @@ func missionToNtfyMsg(baseURL, basePath string, m Mission) ntfyMsg {
 		msg += " (" + strings.Join(wos, ", ") + ")"
 	}
 
-	return ntfyMsg{
-		HeaderTitle: "Nouvelle intervention",
-		HeaderTags:  "tools",
-		HeaderClick: baseURL + basePath + "/interventions#" + m.ID,
-		Body:        msg,
-	}
+	return msg
 }
 
 // Returns the new entries found.
