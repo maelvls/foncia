@@ -322,7 +322,7 @@ var tmpl = template.Must(template.New("base").Parse(`
 <!DOCTYPE html>
 <html>
 <head>
-<title>Interventions</title>
+<title>Suivi des factures et ordres de service de la copro TERRA NOSTRA 2</title>
 <meta charset="utf-8">
 	<style>
 		table {
@@ -358,7 +358,7 @@ var tmpl = template.Must(template.New("base").Parse(`
 	</style>
 </head>
 <body>
-	<h1>Interventions et factures TERRA NOSTRA 2</h1>
+	<h1>Suivi des factures et ordres de service de la copro TERRA NOSTRA 2</h1>
 
 	{{ template "header" . }}
 
