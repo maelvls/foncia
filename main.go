@@ -7,16 +7,20 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/mail"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/emersion/go-smtp"
 	_ "github.com/glebarez/go-sqlite"
 	"github.com/maelvls/foncia/logutil"
 )
@@ -42,6 +46,8 @@ var (
 	syncPeriod = flag.Duration("sync-period", 10*time.Minute, "Period at which to sync with the live API.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
+
+	smtpAddr = flag.String("smtp-addr", "0.0.0.0:25", "SMTP server address. The SMTP server is used to forward 'mission' emails from Foncia")
 )
 
 var (
@@ -80,18 +86,25 @@ func main() {
 		logutil.Infof("version: %s (%s)", version, date)
 		username, password := getCreds()
 
+		// The `--db` is the path to the SQLite database. Example:
+		// "/var/lib/foncia.db".
 		path := *dbPath
 		logutil.Debugf("using sqlite3 database file %q", path)
-
-		err := createDB(context.Background(), path)
-		if err != nil {
-			logutil.Errorf("while creating schema: %v", err)
+		if path == "" {
+			logutil.Errorf("missing required value: path")
 			os.Exit(1)
 		}
 
 		db, err := sql.Open("sqlite", path)
 		if err != nil {
-			logutil.Errorf("while opening database: %v", err)
+			logutil.Errorf("failed to open database at %q: %w", path, err)
+			os.Exit(1)
+		}
+		defer db.Close()
+
+		err = initSchemaDB(context.Background(), db)
+		if err != nil {
+			logutil.Errorf("while creating schema: %v", err)
 			os.Exit(1)
 		}
 
@@ -190,7 +203,30 @@ func main() {
 			}
 		}()
 
-		ServeCmd(db, *serveAddr, *serveBasePath, username, password, readLastSync)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		defer cancel(fmt.Errorf("main: cancelled"))
+
+		httpListen, err := net.Listen("tcp", *serveAddr)
+		if err != nil {
+			cancel(fmt.Errorf("while listening: %v", err))
+			return
+		}
+		smtpListen, err := net.Listen("tcp", *smtpAddr)
+		if err != nil {
+			cancel(fmt.Errorf("while listening on SMTP server: %v", err))
+		}
+
+		htmlHeader, err := readHeaderFile(*htmlHeaderFile)
+		if err != nil {
+			logutil.Errorf("while reading HTML header file: %v", err)
+			os.Exit(1)
+		}
+
+		err = ServeCmd(ctx, db, httpListen, *serveBasePath, username, password, smtpListen, readLastSync, htmlHeader)
+		if err != nil {
+			logutil.Errorf("server: %v", err)
+			os.Exit(1)
+		}
 	case "list":
 		username, password := getCreds()
 		ListCmd(username, password)
@@ -445,51 +481,115 @@ func logRequest(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc 
 	}
 }
 
-// The basePath should always start with a slash and not end with a slash. If
-// you want to given an empty base path, don't give "/". Instead, give "".
-func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret, lastSync func() (time.Time, error)) {
+func readHeaderFile(filename string) (string, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return "", fmt.Errorf("while opening HTML header file: %v", err)
+	}
+
+	bytes, err := io.ReadAll(f)
+	if err != nil {
+		return "", fmt.Errorf("while reading HTML header file: %v", err)
+	}
+	err = f.Close()
+	if err != nil {
+		return "", fmt.Errorf("while closing HTML header file: %v", err)
+	}
+
+	return string(bytes), nil
+}
+
+// This func is blocking and can be unblocked by cancelling the context. The
+// basePath should always start with a slash and not end with a slash. If you
+// want to given an empty base path, don't give "/". Instead, give "".
+func ServeCmd(ctx context.Context, db *sql.DB, httpListen net.Listener, basePath, username string, password secret, smtpListen net.Listener, lastSync func() (time.Time, error), htmlHeader string) error {
+	// If the SMTP server or HTTP server unexpectedly stops, we need to stop the
+	// other server.
+	var err error
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(fmt.Errorf("ServeCmd: cancelled: %w", err))
+	wg := sync.WaitGroup{}
+
 	if basePath != "" && !strings.HasPrefix(basePath, "/") {
-		logutil.Errorf("base path must start with a slash or be an empty string")
-		os.Exit(1)
+		return fmt.Errorf("base path must start with a slash or be an empty string")
 	}
 	if strings.HasSuffix(basePath, "/") {
-		logutil.Errorf("base path must not end with a slash; if you want to give the base path /, give an empty string instead")
-		os.Exit(1)
+		return fmt.Errorf("base path must not end with a slash; if you want to give the base path /, give an empty string instead")
 	}
 
 	var headerContents string = defaultHeaderTmpl
-	if *htmlHeaderFile != "" {
-		f, err := os.Open(*htmlHeaderFile)
-		if err != nil {
-			logutil.Errorf("while opening HTML header file: %v", err)
-			os.Exit(1)
-		}
-
-		bytes, err := io.ReadAll(f)
-		if err != nil {
-			logutil.Errorf("while reading HTML header file: %v", err)
-			os.Exit(1)
-		}
-		err = f.Close()
-		if err != nil {
-			logutil.Errorf("while closing HTML header file: %v", err)
-			os.Exit(1)
-		}
-
-		headerContents = string(bytes)
+	if htmlHeader != "" {
+		headerContents = htmlHeader
 	}
 
-	_, err := tmpl.New("header").Parse(headerContents)
+	_, err = tmpl.New("header").Parse(headerContents)
 	if err != nil {
-		logutil.Errorf("while parsing HTML header file %s: %v", *htmlHeaderFile, err)
+		logutil.Errorf("while parsing HTML header file %s: %v", htmlHeaderFile, err)
 		os.Exit(1)
 	}
 
+	// SMTP server used to receive email-only mission orders ("ordres de
+	// service").
+	s := smtp.NewServer(smtp.BackendFunc(func(c *smtp.Conn) (smtp.Session, error) {
+		logutil.Debugf("SMTP server: new connection from %s", c.Hostname())
+		defer c.Close()
+		sess := &Session{}
+		return sess, nil
+	}))
+	s.ErrorLog = log.Default()
+	s.Debug = os.Stderr
+	go func() {
+		// Unlike http.Server, smtp.Server doesn't have a built-in context. This
+		// func works around that.
+		<-ctx.Done()
+		_ = s.Close()
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel(fmt.Errorf("SMTP server stopped for some reason"))
+		logutil.Infof("serving SMTP server on %s", smtpListen.Addr())
+
+		err = s.Serve(smtpListen)
+		if err != nil {
+			cancel(fmt.Errorf("while serving SMTP server: %v", err))
+		}
+	}()
+
+	// Client to talk to https://myfoncia-gateway.prod.fonciamillenium.net.
 	client := &http.Client{}
 	enableDebugCurlLogs(client)
 
+	// HTTP server to serve the list of missions and expenses.
 	mux := http.NewServeMux()
+	err = addHandlers(mux, db, basePath, username, password, lastSync)
+	if err != nil {
+		return fmt.Errorf("while adding handlers: %v", err)
+	}
 
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel(fmt.Errorf("HTTP server stopped for some reason"))
+		logutil.Infof("listening on %v", httpListen.Addr())
+		logutil.Infof("url: http://%s%s", httpListen.Addr(), basePath)
+
+		err = http.Serve(httpListen, mux)
+		if err != nil {
+			cancel(fmt.Errorf("while serving: %v", err))
+			return
+		}
+	}()
+
+	wg.Wait()
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+
+	return nil
+}
+
+func addHandlers(mux *http.ServeMux, db *sql.DB, basePath, username string, password secret, lastSync func() (time.Time, error)) error {
 	// Download the invoice PDF. Example:
 	//  GET /dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
 	//  GET /dl/contract/660d79500178f21ab3ffc357/contract.pdf
@@ -622,19 +722,7 @@ func ServeCmd(db *sql.DB, serveAddr, basePath, username string, password secret,
 		}
 	}))
 
-	listner, err := net.Listen("tcp", serveAddr)
-	if err != nil {
-		logutil.Errorf("while listening: %v", err)
-		os.Exit(1)
-	}
-	logutil.Infof("listening on %v", listner.Addr())
-	logutil.Infof("url: http://%s%s", listner.Addr(), basePath)
-
-	err = http.Serve(listner, mux)
-	if err != nil {
-		logutil.Errorf("while listening: %v", err)
-		os.Exit(1)
-	}
+	return nil
 }
 
 // This function comes from an MIT-licensed project from github.com/SgtCoDFish.
@@ -984,4 +1072,85 @@ func ListCmd(username string, password secret) {
 			logutil.Gray(missions[i].Description),
 		)
 	}
+}
+
+// Session is used by servers to respond to an SMTP client.
+//
+// The methods are called when the remote client issues the matching command.
+type Session struct {
+	osNumber string
+	date     time.Time
+	subject  string
+	body     string
+}
+
+// Discard currently processed message.
+func (s *Session) Reset() {
+}
+
+// Free all resources associated with session.
+func (s *Session) Logout() error {
+	return nil
+}
+
+// Set return path for currently processed message.
+func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
+	return nil
+}
+
+// Add recipient for currently processed message.
+func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
+	return nil
+}
+
+// Set currently processed message contents and send it.
+//
+// r must be consumed before Data returns.
+func (s *Session) Data(r io.Reader) error {
+	logutil.Infof("email: reading DATA block")
+	// Decode the MIME message.
+	msg, err := mail.ReadMessage(r)
+	if err != nil {
+		return err
+	}
+
+	sub := msg.Header.Get("Subject")
+	if sub == "" {
+		sub = "No subject"
+	}
+
+	// Parse the mission number ("Ordre de service in French") from the subject.
+	// For example, given the subject:
+	//  "Ordre de service N° OSMIL805898844 – 2NRT POMPE ENVIRONNEMENT - 3 RUE BERTRAN 31200 TOULOUSE"
+	// we want to extract "OSMIL805898844".
+	missionNumber := func() string {
+		re := regexp.MustCompile(`N° ([A-Z0-9]+)`)
+		m := re.FindStringSubmatch(sub)
+		if len(m) != 2 {
+			return ""
+		}
+		return m[1]
+	}()
+
+	// Parse body.
+	body, err := io.ReadAll(msg.Body)
+	if err != nil {
+		return err
+	}
+
+	// Parse the date.
+	date, err := time.Parse("Mon, 2 Jan 2006 15:04:05 -0700", msg.Header.Get("Date"))
+	if err != nil {
+		return err
+	}
+
+	s.osNumber = missionNumber
+	s.date = date
+	s.subject = sub
+	s.body = string(body)
+
+	logutil.Infof("email: received email with subject %q", sub)
+	logutil.Debugf("email: body: %s", body)
+
+	return nil
 }

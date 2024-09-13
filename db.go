@@ -11,19 +11,8 @@ import (
 	"github.com/maelvls/foncia/logutil"
 )
 
-// The `path` is the path to the SQLite database. Example: "/var/lib/foncia.db".
-func createDB(ctx context.Context, path string) error {
-	if path == "" {
-		return fmt.Errorf("missing required value: path")
-	}
-
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return fmt.Errorf("failed to open database at %q: %w", path, err)
-	}
-	defer db.Close()
-
-	_, err = db.ExecContext(ctx, `
+func initSchemaDB(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS missions (
 			id TEXT UNIQUE,
 			number TEXT,                 -- Foncia's ID for the intervention
