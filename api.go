@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudmailin/cloudmailin-go"
 	"github.com/maelvls/foncia/logutil"
 	"github.com/sethgrid/gencurl"
 	"github.com/shurcooL/graphql"
@@ -223,7 +225,8 @@ func GetAccountUUID(client *http.Client) (string, error) {
 }
 
 // Repairs and Incidents. Use GetAccountUUID to get the accountUUID.
-func getMissionsLive(client *http.Client, accountUUID string) ([]Mission, error) {
+// `fromCursor` allows you to skip missions that you already have.
+func getMissionsLive(client *http.Client, accountUUID string, fromCursor string) (_ []Mission, lastCursor string, _ error) {
 	var interventions []Mission
 
 	type PageInfo struct {
@@ -301,6 +304,9 @@ func getMissionsLive(client *http.Client, accountUUID string) ([]Mission, error)
 	// doesn't work to get the first page. To get the first page, the field
 	// `after` must be appearing as `null`.
 	var cursor *string
+	if fromCursor != "" {
+		cursor = &fromCursor
+	}
 	pageCount := 0
 	for {
 		var getIncidentsResp struct {
@@ -322,7 +328,7 @@ func getMissionsLive(client *http.Client, accountUUID string) ([]Mission, error)
 			// with pagination, leads to duplicate or missing entries.
 		}, &getIncidentsResp)
 		if err != nil {
-			return nil, fmt.Errorf("error while querying getIncidentsResp: %w", err)
+			return nil, "", fmt.Errorf("error while querying getIncidentsResp: %w", err)
 		}
 
 		for _, edge := range getIncidentsResp.Data.CoownerAccount.TrusteeCouncil.MissionIncidents.Edges {
@@ -332,7 +338,7 @@ func getMissionsLive(client *http.Client, accountUUID string) ([]Mission, error)
 				startedAt, err = time.Parse(time.RFC3339, edge.Node.StartedAt)
 				if err != nil {
 					logutil.Debugf("error parsing time: %v", err)
-					return nil, fmt.Errorf("error parsing time: %w", err)
+					return nil, "", fmt.Errorf("error parsing time: %w", err)
 				}
 			}
 			interventions = append(interventions, Mission{
@@ -414,7 +420,7 @@ func getMissionsLive(client *http.Client, accountUUID string) ([]Mission, error)
 			// with pagination, leads to duplicate or missing entries.
 		}, &getRepairsResp)
 		if err != nil {
-			return nil, fmt.Errorf("error while querying getRepairsResp: %w", err)
+			return nil, "", fmt.Errorf("error while querying getRepairsResp: %w", err)
 		}
 
 		for _, edge := range getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.Edges {
@@ -422,7 +428,7 @@ func getMissionsLive(client *http.Client, accountUUID string) ([]Mission, error)
 			if edge.Node.StartedAt != "" {
 				startedAt, err = time.Parse(time.RFC3339, edge.Node.StartedAt)
 				if err != nil {
-					return nil, fmt.Errorf("error parsing time: %w", err)
+					return nil, "", fmt.Errorf("error parsing time: %w", err)
 				}
 			}
 			interventions = append(interventions, Mission{
@@ -436,10 +442,10 @@ func getMissionsLive(client *http.Client, accountUUID string) ([]Mission, error)
 			})
 		}
 
+		cursor = &getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.EndCursor
 		if !getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.HasNextPage {
 			break
 		}
-		cursor = &getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.EndCursor
 
 		pageCount++
 		if pageCount == pagesLimit {
@@ -450,10 +456,12 @@ func getMissionsLive(client *http.Client, accountUUID string) ([]Mission, error)
 	sort.Slice(interventions, func(i, j int) bool {
 		return interventions[i].StartedAt.After(interventions[j].StartedAt)
 	})
-	return interventions, nil
+	// The `cursor` pointer must be not nil if we are getting here. If it is
+	// nil, it means that an error occurred above, which should have returned.
+	return interventions, *cursor, nil
 }
 
-func getWorkOrdersLive(client *http.Client, accountUUID, missionID string) ([]WorkOrder, error) {
+func getWorkOrdersLive(client *http.Client, accountUUID, missionID string) (_ []WorkOrder, _ error) {
 	const getWorkOrders = `
 		query getWorkOrders($accountUuid: EncodedID!, $missionId: ID!, $first: Int, $before: Cursor, $after: Cursor) {
 			workOrders(accountUuid: $accountUuid, missionId: $missionId, first: $first, before: $before, after: $after) {
@@ -504,6 +512,7 @@ func getWorkOrdersLive(client *http.Client, accountUUID, missionID string) ([]Wo
 	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getWorkOrders, map[string]interface{}{
 		"accountUuid": accountUUID,
 		"missionId":   missionID,
+		"first":       100,
 	}, &getWorkOrdersResp)
 	if err != nil {
 		return nil, fmt.Errorf("error while querying getWorkOrdersResp for mission %s: %w", missionID, err)
@@ -1508,4 +1517,21 @@ type Token string
 
 func (t Token) String() string {
 	return "redacted"
+}
+
+func (t Token) StringOnPurpose() string {
+	return string(t)
+}
+
+func saveEmailToDB(ctx context.Context, db *sql.DB, message *cloudmailin.IncomingMail) error {
+	// Save the message to the database.
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO emails (from, to, subject, body, received_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, message.Headers.From, message.Headers.To, message.Headers.Subject, message.Plain, message.Headers.Find("Date"))
+	if err != nil {
+		return fmt.Errorf("error while saving email to DB: %w", err)
+	}
+
+	return nil
 }

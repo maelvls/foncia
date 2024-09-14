@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"log"
 	"net"
 	"net/http"
-	"net/mail"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/emersion/go-smtp"
+	"github.com/cloudmailin/cloudmailin-go"
 	_ "github.com/glebarez/go-sqlite"
 	"github.com/maelvls/foncia/logutil"
 )
@@ -46,8 +44,6 @@ var (
 	syncPeriod = flag.Duration("sync-period", 10*time.Minute, "Period at which to sync with the live API.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
-
-	smtpAddr = flag.String("smtp-addr", "0.0.0.0:25", "SMTP server address. The SMTP server is used to forward 'mission' emails from Foncia")
 )
 
 var (
@@ -73,6 +69,17 @@ func init() {
 }
 
 func main() {
+	flag.CommandLine.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage:\n"+
+			"  %s [flags] <command>\n"+
+			"\n"+
+			"Commands:\n"+
+			"  serve, list, rm-last-expense, rm-last-mission, token\n"+
+			"\n"+
+			"Flags:\n", os.Args[0])
+		flag.CommandLine.PrintDefaults()
+	}
+
 	flag.Parse()
 	if *debugFlag {
 		logutil.EnableDebug = true
@@ -211,10 +218,6 @@ func main() {
 			cancel(fmt.Errorf("while listening: %v", err))
 			return
 		}
-		smtpListen, err := net.Listen("tcp", *smtpAddr)
-		if err != nil {
-			cancel(fmt.Errorf("while listening on SMTP server: %v", err))
-		}
 
 		htmlHeader, err := readHeaderFile(*htmlHeaderFile)
 		if err != nil {
@@ -222,7 +225,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		err = ServeCmd(ctx, db, httpListen, *serveBasePath, username, password, smtpListen, readLastSync, htmlHeader)
+		err = ServeCmd(ctx, db, httpListen, *serveBasePath, username, password, readLastSync, htmlHeader)
 		if err != nil {
 			logutil.Errorf("server: %v", err)
 			os.Exit(1)
@@ -267,9 +270,9 @@ func main() {
 			logutil.Errorf("while authenticating: %v", err)
 			os.Exit(1)
 		}
-		fmt.Println(token)
+		fmt.Println(token.StringOnPurpose())
 	case "":
-		logutil.Errorf("no command given. Use one of: serve, list, token, version")
+		logutil.Errorf("no command given. Use one of: serve, list, rm-last-expense, rm-last-mission, token")
 	default:
 		logutil.Errorf("unknown command %q", flag.Arg(0))
 		os.Exit(1)
@@ -502,7 +505,7 @@ func readHeaderFile(filename string) (string, error) {
 // This func is blocking and can be unblocked by cancelling the context. The
 // basePath should always start with a slash and not end with a slash. If you
 // want to given an empty base path, don't give "/". Instead, give "".
-func ServeCmd(ctx context.Context, db *sql.DB, httpListen net.Listener, basePath, username string, password secret, smtpListen net.Listener, lastSync func() (time.Time, error), htmlHeader string) error {
+func ServeCmd(ctx context.Context, db *sql.DB, httpListen net.Listener, basePath, username string, password secret, lastSync func() (time.Time, error), htmlHeader string) error {
 	// If the SMTP server or HTTP server unexpectedly stops, we need to stop the
 	// other server.
 	var err error
@@ -527,34 +530,6 @@ func ServeCmd(ctx context.Context, db *sql.DB, httpListen net.Listener, basePath
 		logutil.Errorf("while parsing HTML header file %s: %v", htmlHeaderFile, err)
 		os.Exit(1)
 	}
-
-	// SMTP server used to receive email-only mission orders ("ordres de
-	// service").
-	s := smtp.NewServer(smtp.BackendFunc(func(c *smtp.Conn) (smtp.Session, error) {
-		logutil.Debugf("SMTP server: new connection from %s", c.Hostname())
-		defer c.Close()
-		sess := &Session{}
-		return sess, nil
-	}))
-	s.ErrorLog = log.Default()
-	s.Debug = os.Stderr
-	go func() {
-		// Unlike http.Server, smtp.Server doesn't have a built-in context. This
-		// func works around that.
-		<-ctx.Done()
-		_ = s.Close()
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer cancel(fmt.Errorf("SMTP server stopped for some reason"))
-		logutil.Infof("serving SMTP server on %s", smtpListen.Addr())
-
-		err = s.Serve(smtpListen)
-		if err != nil {
-			cancel(fmt.Errorf("while serving SMTP server: %v", err))
-		}
-	}()
 
 	// Client to talk to https://myfoncia-gateway.prod.fonciamillenium.net.
 	client := &http.Client{}
@@ -722,6 +697,33 @@ func addHandlers(mux *http.ServeMux, db *sql.DB, basePath, username string, pass
 		}
 	}))
 
+	mux.HandleFunc("/cloudmailingwebhook", logRequest(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		message, err := cloudmailin.ParseIncoming(r.Body)
+		if err != nil {
+			http.Error(w, "while parsing message: "+err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+
+		// Output the first instance of the message-id in the headers to show
+		// that we correctly parsed the message. We could also use the helper
+		// message.Headers.MessageID().
+		logutil.Infof("received message: message-id %s, sub: %s", message.Headers.MessageID(), message.Headers.Subject())
+
+		tx, err := db.Begin()
+		if err != nil {
+			http.Error(w, "while starting transaction: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer tx.Rollback()
+
+		logutil.Infof("message: %#v", message)
+	}))
+
 	return nil
 }
 
@@ -760,7 +762,7 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, db *sql.DB
 	if err != nil {
 		return nil, fmt.Errorf("while getting account UUID: %v", err)
 	}
-	missions, err := getMissionsLive(client, uuid)
+	missions, _, err := getMissionsLive(client, uuid, "")
 	if err != nil {
 		return nil, fmt.Errorf("while getting interventions: %v", err)
 	}
@@ -1050,7 +1052,7 @@ func ListCmd(username string, password secret) {
 		os.Exit(1)
 	}
 
-	missions, err := getMissionsLive(client, accUUID)
+	missions, _, err := getMissionsLive(client, accUUID, "")
 	if err != nil {
 		logutil.Errorf("getting interventions: %v", err)
 		os.Exit(1)
@@ -1074,83 +1076,17 @@ func ListCmd(username string, password secret) {
 	}
 }
 
-// Session is used by servers to respond to an SMTP client.
+// Parse the mission number ("Ordre de service in French") from the subject.
+// For example, given the subject:
 //
-// The methods are called when the remote client issues the matching command.
-type Session struct {
-	osNumber string
-	date     time.Time
-	subject  string
-	body     string
-}
-
-// Discard currently processed message.
-func (s *Session) Reset() {
-}
-
-// Free all resources associated with session.
-func (s *Session) Logout() error {
-	return nil
-}
-
-// Set return path for currently processed message.
-func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
-	return nil
-}
-
-// Add recipient for currently processed message.
-func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
-	return nil
-}
-
-// Set currently processed message contents and send it.
+//	"Ordre de service N° OSMIL805898844 – 2NRT POMPE ENVIRONNEMENT - 3 RUE BERTRAN 31200 TOULOUSE"
 //
-// r must be consumed before Data returns.
-func (s *Session) Data(r io.Reader) error {
-	logutil.Infof("email: reading DATA block")
-	// Decode the MIME message.
-	msg, err := mail.ReadMessage(r)
-	if err != nil {
-		return err
+// we want to extract "OSMIL805898844".
+func missionNumber(s string) string {
+	re := regexp.MustCompile(`N° ([A-Z0-9]+)`)
+	m := re.FindStringSubmatch(s)
+	if len(m) != 2 {
+		return ""
 	}
-
-	sub := msg.Header.Get("Subject")
-	if sub == "" {
-		sub = "No subject"
-	}
-
-	// Parse the mission number ("Ordre de service in French") from the subject.
-	// For example, given the subject:
-	//  "Ordre de service N° OSMIL805898844 – 2NRT POMPE ENVIRONNEMENT - 3 RUE BERTRAN 31200 TOULOUSE"
-	// we want to extract "OSMIL805898844".
-	missionNumber := func() string {
-		re := regexp.MustCompile(`N° ([A-Z0-9]+)`)
-		m := re.FindStringSubmatch(sub)
-		if len(m) != 2 {
-			return ""
-		}
-		return m[1]
-	}()
-
-	// Parse body.
-	body, err := io.ReadAll(msg.Body)
-	if err != nil {
-		return err
-	}
-
-	// Parse the date.
-	date, err := time.Parse("Mon, 2 Jan 2006 15:04:05 -0700", msg.Header.Get("Date"))
-	if err != nil {
-		return err
-	}
-
-	s.osNumber = missionNumber
-	s.date = date
-	s.subject = sub
-	s.body = string(body)
-
-	logutil.Infof("email: received email with subject %q", sub)
-	logutil.Debugf("email: body: %s", body)
-
-	return nil
+	return m[1]
 }
