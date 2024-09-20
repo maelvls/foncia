@@ -1,0 +1,654 @@
+Delivered-To: mael65@gmail.com
+Received: by 2002:a05:6359:5a8c:b0:1b4:eddc:4e68 with SMTP id mx12csp176012rwb;
+        Fri, 23 Aug 2024 01:58:15 -0700 (PDT)
+X-Forwarded-Encrypted: i=2; AJvYcCUb/A9XwCE84OZ+mMcB66eIiBbOpBsG5AUSbsscU5wGxpKXVpEuYe3pC6i+AKZVCHT6GtruUfc=@gmail.com
+X-Google-Smtp-Source: AGHT+IF99NYXArJ2xwezmkGyixNHKgYHf3xvvBavvXMv2OWbDEEBrAnIdrTviGn22Wyp0oP2loDX
+X-Received: by 2002:a05:6102:e13:b0:493:e587:3251 with SMTP id ada2fe7eead31-498f4bf9ff9mr1796791137.20.1724403494683;
+        Fri, 23 Aug 2024 01:58:14 -0700 (PDT)
+ARC-Seal: i=1; a=rsa-sha256; t=1724403494; cv=none;
+        d=google.com; s=arc-20160816;
+        b=BrSUS9Yd5Cj/yW4xeM9D7YyBOjkkQYfskTJNo9vLIlxXZGbaAd6NgVWvPm6arUESN8
+         CmrR65ynxODxR30nJYOGBL6V9ZLQBbNYempkZO0sLzpYWrRY3rdAz3ydMeiOJiyI0Ae6
+         u9tBoMttvtTz8SqKsjKyApu7XDssAOxYVj0xICaMAitlQr0ae8uXk7fcvSmZVqklVgAp
+         yfxh5UfyGKIivUM9FPA79ZkmjKv4rc4pPdils5+3pPKikv44VjL9rcncYqba/FhxA2vs
+         H/mP4mkFZNb3EXc8s6i1AIQTjiBayvTalKaSn/thH038iYnVzva7BiXXB2kSevmYUKY5
+         KeYA==
+ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20160816;
+        h=cc:to:reply-to:subject:message-id:mime-version:from:date
+         :dkim-signature:dkim-signature;
+        bh=gsqPmsF6OdTYVnAxZjux+5Au0xlATkB4PhMnY7Xybas=;
+        fh=/GkVW4Nr7I6RWivWwEszxdTHakvONfct7IofZs6HMnw=;
+        b=rKNmAMBXHxsDDNE3acF2zv6xribzzOQE6ikETJjgfb7vMtDbVnNqD8wKfw5gW+Yfvh
+         YbkahM+hq0dFclQ9cSeCz2rNW5bKtXF6AhGAPFNsrTZaaaV6wCGOIOd+JU5DfUKvLiuC
+         cY2dekfuSkRqz8mw2omjrYyIinJTURCOWV206JaLtNuphjqFS7P7Hk2/mvBP8XbhNQTW
+         rRybOx8yJ0YQomIZqStzcNt/MBr46Vs6lk3gkl/hsw363CCaipg/jSD8SmfpQLpjBQVT
+         KcCcYyJFDsS8dtGCyd2lju0b+ZsIlLm13eytv5geUIPdXDDw0Pbhz3J0E1GFQB+h/+ix
+         kERA==;
+        dara=google.com
+ARC-Authentication-Results: i=1; mx.google.com;
+       dkim=pass header.i=@foncia.com header.s=s1 header.b="FGazJ0/E";
+       dkim=pass header.i=@sendgrid.info header.s=smtpapi header.b=xJd3oyyx;
+       spf=pass (google.com: domain of bounces+19049598-641b-mael65=gmail.com@em190.foncia.com designates 149.72.193.75 as permitted sender) smtp.mailfrom="bounces+19049598-641b-mael65=gmail.com@em190.foncia.com";
+       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=foncia.com
+Return-Path: <bounces+19049598-641b-mael65=gmail.com@em190.foncia.com>
+Received: from wrqvckqb.outbound-mail.sendgrid.net (wrqvckqb.outbound-mail.sendgrid.net. [149.72.193.75])
+        by mx.google.com with ESMTPS id af79cd13be357-7a67f3cf6f7si379941985a.293.2024.08.23.01.58.13
+        for <mael65@gmail.com>
+        (version=TLS1_3 cipher=TLS_AES_128_GCM_SHA256 bits=128/128);
+        Fri, 23 Aug 2024 01:58:14 -0700 (PDT)
+Received-SPF: pass (google.com: domain of bounces+19049598-641b-mael65=gmail.com@em190.foncia.com designates 149.72.193.75 as permitted sender) client-ip=149.72.193.75;
+Authentication-Results: mx.google.com;
+       dkim=pass header.i=@foncia.com header.s=s1 header.b="FGazJ0/E";
+       dkim=pass header.i=@sendgrid.info header.s=smtpapi header.b=xJd3oyyx;
+       spf=pass (google.com: domain of bounces+19049598-641b-mael65=gmail.com@em190.foncia.com designates 149.72.193.75 as permitted sender) smtp.mailfrom="bounces+19049598-641b-mael65=gmail.com@em190.foncia.com";
+       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=foncia.com
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=foncia.com;
+	h=content-type:from:mime-version:subject:reply-to:x-feedback-id:to:cc:
+	cc:content-type:from:subject:to;
+	s=s1; bh=gsqPmsF6OdTYVnAxZjux+5Au0xlATkB4PhMnY7Xybas=;
+	b=FGazJ0/EjB0nNgZA3G1gz9fsIyMDnx2t93V6hpD8IEVIHxORnKCTRW6yfp7jdLFjX991
+	6d7jlWYBIJ6q1xgnDex9eucoSB+R7ccVAqFIlZmqo8qkGG/oBtRIfU0NCMEN3m93APEe2E
+	BWTpGXGutrl0rz+aWmXrmt73mCTf1qoI1kr8yYbE7MZhKeHNoVSJb/HH4FcqNjIh5N+qJ3
+	AKG+Ytq1hzxuBK6/YZPziRTaxpMO8oS3uTAZ4q+659C81ZVbb0TPZ90QX6WsZt0y5M/I+v
+	1bRo07jd+HuYTgQHAASg6Ec5cDxzm9+6OdCb6Ekvb7QZTHAX3rB/QDITtXzvdx2Q==
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=sendgrid.info;
+	h=content-type:from:mime-version:subject:reply-to:x-feedback-id:to:cc:
+	cc:content-type:from:subject:to;
+	s=smtpapi; bh=gsqPmsF6OdTYVnAxZjux+5Au0xlATkB4PhMnY7Xybas=;
+	b=xJd3oyyxLII0Z8/SFcXmghXRB1KpGKXvPcnpy24MN+xaFSQIY7LSLizfHutWm81b5up2
+	85fn5iLJK+dL3AyRGRmAQA6VIhINgLUrYs+yDpj75hW7Zr18SUPiZB2tSk5dEuZ1x7+a+y
+	h6DPOci2aNgwNNIw4uNnenlVgC0YTy6JA=
+Received: by recvd-57c5bd5c68-4nqdf with SMTP id recvd-57c5bd5c68-4nqdf-1-66C84F23-3E
+	2024-08-23 08:58:11.905058262 +0000 UTC m=+124278.500749738
+Received: from MTkwNDk1OTg (unknown)
+	by geopod-ismtpd-2 (SG) with HTTP
+	id ZExd3_m3SXiUKIanwb7ivw
+	Fri, 23 Aug 2024 08:58:11.890 +0000 (UTC)
+Content-Type: multipart/alternative; boundary=0739d2f849e1b0908d960e9150db9732fb6f9e461a99ad7e55ecddc820f9
+Date: Fri, 23 Aug 2024 08:58:12 +0000 (UTC)
+From: noreply@foncia.com
+Mime-Version: 1.0
+Message-ID: <ZExd3_m3SXiUKIanwb7ivw@geopod-ismtpd-2>
+Subject: Ordre de service =?UTF-8?B?TsKwIE9TTUlMODA1ODk4ODQ0IOKAkw==?= 2NRT
+ POMPE ENVIRONNEMENT - 3 RUE BERTRAN 31200 TOULOUSE
+Reply-To: sihem.mhamdi@foncia.com
+X-Feedback-ID: 19049598:SG
+X-SG-EID: 
+ =?us-ascii?Q?u001=2EwgPQEA+gt=2F9mQv4JaEv+7cpkc4eofXEUqOSoWW3ytrGUCfll+wjAztpO5?=
+ =?us-ascii?Q?bLndPmdAdmU6Lu6e7g7b9+NRIlbhsmSl7c7LrIw?=
+ =?us-ascii?Q?ISKJb5uIHqboArWb2Fvzcy9rJ=2Fodc9k09DAj4IK?=
+ =?us-ascii?Q?43x8+i4NztcuOu799RXTz1U28+S8gvOM3IHn7n3?=
+ =?us-ascii?Q?trb50mOmOKVwcyZoTNhENwFnNk4SrB1MSNV0Mdu?=
+ =?us-ascii?Q?A=3D=3D?=
+X-SG-ID: 
+ =?us-ascii?Q?u001=2ESdBcvi+Evd=2FbQef8eZF3BpTL9BgbK5wfSJMJGMsmprDsPyUTnMagHRCjb?=
+ =?us-ascii?Q?=2F65GublhxnFWvh+IyabW72nVQmszCx1jip2cHWX?=
+ =?us-ascii?Q?=2FCtQtvWBQOOTgYecwaL8eF0c+Y=2Fz8xWntxbmeZf?=
+ =?us-ascii?Q?dUvK6zpzB66WgBgIYC2IQ4xDMoBW=2F1hV5tcEfb8?=
+ =?us-ascii?Q?i8qKRCSFISZt03VLsG?=
+To: sihem.mhamdi@foncia.com, 2nrt@pompesenvironnement.fr
+Cc: didier.fadel@foncia.com, mael65@gmail.com
+X-Entity-ID: u001.AY2a/N9wCSASdpq1PB0X4A==
+
+--0739d2f849e1b0908d960e9150db9732fb6f9e461a99ad7e55ecddc820f9
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/plain; charset=utf-8
+Mime-Version: 1.0
+
+Bonjour,<br/ ><br/ >En notre qualit=C3=A9 de syndic du bien d=C3=A9sign=C3=
+=A9 en objet, nous vous remercions d'ex=C3=A9cuter les travaux d=C3=A9crits=
+ dans l=E2=80=99ordre de service d=C3=A9taill=C3=A9 ci-dessous :<br/ ><br/ =
+>Immeuble N=C2=B0 501292910 : TERRA NOSTRA 2 - 3 RUE BERTRAN 31200 TOULOUSE=
+,<br/ ><br/ >digicode(s): CODE, 2308, CODE, 2308<br/ ><br/ ><br/ ><br/ >Obj=
+et : 2NRT POMPE ENVIRONNEMENT - REGARD EN SOUS-SOL<br/ ><br/ >Date de d=C3=
+=A9but des travaux : vendredi 23 ao=C3=BBt 2024<br/ ><br/ >Merci de nous co=
+nfirmer la bonne ex=C3=A9cution des travaux par retour de mail.<br/ ><br/ >=
+Afin de faciliter le traitement de votre facture, merci de reporter le N=C2=
+=B0 du pr=C3=A9sent ordre de service sur votre facture, libell=C3=A9e =C3=
+=A0 l=E2=80=99ordre du syndicat des copropri=C3=A9taires.<br/ ><br/ >MERCI =
+D'INTERVENIR POUR POMPER DES REGARD EN SOUS SOL. CONTACTER MR VALAIS AU 07 =
+86 48 43 91   .<br/ ><br/ >Cordialement.<br/ ><br/ >Sinc=C3=A8res salutatio=
+ns.
+
+MHAMDI Sihem
+
+Foncia Toulouse - Arthaud
+6 boulevard Florence Arthaud 31200 Toulouse France
+sihem.mhamdi@foncia.com ( sihem.mhamdi@foncia.com )
+
+( https://u19049598.ct.sendgrid.net/ls/click?upn=3Du001.42-2BruBDFhEzIWqQkn=
+vWFMLTDyoNn-2Fpy9FeFmgiP2dBgCRChgczdJFISCiv4fF3nLZZ1j_DaCUCeel0mqe9lxlk2PyR=
+2f-2F4wmvAt2zgze8JAPR1TX0mxFnIDnULobMeDXH8sC5DxStuEg-2B9gqDvD839saOqeddSoXP=
+xclhMr6rlzbJK1NFzjZFgtqrSCResdUakk1PT2T-2Fm-2BU0mAKeMHjvJXV91ap9Y61tPYM2mJL=
+Apo-2BOmbfIcIA8Q6lkuMSfd4OgN4L5TySkJgTFdwOZ0h4OVtvWlHzPMCcFS7eRgdX2OvS-2F2r=
+M0oGkdqhEAqWHbMXxQJMP61qCan5ZJ4iLoIK8WPcwZej8Qy4xD0B1-2BNOj7dBVagTgCP0OWicR=
+zKIqQ4oag9ym38vAgXyRBxZeiy4FiZyAnQQ-3D-3D ) ( https://u19049598.ct.sendgrid=
+.net/ls/click?upn=3Du001.42-2BruBDFhEzIWqQknvWFMN-2Fh9YX8ZSVX54DfkkTBNWDqKZ=
+7ffXLTyqIcvvAM8ZD8XqMqqica187KifrGTByqvJ0UY5UNzFFEk4KTr7mBTNaUaiiyD7Ixc5vLe=
+GeRAkDwmmMG_DaCUCeel0mqe9lxlk2PyR2f-2F4wmvAt2zgze8JAPR1TX0mxFnIDnULobMeDXH8=
+sC5DxStuEg-2B9gqDvD839saOqeddSoXPxclhMr6rlzbJK1NFzjZFgtqrSCResdUakk1PT2T-2F=
+m-2BU0mAKeMHjvJXV91ap9Y61tPYM2mJLApo-2BOmbfIcIA8Q6lkuMSfd4OgN4L5TySkJgTFdwO=
+Z0h4OVtvWlJZf-2BcSVxhpNTbC8VA83cU9TNTGZgs46SBNRim7fVBmpFTU6gILX9mByrbNiBiRe=
+keh0kZWOA6ZwVITSwmGasnqJHZFZn6xO-2FHfAr5yTmSLOJIZpxScD7bQ-2Bj9int6DcIw-3D-3=
+D ) ( https://u19049598.ct.sendgrid.net/ls/click?upn=3Du001.42-2BruBDFhEzIW=
+qQknvWFMGhD5teAZOZRtlH8bF9-2B-2B0U3m3l585C8BuYxKlA1CCHg-2BE4oU-2BjWd4LFHF9O=
+LEHLP-2FH7iQuc9aas46wZ4ZRxhis-3DU_jC_DaCUCeel0mqe9lxlk2PyR2f-2F4wmvAt2zgze8=
+JAPR1TX0mxFnIDnULobMeDXH8sC5DxStuEg-2B9gqDvD839saOqeddSoXPxclhMr6rlzbJK1NFz=
+jZFgtqrSCResdUakk1PT2T-2Fm-2BU0mAKeMHjvJXV91ap9Y61tPYM2mJLApo-2BOmbfIcIA8Q6=
+lkuMSfd4OgN4L5TySkJgTFdwOZ0h4OVtvWlFP6GlCSa0cXk0QG84-2BKCnN1hOsfnC26Op-2FL4=
+RUVXUgt7dYnjKuXW8HlNuWku6K5FjvCqJ8Rlft-2BncPK4fBSMOPhscRJn8bovmPXEWti-2BnLH=
+t9gJHQsOlYC2lR-2BDDf0mag-3D-3D )
+
+foncia.com
+--0739d2f849e1b0908d960e9150db9732fb6f9e461a99ad7e55ecddc820f9
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/html; charset=utf-8
+Mime-Version: 1.0
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org=
+/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html data-editor-version=3D"2" class=3D"sg-campaigns" xmlns=3D"http://www.=
+w3.org/1999/xhtml">
+    <head>
+      <meta http-equiv=3D"Content-Type" content=3D"text/html; charset=3Dutf=
+-8">
+      <meta name=3D"viewport" content=3D"width=3Ddevice-width, initial-scal=
+e=3D1, minimum-scale=3D1, maximum-scale=3D1">
+      <!--[if !mso]><!-->
+      <meta http-equiv=3D"X-UA-Compatible" content=3D"IE=3DEdge">
+      <!--<![endif]-->
+      <!--[if (gte mso 9)|(IE)]>
+      <xml>
+        <o:OfficeDocumentSettings>
+          <o:AllowPNG/>
+          <o:PixelsPerInch>96</o:PixelsPerInch>
+        </o:OfficeDocumentSettings>
+      </xml>
+      <![endif]-->
+      <!--[if (gte mso 9)|(IE)]>
+  <style type=3D"text/css">
+    body {width: 600px;margin: 0 auto;}
+    table {border-collapse: collapse;}
+    table, td {mso-table-lspace: 0pt;mso-table-rspace: 0pt;}
+    img {-ms-interpolation-mode: bicubic;}
+  </style>
+<![endif]-->
+      <style type=3D"text/css">
+    body, p, div {
+      font-family: arial,helvetica,sans-serif;
+      font-size: 14px;
+    }
+    body {
+      color: #000000;
+    }
+    body a {
+      color: #1188E6;
+      text-decoration: none;
+    }
+    p { margin: 0; padding: 0; }
+    table.wrapper {
+      width:100% !important;
+      table-layout: fixed;
+      -webkit-font-smoothing: antialiased;
+      -webkit-text-size-adjust: 100%;
+      -moz-text-size-adjust: 100%;
+      -ms-text-size-adjust: 100%;
+    }
+    img.max-width {
+      max-width: 100% !important;
+    }
+    .column.of-2 {
+      width: 50%;
+    }
+    .column.of-3 {
+      width: 33.333%;
+    }
+    .column.of-4 {
+      width: 25%;
+    }
+    ul ul ul ul  {
+      list-style-type: disc !important;
+    }
+    ol ol {
+      list-style-type: lower-roman !important;
+    }
+    ol ol ol {
+      list-style-type: lower-latin !important;
+    }
+    ol ol ol ol {
+      list-style-type: decimal !important;
+    }
+    @media screen and (max-width:480px) {
+      .preheader .rightColumnContent,
+      .footer .rightColumnContent {
+        text-align: left !important;
+      }
+      .preheader .rightColumnContent div,
+      .preheader .rightColumnContent span,
+      .footer .rightColumnContent div,
+      .footer .rightColumnContent span {
+        text-align: left !important;
+      }
+      .preheader .rightColumnContent,
+      .preheader .leftColumnContent {
+        font-size: 80% !important;
+        padding: 5px 0;
+      }
+      table.wrapper-mobile {
+        width: 100% !important;
+        table-layout: fixed;
+      }
+      img.max-width {
+        height: auto !important;
+        max-width: 100% !important;
+      }
+      a.bulletproof-button {
+        display: block !important;
+        width: auto !important;
+        font-size: 80%;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+      }
+      .columns {
+        width: 100% !important;
+      }
+      .column {
+        display: block !important;
+        width: 100% !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+        margin-left: 0 !important;
+        margin-right: 0 !important;
+      }
+      .social-icon-column {
+        display: inline-block !important;
+      }
+    }
+  </style>
+    <style>
+      @media screen and (max-width:480px) {
+        table\0 {
+          width: 480px !important;
+          }
+      }
+    </style>
+      <!--user entered Head Start--><!--End Head user entered-->
+    </head>
+    <body>
+      <center class=3D"wrapper" data-link-color=3D"#1188E6" data-body-style=
+=3D"font-size:14px; font-family:arial,helvetica,sans-serif; color:#000000; =
+background-color:#FFFFFF;">
+        <div class=3D"webkit">
+          <table cellpadding=3D"0" cellspacing=3D"0" border=3D"0" width=3D"=
+100%" class=3D"wrapper" bgcolor=3D"#FFFFFF">
+            <tr>
+              <td valign=3D"top" bgcolor=3D"#FFFFFF" width=3D"100%">
+                <table width=3D"100%" role=3D"content-container" class=3D"o=
+uter" align=3D"center" cellpadding=3D"0" cellspacing=3D"0" border=3D"0">
+                  <tr>
+                    <td width=3D"100%">
+                      <table width=3D"100%" cellpadding=3D"0" cellspacing=
+=3D"0" border=3D"0">
+                        <tr>
+                          <td>
+                            <!--[if mso]>
+    <center>
+    <table><tr><td width=3D"600">
+  <![endif]-->
+                                    <table width=3D"100%" cellpadding=3D"0"=
+ cellspacing=3D"0" border=3D"0" style=3D"width:100%; max-width:600px;" alig=
+n=3D"center">
+                                      <tr>
+                                        <td role=3D"modules-container" styl=
+e=3D"padding:0px 0px 0px 0px; color:#000000; text-align:left;" bgcolor=3D"#=
+FFFFFF" width=3D"100%" align=3D"left"><table class=3D"module preheader preh=
+eader-hide" role=3D"module" data-type=3D"preheader" border=3D"0" cellpaddin=
+g=3D"0" cellspacing=3D"0" width=3D"100%" style=3D"display: none !important;=
+ mso-hide: all; visibility: hidden; opacity: 0; color: transparent; height:=
+ 0; width: 0;">
+    <tr>
+      <td role=3D"module-content">
+        <p></p>
+      </td>
+    </tr>
+  </table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" align=3D"=
+center" width=3D"100%" role=3D"module" data-type=3D"columns" style=3D"paddi=
+ng:0px 0px 0px 0px;" bgcolor=3D"#FFFFFF" data-distribution=3D"1">
+                              <tbody>
+                              <tr role=3D"module-content">
+                                <td height=3D"100%" valign=3D"top"><table w=
+idth=3D"580" style=3D"width:580px; border-spacing:0; border-collapse:collap=
+se; margin:0px 10px 0px 10px;" cellpadding=3D"0" cellspacing=3D"0" align=3D=
+"left" border=3D"0" bgcolor=3D"" class=3D"column column-0">
+      <tbody>
+        <tr>
+          <td style=3D"padding:0px;margin:0px;border-spacing:0;"><table cla=
+ss=3D"module" role=3D"module" data-type=3D"code" border=3D"0" cellpadding=
+=3D"0" cellspacing=3D"0" width=3D"100%" style=3D"table-layout: fixed;" data=
+-muid=3D"44bb14d2-bbf8-4d0c-9a85-755bc5d10df8">
+                                          <tbody>
+                                          <tr>
+                                            <td height=3D"100%" valign=3D"t=
+op" role=3D"module-content">
+                                              <div style=3D"line-height: 21=
+px">
+                                                <div style=3D"font-family: =
+inherit; text-align: inherit">
+                                                  Bonjour,<br/ ><br/ >En no=
+tre qualit=C3=A9 de syndic du bien d=C3=A9sign=C3=A9 en objet, nous vous re=
+mercions d'ex=C3=A9cuter les travaux d=C3=A9crits dans l=E2=80=99ordre de s=
+ervice d=C3=A9taill=C3=A9 ci-dessous :<br/ ><br/ >Immeuble N=C2=B0 50129291=
+0 : TERRA NOSTRA 2 - 3 RUE BERTRAN 31200 TOULOUSE,<br/ ><br/ >digicode(s): =
+CODE, 2308, CODE, 2308<br/ ><br/ ><br/ ><br/ >Objet : 2NRT POMPE ENVIRONNEM=
+ENT - REGARD EN SOUS-SOL<br/ ><br/ >Date de d=C3=A9but des travaux : vendre=
+di 23 ao=C3=BBt 2024<br/ ><br/ >Merci de nous confirmer la bonne ex=C3=A9cu=
+tion des travaux par retour de mail.<br/ ><br/ >Afin de faciliter le traite=
+ment de votre facture, merci de reporter le N=C2=B0 du pr=C3=A9sent ordre d=
+e service sur votre facture, libell=C3=A9e =C3=A0 l=E2=80=99ordre du syndic=
+at des copropri=C3=A9taires.<br/ ><br/ >MERCI D'INTERVENIR POUR POMPER DES =
+REGARD EN SOUS SOL. CONTACTER MR VALAIS AU 07 86 48 43 91   .<br/ ><br/ >Co=
+rdialement.<br/ ><br/ >Sinc=C3=A8res salutations.
+                                                </div>
+                                                <div style=3D"font-family: =
+inherit; text-align: inherit">
+                                                  <br></div>
+                                              </div>
+                                            </td>
+                                          </tr>
+                                          </tbody>
+                                        </table></td>
+        </tr>
+      </tbody>
+    </table></td>
+                              </tr>
+                              </tbody>
+                            </table><table border=3D"0" cellpadding=3D"0" c=
+ellspacing=3D"0" align=3D"center" width=3D"100%" role=3D"module" data-type=
+=3D"columns" style=3D"padding:0px 0px 0px 0px;" bgcolor=3D"#FFFFFF" data-di=
+stribution=3D"1,1">
+                              <tbody>
+                              <tr role=3D"module-content">
+                                <td height=3D"100%" valign=3D"top"><table w=
+idth=3D"290" style=3D"width:290px; border-spacing:0; border-collapse:collap=
+se; margin:0px 10px 0px 0px;" cellpadding=3D"0" cellspacing=3D"0" align=3D"=
+left" border=3D"0" bgcolor=3D"" class=3D"column column-0">
+      <tbody>
+        <tr>
+          <td style=3D"padding:0px;margin:0px;border-spacing:0;"><table cla=
+ss=3D"wrapper" role=3D"module" data-type=3D"image" border=3D"0" cellpadding=
+=3D"0" cellspacing=3D"0" width=3D"100%" style=3D"table-layout: fixed;" data=
+-muid=3D"xqaBpYQCm2XfPATMYhFmh6">
+                                          <tbody>
+                                          <tr>
+                                            <td style=3D"font-size:6px; lin=
+e-height:10px; padding:0px 0px 0px 0px;" valign=3D"top" align=3D"left">
+                                              <img class=3D"max-width" bord=
+er=3D"0" style=3D"display:block; color:#000000; text-decoration:none; font-=
+family:Helvetica, arial, sans-serif; font-size:16px; max-width:78% !importa=
+nt; width:78%; height:auto !important;" width=3D"226" alt=3D"" data-proport=
+ionally-constrained=3D"true" data-responsive=3D"true" src=3D"http://cdn.mca=
+uto-images-production.sendgrid.net/566b85b789c6d4d8/333e17fc-615c-4dc6-a522=
+-5a7ce1c287ce/499x458.png">
+                                            </td>
+                                          </tr>
+                                          </tbody>
+                                        </table></td>
+        </tr>
+      </tbody>
+    </table><table width=3D"290" style=3D"width:290px; border-spacing:0; bo=
+rder-collapse:collapse; margin:0px 0px 0px 10px;" cellpadding=3D"0" cellspa=
+cing=3D"0" align=3D"left" border=3D"0" bgcolor=3D"" class=3D"column column-=
+1">
+      <tbody>
+        <tr>
+          <td style=3D"padding:0px;margin:0px;border-spacing:0;"><table cla=
+ss=3D"module" role=3D"module" data-type=3D"text" border=3D"0" cellpadding=
+=3D"0" cellspacing=3D"0" width=3D"100%" style=3D"table-layout: fixed;" data=
+-muid=3D"7ok4bNgNm8ZmsTTnzXVbLH" data-mc-module-version=3D"2019-10-22">
+                                          <tbody>
+                                          <tr>
+                                            <td style=3D"padding:18px 0px 0=
+px 0px; line-height:18px; text-align:inherit;" height=3D"100%" valign=3D"to=
+p" bgcolor=3D"" role=3D"module-content"><div><div style=3D"font-family: inh=
+erit; text-align: left"><span style=3D"box-sizing: border-box; padding-top:=
+ 0px; padding-right: 0px; padding-bottom: 0px; padding-left: 0px; margin-to=
+p: 0px; margin-right: 0px; margin-bottom: 0px; margin-left: 0px; font-style=
+: inherit; font-variant-ligatures: inherit; font-variant-caps: inherit; fon=
+t-variant-numeric: inherit; font-variant-east-asian: inherit; font-weight: =
+bold; font-stretch: inherit; line-height: inherit; font-family: inherit; fo=
+nt-size: 14px; vertical-align: baseline; border-top-width: 0px; border-righ=
+t-width: 0px; border-bottom-width: 0px; border-left-width: 0px; border-top-=
+style: initial; border-right-style: initial; border-bottom-style: initial; =
+border-left-style: initial; border-top-color: initial; border-right-color: =
+initial; border-bottom-color: initial; border-left-color: initial; border-i=
+mage-source: initial; border-image-slice: initial; border-image-width: init=
+ial; border-image-outset: initial; border-image-repeat: initial; text-align=
+: left; color: #000000; letter-spacing: normal; text-indent: 0px; text-tran=
+sform: none; white-space: pre-wrap; word-spacing: 0px; -webkit-text-stroke-=
+width: 0px; background-color: rgb(255, 255, 255); text-decoration-thickness=
+: initial; text-decoration-style: initial; text-decoration-color: initial">=
+MHAMDI Sihem</span></div>
+<div style=3D"font-family: inherit; text-align: inherit; margin-left: 0px">=
+<span style=3D"box-sizing: border-box; padding-top: 0px; padding-right: 0px=
+; padding-bottom: 0px; padding-left: 0px; margin-top: 0px; margin-right: 0p=
+x; margin-bottom: 0px; margin-left: 0px; font-style: inherit; font-variant-=
+ligatures: inherit; font-variant-caps: inherit; font-variant-numeric: inher=
+it; font-variant-east-asian: inherit; font-weight: inherit; font-stretch: i=
+nherit; line-height: inherit; font-family: inherit; font-size: 14px; vertic=
+al-align: baseline; border-top-width: 0px; border-right-width: 0px; border-=
+bottom-width: 0px; border-left-width: 0px; border-top-style: initial; borde=
+r-right-style: initial; border-bottom-style: initial; border-left-style: in=
+itial; border-top-color: initial; border-right-color: initial; border-botto=
+m-color: initial; border-left-color: initial; border-image-source: initial;=
+ border-image-slice: initial; border-image-width: initial; border-image-out=
+set: initial; border-image-repeat: initial; color: #fa6400; letter-spacing:=
+ normal; text-align: left; text-indent: 0px; text-transform: none; white-sp=
+ace: pre-wrap; word-spacing: 0px; -webkit-text-stroke-width: 0px; backgroun=
+d-color: rgb(255, 255, 255); text-decoration-thickness: initial; text-decor=
+ation-style: initial; text-decoration-color: initial"></span></div>
+<div style=3D"font-family: inherit; text-align: inherit; margin-left: 0px">=
+<span style=3D"box-sizing: border-box; padding-top: 0px; padding-right: 0px=
+; padding-bottom: 0px; padding-left: 0px; margin-top: 0px; margin-right: 0p=
+x; margin-bottom: 0px; margin-left: 0px; font-style: inherit; font-variant-=
+ligatures: inherit; font-variant-caps: inherit; font-variant-numeric: inher=
+it; font-variant-east-asian: inherit; font-weight: 50; font-stretch: inheri=
+t; line-height: inherit; font-family: inherit; font-size: 12px; vertical-al=
+ign: baseline; border-top-width: 0px; border-right-width: 0px; border-botto=
+m-width: 0px; border-left-width: 0px; border-top-style: initial; border-rig=
+ht-style: initial; border-bottom-style: initial; border-left-style: initial=
+; border-top-color: initial; border-right-color: initial; border-bottom-col=
+or: initial; border-left-color: initial; border-image-source: initial; bord=
+er-image-slice: initial; border-image-width: initial; border-image-outset: =
+initial; border-image-repeat: initial; color: #003369; letter-spacing: norm=
+al; text-align: left; text-indent: 0px; text-transform: none; white-space: =
+pre-wrap; word-spacing: 0px; -webkit-text-stroke-width: 0px; background-col=
+or: rgb(255, 255, 255); text-decoration-thickness: initial; text-decoration=
+-style: initial; text-decoration-color: initial">Foncia Toulouse - Arthaud<=
+/span></div>
+<div style=3D"font-family: inherit; text-align: inherit; margin-left: 0px">=
+<span style=3D"box-sizing: border-box; padding-top: 0px; padding-right: 0px=
+; padding-bottom: 0px; padding-left: 0px; margin-top: 0px; margin-right: 0p=
+x; margin-bottom: 0px; margin-left: 0px; font-style: inherit; font-variant-=
+ligatures: inherit; font-variant-caps: inherit; font-variant-numeric: inher=
+it; font-variant-east-asian: inherit; font-weight: 500; font-stretch: inher=
+it; line-height: inherit; font-family: inherit; font-size: 12px; vertical-a=
+lign: baseline; border-top-width: 0px; border-right-width: 0px; border-bott=
+om-width: 0px; border-left-width: 0px; border-top-style: initial; border-ri=
+ght-style: initial; border-bottom-style: initial; border-left-style: initia=
+l; border-top-color: initial; border-right-color: initial; border-bottom-co=
+lor: initial; border-left-color: initial; border-image-source: initial; bor=
+der-image-slice: initial; border-image-width: initial; border-image-outset:=
+ initial; border-image-repeat: initial; color: #003369; letter-spacing: nor=
+mal; text-align: left; text-indent: 0px; text-transform: none; white-space:=
+ pre-wrap; word-spacing: 0px; -webkit-text-stroke-width: 0px; background-co=
+lor: rgb(255, 255, 255); text-decoration-thickness: initial; text-decoratio=
+n-style: initial; text-decoration-color: initial">6 boulevard Florence Arth=
+aud 31200 Toulouse France</span></div>
+<div style=3D"font-family: inherit; text-align: inherit"><a href=3D"mailto:=
+sihem.mhamdi@foncia.com"><span style=3D"box-sizing: border-box; padding-top=
+: 0px; padding-right: 0px; padding-bottom: 0px; padding-left: 0px; margin-t=
+op: 0px; margin-right: 0px; margin-bottom: 0px; margin-left: 0px; font-styl=
+e: inherit; font-variant-ligatures: inherit; font-variant-caps: inherit; fo=
+nt-variant-numeric: inherit; font-variant-east-asian: inherit; font-weight:=
+ inherit; font-stretch: inherit; line-height: inherit; font-family: inherit=
+; font-size: 12px; vertical-align: baseline; border-top-width: 0px; border-=
+right-width: 0px; border-bottom-width: 0px; border-left-width: 0px; border-=
+top-style: initial; border-right-style: initial; border-bottom-style: initi=
+al; border-left-style: initial; border-top-color: initial; border-right-col=
+or: initial; border-bottom-color: initial; border-left-color: initial; bord=
+er-image-source: initial; border-image-slice: initial; border-image-width: =
+initial; border-image-outset: initial; border-image-repeat: initial; outlin=
+e-color: initial; outline-style: none; outline-width: initial; color: #0033=
+69; text-decoration-line: underline; text-decoration-thickness: initial; te=
+xt-decoration-style: initial; text-decoration-color: initial; transition-du=
+ration: 0.3s; transition-timing-function: ease; transition-delay: 0s; trans=
+ition-property: color; letter-spacing: normal; orphans: 2; text-align: left=
+; text-indent: 0px; text-transform: none; white-space: pre-wrap; widows: 2;=
+ word-spacing: 0px; -webkit-text-stroke-width: 0px; background-color: rgb(2=
+55, 255, 255); display: inline">sihem.mhamdi@foncia.com</span></a></div><di=
+v></div></div></td>
+                                          </tr>
+                                          </tbody>
+                                        </table><table class=3D"module" rol=
+e=3D"module" data-type=3D"social" align=3D"center" border=3D"0" cellpadding=
+=3D"0" cellspacing=3D"0" width=3D"100%" style=3D"table-layout: fixed;" data=
+-muid=3D"a307b793-72e8-4e6c-b4ae-9c24fca3d38c">
+                                          <tbody>
+                                          <tr>
+                                            <td valign=3D"top" style=3D"pad=
+ding:0px 0px 0px 3px; font-size:6px; line-height:10px;" align=3D"left">
+                                              <table align=3D"left" style=
+=3D"-webkit-margin-start:auto;-webkit-margin-end:auto;">
+                                                <tbody><tr align=3D"left"><=
+td style=3D"padding: 0px 5px;" class=3D"social-icon-column">
+      <a role=3D"social-icon-link" href=3D"https://u19049598.ct.sendgrid.ne=
+t/ls/click?upn=3Du001.42-2BruBDFhEzIWqQknvWFMLTDyoNn-2Fpy9FeFmgiP2dBgCRChgc=
+zdJFISCiv4fF3nLbkDe_DaCUCeel0mqe9lxlk2PyR2f-2F4wmvAt2zgze8JAPR1TX0mxFnIDnUL=
+obMeDXH8sC5DxStuEg-2B9gqDvD839saOqeddSoXPxclhMr6rlzbJK1NFzjZFgtqrSCResdUakk=
+1PT2T-2Fm-2BU0mAKeMHjvJXV91ap9Y61tPYM2mJLApo-2BOmbfIcIA8Q6lkuMSfd4OgN4L5TyS=
+kJgTFdwOZ0h4OVtvWlKAZWySvYThuFRff-2FCvnW1MwoKo-2FDHU-2BIHVYso4Y-2BCKTy1-2B-=
+2FbjqFNY1Osd-2Fz73jO52AsL2-2B1FyaKfFdkr2S7B23kmTR-2BmjlWs7UspstsXvEhr5nuCkh=
+0aR1izWugwZHGpQ-3D-3D" target=3D"_blank" alt=3D"Facebook" title=3D"Facebook=
+" style=3D"display:inline-block; background-color:#003369; height:16px; wid=
+th:16px;">
+        <img role=3D"social-icon" alt=3D"Facebook" title=3D"Facebook" src=
+=3D"https://mc.sendgrid.com/assets/social/white/facebook.png" style=3D"heig=
+ht:16px; width:16px;" height=3D"16" width=3D"16">
+      </a>
+    </td><td style=3D"padding: 0px 5px;" class=3D"social-icon-column">
+      <a role=3D"social-icon-link" href=3D"https://u19049598.ct.sendgrid.ne=
+t/ls/click?upn=3Du001.42-2BruBDFhEzIWqQknvWFMN-2Fh9YX8ZSVX54DfkkTBNWDqKZ7ff=
+XLTyqIcvvAM8ZD8XqMqqica187KifrGTByqvJ0UY5UNzFFEk4KTr7mBTNaUaiiyD7Ixc5vLeGeR=
+AkDwZlNO_DaCUCeel0mqe9lxlk2PyR2f-2F4wmvAt2zgze8JAPR1TX0mxFnIDnULobMeDXH8sC5=
+DxStuEg-2B9gqDvD839saOqeddSoXPxclhMr6rlzbJK1NFzjZFgtqrSCResdUakk1PT2T-2Fm-2=
+BU0mAKeMHjvJXV91ap9Y61tPYM2mJLApo-2BOmbfIcIA8Q6lkuMSfd4OgN4L5TySkJgTFdwOZ0h=
+4OVtvWlMDrZWaj7-2BH4rupHBGDIWlzDJOs-2FO7RBhWKMnvJzhBT7E3CLDRSlOZMnnZmTr90xH=
+k7PsEmwZVPqAIlIPvjpNcyjTXnaUSvZGPsON-2FeM2JLkwJ9BXVL8v3dKuHKd-2BfOHJA-3D-3D=
+" target=3D"_blank" alt=3D"Twitter" title=3D"Twitter" style=3D"display:inli=
+ne-block; background-color:#003369; height:16px; width:16px;">
+        <img role=3D"social-icon" alt=3D"Twitter" title=3D"Twitter" src=3D"=
+https://mc.sendgrid.com/assets/social/white/twitter.png" style=3D"height:16=
+px; width:16px;" height=3D"16" width=3D"16">
+      </a>
+    </td><td style=3D"padding: 0px 5px;" class=3D"social-icon-column">
+      <a role=3D"social-icon-link" href=3D"https://u19049598.ct.sendgrid.ne=
+t/ls/click?upn=3Du001.42-2BruBDFhEzIWqQknvWFMGhD5teAZOZRtlH8bF9-2B-2B0U3m3l=
+585C8BuYxKlA1CCHg-2BE4oU-2BjWd4LFHF9OLEHLP-2FH7iQuc9aas46wZ4ZRxhis-3DZg2b_D=
+aCUCeel0mqe9lxlk2PyR2f-2F4wmvAt2zgze8JAPR1TX0mxFnIDnULobMeDXH8sC5DxStuEg-2B=
+9gqDvD839saOqeddSoXPxclhMr6rlzbJK1NFzjZFgtqrSCResdUakk1PT2T-2Fm-2BU0mAKeMHj=
+vJXV91ap9Y61tPYM2mJLApo-2BOmbfIcIA8Q6lkuMSfd4OgN4L5TySkJgTFdwOZ0h4OVtvWlMIj=
+dx9LOw7QFKwgCYWUzZ2lrC5lhSaQz-2BDFt-2BSvpxsNG5aKk-2BAFCzOEC4Q92u3FuyeJUvRZk=
+7cHVY5XD13dXcPk1YXulBg6ncCxa8VU-2Beu9KU5I5ZiKSbMlzb6fdnDCWQ-3D-3D" target=
+=3D"_blank" alt=3D"LinkedIn" title=3D"LinkedIn" style=3D"display:inline-blo=
+ck; background-color:#003369; height:16px; width:16px;">
+        <img role=3D"social-icon" alt=3D"LinkedIn" title=3D"LinkedIn" src=
+=3D"https://mc.sendgrid.com/assets/social/white/linkedin.png" style=3D"heig=
+ht:16px; width:16px;" height=3D"16" width=3D"16">
+      </a>
+    </td></tr></tbody>
+                                              </table>
+                                            </td>
+                                          </tr>
+                                          </tbody>
+                                        </table><table class=3D"module" rol=
+e=3D"module" data-type=3D"text" border=3D"0" cellpadding=3D"0" cellspacing=
+=3D"0" width=3D"100%" style=3D"table-layout: fixed;" data-muid=3D"bd1463f1-=
+02cd-41a9-8826-cdf2971bde59" data-mc-module-version=3D"2019-10-22">
+                                          <tbody>
+                                          <tr>
+                                            <td style=3D"padding:0px 0px 1p=
+x 0px; line-height:18px; text-align:inherit;" height=3D"100%" valign=3D"top=
+" bgcolor=3D"" role=3D"module-content"><div><div style=3D"font-family: inhe=
+rit; text-align: inherit"><span style=3D"color: #003369; font-family: arial=
+, helvetica, sans-serif; font-style: normal; font-variant-ligatures: normal=
+; font-variant-caps: normal; font-weight: 50; letter-spacing: normal; text-=
+align: left; text-indent: 0px; text-transform: none; white-space: pre-wrap;=
+ word-spacing: 0px; -webkit-text-stroke-width: 0px; background-color: rgb(2=
+55, 255, 255); text-decoration-line: underline; text-decoration-thickness: =
+initial; text-decoration-style: initial; text-decoration-color: initial; fl=
+oat: none; display: inline; font-size: 12px">foncia.com</span></div><div></=
+div></div></td>
+                                          </tr>
+                                          </tbody>
+                                        </table><table class=3D"module" rol=
+e=3D"module" data-type=3D"divider" border=3D"0" cellpadding=3D"0" cellspaci=
+ng=3D"0" width=3D"100%" style=3D"table-layout: fixed;" data-muid=3D"98f1c8f=
+1-2a2d-4350-a741-c1d59c1b7b9e">
+                                          <tbody>
+                                          <tr>
+                                            <td style=3D"padding:0px 0px 0p=
+x 0px;" role=3D"module-content" height=3D"100%" valign=3D"top" bgcolor=3D""=
+>
+                                              <table border=3D"0" cellpaddi=
+ng=3D"0" cellspacing=3D"0" align=3D"center" width=3D"100%" height=3D"4px" s=
+tyle=3D"line-height:4px; font-size:4px;">
+                                                <tbody>
+                                                <tr>
+                                                  <td style=3D"padding:0px =
+0px 4px 0px;" bgcolor=3D"fa6400"></td>
+                                                </tr>
+                                                </tbody>
+                                              </table>
+                                            </td>
+                                          </tr>
+                                          </tbody>
+                                        </table></td>
+        </tr>
+      </tbody>
+    </table></td>
+                              </tr>
+                              </tbody>
+                            </table></td>
+                                      </tr>
+                                    </table>
+                                    <!--[if mso]>
+                                  </td>
+                                </tr>
+                              </table>
+                            </center>
+                            <![endif]-->
+                          </td>
+                        </tr>
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+          </table>
+        </div>
+      </center>
+    <img src=3D"https://u19049598.ct.sendgrid.net/wf/open?upn=3Du001.Ar0Qov=
+rl2XEF4Y0-2BpF6EkSy-2FsU11Uf0mdQEGOFmHzvjo3NwJVmiW3dJaKgLL5zkZCfqpzaNDYz-2B=
+5DV0Hk82mNnFFOqWFmoDiHAJc2YWvwzHdjlA8qTdTfWp4cGk7R24LsMj3yrL0BhiUTZ-2FJ-2BL=
+Na0EkHx7f-2FRItiFy8TxyxMqzn0mIYR-2Fk-2F9oR-2F38PZBV5X6mD3HjllF-2F1iLsHGH4Fm=
+8gZ7wR0cWgg8g-2Ffoy0-2FsAHVze5QDH-2FgKbLWiwmm0P-2B0QkVtwUV-2BI4Kl7uaTGQVphL=
+sM7n-2BYM8uc74y-2FlaYmsywqT0Z6RbLN3Q03VPIMJiIvzpKC1NmBWpgLLhh-2Fje6dmhwYAq4=
+GQmoUiZBr6Y7bBwb6Q-3D" alt=3D"" width=3D"1" height=3D"1" border=3D"0" style=
+=3D"height:1px !important;width:1px !important;border-width:0 !important;ma=
+rgin-top:0 !important;margin-bottom:0 !important;margin-right:0 !important;=
+margin-left:0 !important;padding-top:0 !important;padding-bottom:0 !importa=
+nt;padding-right:0 !important;padding-left:0 !important;"/></body>
+  </html>
+
+--0739d2f849e1b0908d960e9150db9732fb6f9e461a99ad7e55ecddc820f9--
