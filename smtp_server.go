@@ -192,7 +192,7 @@ func (s *Session) Data(r io.Reader) error {
 	s.subject = sub
 	s.plaintextPart = string(plaintext)
 
-	logutil.Infof("email: received email %s with subject %q", osNumber, sub)
+	logutil.Infof("email: received email with subject %q", sub)
 	logutil.Infof("email: plain/text part: %s", plaintext)
 
 	return nil

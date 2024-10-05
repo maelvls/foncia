@@ -674,7 +674,7 @@ type Document struct {
 	// Live-only fields.
 	OriginalFilename string // Example: "2023-03-09_2apf.pdf"
 	MimeType         string // Example: "application/pdf"
-	Category         string // Example: "contract"
+	Category         string // Example: "contract", "reportVisit", "councilReportVisit"
 	CreatedAt        time.Time
 }
 
@@ -1534,4 +1534,116 @@ func saveEmailToDB(ctx context.Context, db *sql.DB, message *cloudmailin.Incomin
 	}
 
 	return nil
+}
+
+//	{
+//	 "query": "query getAccountDocuments($accountUuid: EncodedID!, $first: Int, $after: Cursor, $documentCategory: MyFonciaFileCategoryEnum!, $originalFilename: String, $subCategories: [String!], $fromDate: String, $toDate: String, $missionGeneralAssemblyIds: [String!]) {\n  account(uuid: $accountUuid) {\n    uuid\n    documents(\n      documentCategory: $documentCategory\n      first: $first\n      after: $after\n      originalFilename: $originalFilename\n      subCategories: $subCategories\n      fromDate: $fromDate\n      toDate: $toDate\n      missionGeneralAssemblyIds: $missionGeneralAssemblyIds\n    ) {\n      totalCount\n      pageInfo {\n        ...pageInfo\n        __typename\n      }\n      edges {\n        node {\n          ...document\n          __typename\n        }\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}\n\nfragment pageInfo on PageInfo {\n  startCursor\n  endCursor\n  hasPreviousPage\n  hasNextPage\n  pageNumber\n  itemsPerPage\n  totalDisplayPages\n  totalPages\n  __typename\n}\n\nfragment document on Document {\n  id\n  hashFile\n  mimeType\n  originalFilename\n  category\n  createdAt\n  __typename\n}",
+//	 "variables": {
+//	   "accountUuid": "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9",
+//	   "documentCategory": "reportVisit",
+//	   "originalFilename": "",
+//	   "subCategories": [],
+//	   "after": "eyJwYWdlTnVtYmVyIjoyLCJpdGVtc1BlclBhZ2UiOjEwfQ"
+//	 },
+//	 "operationName": "getAccountDocuments"
+//	}
+func getAccountDocumentsLive(client *http.Client, accountUUID, documentCategory, after string) ([]Document, error) {
+	const getAccountDocumentsQuery = `
+		query getAccountDocuments($accountUuid: EncodedID!, $first: Int, $after: Cursor, $documentCategory: MyFonciaFileCategoryEnum!, $originalFilename: String, $subCategories: [String!], $fromDate: String, $toDate: String, $missionGeneralAssemblyIds: [String!]) {
+		  account(uuid: $accountUuid) {
+		    uuid
+		    documents(
+		      documentCategory: $documentCategory
+		      first: $first
+		      after: $after
+		      originalFilename: $originalFilename
+		      subCategories: $subCategories
+		      fromDate: $fromDate
+		      toDate: $toDate
+		      missionGeneralAssemblyIds: $missionGeneralAssemblyIds
+		    ) {
+		      totalCount
+		      pageInfo {
+		        startCursor
+		        endCursor
+		        hasPreviousPage
+		        hasNextPage
+		        pageNumber
+		        itemsPerPage
+		        totalDisplayPages
+		        totalPages
+		      }
+		      edges {
+		        node {
+		          id
+		          hashFile
+		          mimeType
+		          originalFilename
+		          category
+		          createdAt
+		        }
+		      }
+		    }
+		  }
+		}`
+	var getAccountDocumentsResp struct {
+		Data struct {
+			Account struct {
+				Documents struct {
+					TotalCount int `json:"totalCount"`
+					PageInfo   struct {
+						StartCursor       string `json:"startCursor"`
+						EndCursor         string `json:"endCursor"`
+						HasPreviousPage   bool   `json:"hasPreviousPage"`
+						HasNextPage       bool   `json:"hasNextPage"`
+						PageNumber        int    `json:"pageNumber"`
+						ItemsPerPage      int    `json:"itemsPerPage"`
+						TotalDisplayPages int    `json:"totalDisplayPages"`
+						TotalPages        int    `json:"totalPages"`
+					} `json:"pageInfo"`
+					Edges []struct {
+						Node struct {
+							ID               string `json:"id"`
+							HashFile         string `json:"hashFile"`
+							MimeType         string `json:"mimeType"`
+							OriginalFilename string `json:"originalFilename"`
+							Category         string `json:"category"`
+							CreatedAt        string `json:"createdAt"`
+						} `json:"node"`
+					} `json:"edges"`
+				} `json:"documents"`
+			} `json:"account"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getAccountDocumentsQuery, map[string]interface{}{
+		"accountUuid":      accountUUID,
+		"documentCategory": documentCategory,
+		"originalFilename": "",
+		"subCategories":    []string{},
+		"after":            after,
+	}, &getAccountDocumentsResp)
+	if err != nil {
+		return nil, fmt.Errorf("error while querying getAccountDocumentsResp: %w", err)
+	}
+
+	var docs []Document
+	for _, edge := range getAccountDocumentsResp.Data.Account.Documents.Edges {
+
+		createdAt, err := time.Parse(time.RFC3339, edge.Node.CreatedAt)
+		if err != nil {
+			logutil.Debugf("error parsing time: %v", err)
+			return nil, err
+		}
+
+		docs = append(docs, Document{
+			ID:               edge.Node.ID,
+			HashFile:         edge.Node.HashFile,
+			MimeType:         edge.Node.MimeType,
+			OriginalFilename: edge.Node.OriginalFilename,
+			Category:         edge.Node.Category,
+			CreatedAt:        createdAt,
+		})
+	}
+	return docs, nil
 }
