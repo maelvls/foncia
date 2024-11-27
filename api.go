@@ -83,6 +83,23 @@ func authenticatedClient(authClient *http.Client, username string, password secr
 //	))
 //
 // The given client isn't mutated.
+//
+//	curl 'https://myfoncia-gateway.prod.fonciamillenium.net/graphql' \
+//	  -H 'accept: */*' \
+//	  -H 'accept-language: en-US,en;q=0.9,fr;q=0.8,fr-FR;q=0.7' \
+//	  -H 'authorization;' \
+//	  -H 'content-type: application/json' \
+//	  -H 'origin: https://my-foncia.fonciamillenium.net' \
+//	  -H 'priority: u=1, i' \
+//	  -H 'referer: https://my-foncia.fonciamillenium.net/' \
+//	  -H 'sec-ch-ua: "Not A(Brand";v="8", "Chromium";v="132", "Microsoft Edge";v="132"' \
+//	  -H 'sec-ch-ua-mobile: ?0' \
+//	  -H 'sec-ch-ua-platform: "macOS"' \
+//	  -H 'sec-fetch-dest: empty' \
+//	  -H 'sec-fetch-mode: cors' \
+//	  -H 'sec-fetch-site: same-site' \
+//	  -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0' \
+//	  --data-raw $'{"query":"mutation login($request: LoginRequest\u0021) {\\n  login(request: $request) {\\n    token\\n    __typename\\n  }\\n}","variables":{"request":{"username":"","password":"","appId":"myfoncia"}},"operationName":"login"}'
 func getToken(client *http.Client, username string, password secret) (Token, error) {
 	// Redirects don't make sense for HTML pages. For example, a 302 redirect
 	// might actually indicate an error.
@@ -96,71 +113,47 @@ func getToken(client *http.Client, username string, password secret) (Token, err
 	}
 	client.Jar = jar
 
-	// A first request is needed to get the session cookie.
-	req, err := http.NewRequest("GET", "https://myfoncia.fr/login", nil)
-	if err != nil {
-		return "", fmt.Errorf("error creating request: %w", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("while performing request: %w", err)
-	}
-	defer resp.Body.Close()
+	query := `mutation login($request: LoginRequest!) {
+		login(request: $request) {
+			token
+			__typename
+		}
+	}`
 
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("unexpected status code %d", resp.StatusCode)
+	type LoginRequest struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		AppID    string `json:"appId"`
+	}
+	var loginResp struct {
+		Data struct {
+			Login struct {
+				Token string `json:"token"`
+			} `json:"login"`
+		} `json:"data"`
 	}
 
-	// The second request is the actual authentication.
-	form := url.Values{}
-	form.Add("username", username)
-	form.Add("_password", password.Raw())
-	req, err = http.NewRequest("POST", "https://myfoncia.fr/login_check", strings.NewReader(form.Encode()))
+	err = DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", query, map[string]interface{}{
+		"request": LoginRequest{
+			Username: username,
+			Password: password.Raw(),
+			AppID:    "myfoncia",
+		},
+	}, &loginResp)
 	if err != nil {
-		logutil.Errorf("Error creating request: %v", err)
+		return "", fmt.Errorf("error while querying loginResp: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err = client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("while performing request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 302 {
-		logutil.Debugf("authentication: got %d instead of a 302", resp.StatusCode)
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
-		return "", fmt.Errorf("unexpected status code %d", resp.StatusCode)
-	}
-	loc, err := resp.Location()
-	if err != nil {
-		logutil.Debugf("authentication: no Location header found")
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
-		return "", fmt.Errorf("error getting redirect location: %w", err)
-	}
-	// The Location header should be:
-	// https://my-foncia.fonciamillenium.net?sso=<jwt>
-	expected := "https://my-foncia.fonciamillenium.net?sso=<jwt>"
-	ssoParam := loc.Query()["sso"]
-	if len(ssoParam) != 1 {
-		logutil.Debugf("authentication: no 'sso' query parameter found in the Location header. Was redirected to %s instead of expected %s", loc.String(), expected)
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		logutil.Debugf("HTML page was:\n%s", string(bodyBytes))
-		return "", fmt.Errorf("authentication did not go well. No 'sso' query param was found in the Location header. Location header was %s", loc.String())
-	}
-	token := Token(ssoParam[0])
 
 	// We parse the JWT to know when the token expires. We can't verify the JWT
 	// because we don't have the public key (and we don't need to verify it),
 	// but I trust that the `exp` claim is correct since I trust the server.
-	expiry, err := parseJWTExp(string(token))
+	expiry, err := parseJWTExp(string(loginResp.Data.Login.Token))
 	if err != nil {
 		return "", fmt.Errorf("while parsing JWT: %w", err)
 	}
+
 	logutil.Debugf("authentication: token expires in %s (%s)", expiry.Sub(time.Now()).Round(time.Second), expiry)
-	return Token(token), nil
+	return Token(loginResp.Data.Login.Token), nil
 }
 
 // Returns the expiry date of the given JWT. WARNING: This func doesn't verify
