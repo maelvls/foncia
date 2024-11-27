@@ -17,6 +17,8 @@ import (
 	"time"
 
 	_ "github.com/glebarez/go-sqlite"
+	"github.com/maelvls/foncia/api"
+	"github.com/maelvls/foncia/db"
 	"github.com/maelvls/foncia/logutil"
 	"github.com/maelvls/foncia/undent"
 )
@@ -110,7 +112,6 @@ func main() {
 		fmt.Println(version)
 	case "serve":
 		logutil.Infof("version: %s (%s)", version, date)
-		username, password := getCreds()
 
 		// The `--db` is the path to the SQLite database. Example:
 		// "/var/lib/foncia.db".
@@ -121,23 +122,31 @@ func main() {
 			os.Exit(1)
 		}
 
-		db, err := sql.Open("sqlite", path)
+		sqlDB, err := sql.Open("sqlite", path)
 		if err != nil {
 			logutil.Errorf("failed to open database at %q: %w", path, err)
 			os.Exit(1)
 		}
-		defer db.Close()
+		defer sqlDB.Close()
 
-		err = initSchemaDB(context.Background(), db)
+		err = db.InitSchemaDB(context.Background(), sqlDB)
 		if err != nil {
 			logutil.Errorf("while creating schema: %v", err)
 			os.Exit(1)
 		}
 
-		client, err := authenticatedClient(&http.Client{}, username, password)
-		if err != nil {
-			logutil.Errorf("while authenticating client: %v", err)
-			os.Exit(1)
+		token := os.Getenv("FONCIA_TOKEN")
+		var client *http.Client
+		if token != "" {
+			logutil.Infof("using FONCIA_TOKEN instead of username and password")
+			client = api.AuthenticatedClientToken(api.Token(token))
+		} else {
+			username, password := getCreds()
+			client, err = api.AuthenticatedClient(&http.Client{}, username, password)
+			if err != nil {
+				logutil.Errorf("while authenticating client: %v", err)
+				os.Exit(1)
+			}
 		}
 
 		m := sync.RWMutex{}
@@ -165,12 +174,18 @@ func main() {
 			serveBaseURL = "http://" + *serveAddr
 		}
 
+		uuid, err := api.GetAccountUUID(client)
+		if err != nil {
+			logutil.Errorf("while getting account UUID: %v", err)
+			os.Exit(1)
+		}
+
 		go func() {
 			// When the database is empty, we do an initial fetch to populate
 			// it; since it most likely means that these items aren't new, we
 			// don't send Ntfy notifications.
 			var skipNotif bool
-			empty, err := isEmptyDB(context.Background(), db)
+			empty, err := db.IsEmptyDB(context.Background(), sqlDB)
 			if err != nil {
 				logutil.Errorf("while checking if database is empty: %v", err)
 				os.Exit(1)
@@ -181,7 +196,7 @@ func main() {
 
 			for {
 				logutil.Debugf("updating database by fetching from live")
-				newMissions, newExpenses, err := authFetchSave(client, *invoicesDir, db)
+				newMissions, newExpenses, err := authFetchSave(client, sqlDB, uuid, *invoicesDir)
 				writeLastSync(err)
 				if err != nil {
 					logutil.Errorf("while fetching and updating database: %v", err)
@@ -229,10 +244,13 @@ func main() {
 			}
 		}()
 
-		htmlHeader, err := readHeaderFile(*htmlHeaderFile)
-		if err != nil {
-			logutil.Errorf("while reading HTML header file: %v", err)
-			os.Exit(1)
+		var htmlHeader string
+		if *htmlHeaderFile != "" {
+			htmlHeader, err = readHeaderFile(*htmlHeaderFile)
+			if err != nil {
+				logutil.Errorf("while reading HTML header file: %v", err)
+				os.Exit(1)
+			}
 		}
 
 		httpListen, err := net.Listen("tcp", *serveAddr)
@@ -247,17 +265,20 @@ func main() {
 		}
 
 		wg := sync.WaitGroup{}
+
 		ctx := context.Background()
 		ctx, cancel := context.WithCancelCause(ctx)
-		defer cancel(fmt.Errorf("main: cancelled for no reason"))
+		defer cancel(nil)
+
 		signalOnExit(func(s os.Signal) {
-			cancel(fmt.Errorf("main: cancelled by signal %s", s))
+			cancel(fmt.Errorf("signal '%s'", s))
 		})
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := ServeSMTP(ctx, db, smtpListen)
+			defer cancel(nil)
+			err := ServeSMTP(ctx, sqlDB, smtpListen)
 			if err != nil {
 				cancel(err)
 			}
@@ -266,7 +287,8 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := ServeHTTP(ctx, db, httpListen, *serveBasePath, username, password, readLastSync, htmlHeader)
+			defer cancel(nil)
+			err := ServeHTTP(ctx, sqlDB, httpListen, *serveBasePath, readLastSync, htmlHeader)
 			if err != nil {
 				cancel(err)
 			}
@@ -274,7 +296,7 @@ func main() {
 
 		wg.Wait()
 		if ctx.Err() != nil {
-			logutil.Errorf("main: %v", context.Cause(ctx))
+			logutil.Errorf("%v", context.Cause(ctx))
 			os.Exit(1)
 		}
 	case "serve-smtp":
@@ -287,14 +309,14 @@ func main() {
 			os.Exit(1)
 		}
 
-		db, err := sql.Open("sqlite", path)
+		sqlDB, err := sql.Open("sqlite", path)
 		if err != nil {
 			logutil.Errorf("failed to open database at %q: %w", path, err)
 			os.Exit(1)
 		}
-		defer db.Close()
+		defer sqlDB.Close()
 
-		err = initSchemaDB(context.Background(), db)
+		err = db.InitSchemaDB(context.Background(), sqlDB)
 		if err != nil {
 			logutil.Errorf("while creating schema: %v", err)
 			os.Exit(1)
@@ -333,7 +355,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := ServeSMTP(ctx, db, smtpListen)
+			err := ServeSMTP(ctx, sqlDB, smtpListen)
 			if err != nil {
 				cancel(err)
 			}
@@ -351,12 +373,12 @@ func main() {
 		path := *dbPath
 		logutil.Debugf("using sqlite3 database file %q", path)
 
-		db, err := sql.Open("sqlite", path)
+		sqlDB, err := sql.Open("sqlite", path)
 		if err != nil {
 			logutil.Errorf("while opening database: %v", err)
 			os.Exit(1)
 		}
-		err = rmLastExpenseDB(db)
+		err = db.RmLastExpenseDB(sqlDB)
 		if err != nil {
 			logutil.Errorf("while removing last expense: %v", err)
 			os.Exit(1)
@@ -365,12 +387,12 @@ func main() {
 		path := *dbPath
 		logutil.Debugf("using sqlite3 database file %q", path)
 
-		db, err := sql.Open("sqlite", path)
+		sqlDB, err := sql.Open("sqlite", path)
 		if err != nil {
 			logutil.Errorf("while opening database: %v", err)
 			os.Exit(1)
 		}
-		err = rmLastMissionDB(db)
+		err = db.RmLastMissionDB(sqlDB)
 		if err != nil {
 			logutil.Errorf("while removing last expense: %v", err)
 			os.Exit(1)
@@ -378,8 +400,8 @@ func main() {
 	case "token":
 		username, password := getCreds()
 		client := &http.Client{}
-		enableDebugCurlLogs(client)
-		token, err := getToken(client, username, password)
+		api.EnableDebugCurlLogs(client)
+		token, err := api.GetToken(client, username, password)
 		if err != nil {
 			logutil.Errorf("while authenticating: %v", err)
 			os.Exit(1)
@@ -408,7 +430,7 @@ type ntfyMsg struct {
 	Body           string // Content of the notification.
 }
 
-func missionToNtfyBody(m Mission) string {
+func missionToNtfyBody(m db.MissionDB) string {
 	msg := m.Label
 	if m.Description != "" {
 		msg += ": " + m.Description
@@ -427,28 +449,28 @@ func missionToNtfyBody(m Mission) string {
 }
 
 // Returns the new entries found.
-func authFetchSave(client *http.Client, invoicesDir string, db *sql.DB) ([]Mission, []Expense, error) {
+func authFetchSave(client *http.Client, db *sql.DB, uuid, invoicesDir string) ([]db.MissionDB, []db.ExpenseDocumentDB, error) {
 	ctx := context.Background()
 
-	newMissions, err := syncLiveMissionsWithDB(ctx, client, db)
+	// newMissions, err := syncLiveMissionsWithDB(ctx, client, db, uuid)
+	// if err != nil {
+	// 	return nil, nil, fmt.Errorf("while saving to database: %v", err)
+	// }
+	newExpenses, err := syncExpensesWithDB(ctx, client, db, uuid, invoicesDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}
-	newExpenses, err := syncExpensesWithDB(ctx, client, db, invoicesDir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("while saving to database: %v", err)
-	}
-	err = syncSuppliersWithDB(ctx, client, db, invoicesDir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("while saving to database: %v", err)
-	}
+	// err = syncSuppliersWithDB(ctx, client, db, uuid, invoicesDir)
+	// if err != nil {
+	// 	return nil, nil, fmt.Errorf("while saving to database: %v", err)
+	// }
 
-	return newMissions, newExpenses, nil
+	return nil, newExpenses, nil
 }
 
-func getCreds() (string, secret) {
+func getCreds() (string, api.Password) {
 	username := os.Getenv("FONCIA_USERNAME")
-	password := secret(os.Getenv("FONCIA_PASSWORD"))
+	password := api.Password(os.Getenv("FONCIA_PASSWORD"))
 	if username == "" || password == "" {
 		logutil.Errorf("FONCIA_USERNAME and FONCIA_PASSWORD must be set.")
 		os.Exit(1)

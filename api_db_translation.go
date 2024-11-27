@@ -1,0 +1,67 @@
+package main
+
+import (
+	"github.com/maelvls/foncia/api"
+	"github.com/maelvls/foncia/db"
+)
+
+func MissionAPIToDB(m api.MissionAPI) db.MissionDB {
+	return db.MissionDB{
+		ID:          m.ID,
+		StartedAt:   m.StartedAt,
+		Kind:        string(m.Kind),
+		Number:      m.Number,
+		Label:       m.Label,
+		Description: m.Description,
+		Status:      m.Status,
+	}
+}
+
+// WARNING: the `Documents` field is not set by this function. You need to set
+// it manually afterwards.
+func SupplierAPIToDB(s api.SupplierAPI) db.SupplierDB {
+	return db.SupplierDB{
+		ID:       s.ID,
+		Name:     s.Name,
+		Activity: s.Activity,
+	}
+}
+
+// WARNING: the `FilePath` field is not set by this function. You need to set it
+// manually afterwards.
+func ExpenseDocumentAPIToDB(e api.ExpenseDocumentAPI) db.ExpenseDocumentDB {
+	return db.ExpenseDocumentDB{
+		Label:     e.Label,
+		Date:      e.Date,
+		Amount:    e.Amount,
+		InvoiceID: e.InvoiceID,
+		HashFile:  e.HashFile,
+		FilePath:  "", // Remember to set this later on.
+	}
+}
+
+// The FilePath is left empty. You have to set it later on.
+func SupplierContractAPIToDB(c api.SupplierContractAPI) []db.SupplierContractDocumentDB {
+	var docs []db.SupplierContractDocumentDB
+	for _, doc := range c.Documents {
+		docs = append(docs, db.SupplierContractDocumentDB{
+			ID:         doc.ID,
+			HashFile:   doc.HashFile,
+			FilePath:   "", // Remember to set this later on.
+			SupplierID: c.ID,
+		})
+	}
+	return docs
+}
+
+func WorkOrderAPIToDB(w api.WorkOrderAPI, missionID string) db.WorkOrderDB {
+	return db.WorkOrderDB{
+		ID:              w.ID,
+		MissionID:       missionID,
+		Number:          w.Number,
+		Label:           w.Label,
+		RepairDateStart: w.RepairDateStart,
+		RepairDateEnd:   w.RepairDateEnd,
+		Supplier:        SupplierAPIToDB(w.Supplier),
+	}
+}

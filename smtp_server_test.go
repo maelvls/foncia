@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-smtp"
+	"github.com/maelvls/foncia/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -25,6 +26,7 @@ import (
 
 func TestSMTPServer(t *testing.T) {
 	t.Run("sample email is correctly parsed", func(t *testing.T) {
+		email := "foo"
 		msg, err := mail.ReadMessage(bytes.NewBufferString(email))
 		require.NoError(t, err)
 
@@ -52,9 +54,9 @@ func TestSMTPServer(t *testing.T) {
 	})
 
 	t.Run("run server", func(t *testing.T) {
-		db, err := sql.Open("sqlite", ":memory:")
+		sqlDB, err := sql.Open("sqlite", ":memory:")
 		require.NoError(t, err)
-		err = initSchemaDB(context.Background(), db)
+		err = db.InitSchemaDB(context.Background(), sqlDB)
 		require.NoError(t, err)
 
 		d := t.TempDir()
@@ -66,7 +68,7 @@ func TestSMTPServer(t *testing.T) {
 		t.Logf("You can test the SMTP server by running:\n  socat - UNIX-CONNECT:%s", smtpL.Addr().String())
 
 		go func() {
-			err = ServeSMTP(context.Background(), db, smtpL)
+			err = ServeSMTP(context.Background(), sqlDB, smtpL)
 			require.NoError(t, err)
 		}()
 
@@ -80,6 +82,7 @@ func TestSMTPServer(t *testing.T) {
 		require.NoError(t, err)
 		defer conn.Close()
 
+		email := "foo"
 		err = smtp.NewClient(conn).SendMail("foo@bar.fr", []string{"foo2bar@foo.co"}, bytes.NewBufferString(email))
 		require.NoError(t, err)
 	})

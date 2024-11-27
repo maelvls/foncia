@@ -9,12 +9,17 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cloudmailin/cloudmailin-go"
+	"github.com/maelvls/foncia/db"
 	"github.com/maelvls/foncia/logutil"
 )
+
+type MissionOrExpense struct {
+	Mission *db.MissionDB
+	Expense *db.ExpenseDocumentDB
+}
 
 type tmlpData struct {
 	BasePath   string
@@ -101,9 +106,9 @@ var tmpl = template.Must(template.New("base").Parse(`
 								{{.RepairDateStart.Format "02/01/2006"}}–{{.RepairDateEnd.Format "02/01/2006"}}
 								{{.Supplier.Name}}
 								{{.Supplier.Activity}}</br>
-								{{if .Supplier.Document.HashFile}}{{with .Supplier.Document}}
+								{{range .Supplier.Documents}}
 									(<small><a href="{{$.BasePath}}/dl/contract/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small>)
-								{{end}}{{end}}
+								{{end}}
 							{{end}}
 						</small>
 					</td>
@@ -117,7 +122,13 @@ var tmpl = template.Must(template.New("base").Parse(`
 					<td><small>
 						{{.Amount}}
 					</small></td>
-					<td><small><a href="{{$.BasePath}}/dl/invoice/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
+					{{if .FilePath}}
+						<td><small><a href="{{$.BasePath}}/dl/invoice/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
+					{{else if .HashFile}}
+						<td><small>PDF en attente de téléchargement</small></td>
+					{{else}}
+						<td><small>Pas de PDF</small></td>
+					{{end}}
 				</tr>
 				{{end}}
 			{{end}}
@@ -162,7 +173,7 @@ func logRequest(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc 
 // the context. The `basePath` should always start with a slash and not end with
 // a slash. If you want to given an empty base path, don't give "/". Instead,
 // give "".
-func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, basePath, username string, password secret, lastSync func() (time.Time, error), htmlHeader string) error {
+func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, basePath string, lastSync func() (time.Time, error), htmlHeader string) error {
 	if basePath != "" && !strings.HasPrefix(basePath, "/") {
 		return fmt.Errorf("base path must start with a slash or be an empty string")
 	}
@@ -170,54 +181,40 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, basePat
 		return fmt.Errorf("base path must not end with a slash; if you want to give the base path /, give an empty string instead")
 	}
 
-	var headerContents string = defaultHeaderTmpl
+	headerContents := defaultHeaderTmpl
 	if htmlHeader != "" {
 		headerContents = htmlHeader
 	}
-
 	_, err := tmpl.New("header").Parse(headerContents)
 	if err != nil {
 		return fmt.Errorf("while parsing HTML header file %s: %w", *htmlHeaderFile, err)
 	}
 
-	// Client to talk to https://myfoncia-gateway.prod.fonciamillenium.net.
-	client := &http.Client{}
-	enableDebugCurlLogs(client)
-
 	// HTTP server to serve the list of missions and expenses.
 	mux := http.NewServeMux()
-	err = addHandlers(mux, db, basePath, username, password, lastSync)
+	s := http.Server{Handler: mux}
+	go func() {
+		<-ctx.Done()
+		_ = s.Close()
+	}()
+
+	err = addHandlers(mux, db, basePath, lastSync)
 	if err != nil {
 		return fmt.Errorf("while adding handlers: %w", err)
 	}
 
-	ctx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(fmt.Errorf("ServeCmd: cancelled without a reason"))
+	logutil.Infof("listening on %v", httpListen.Addr())
+	logutil.Infof("url: http://%s%s", httpListen.Addr(), basePath)
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer cancel(fmt.Errorf("HTTP server stopped for some reason"))
-		logutil.Infof("listening on %v", httpListen.Addr())
-		logutil.Infof("url: http://%s%s", httpListen.Addr(), basePath)
-
-		err = http.Serve(httpListen, mux)
-		if err != nil {
-			cancel(fmt.Errorf("while serving: %v", err))
-			return
-		}
-	}()
-
-	wg.Wait()
-	if ctx.Err() != nil {
-		return context.Cause(ctx)
+	err = s.Serve(httpListen)
+	if err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("while serving HTTP: %w", err)
 	}
 
 	return nil
 }
 
-func addHandlers(mux *http.ServeMux, db *sql.DB, basePath, username string, password secret, lastSync func() (time.Time, error)) error {
+func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync func() (time.Time, error)) error {
 	// Download the invoice PDF. Example:
 	//  GET /dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
 	//  GET /dl/contract/660d79500178f21ab3ffc357/contract.pdf
@@ -245,7 +242,7 @@ func addHandlers(mux *http.ServeMux, db *sql.DB, basePath, username string, pass
 
 		switch typ {
 		case "invoice":
-			expense, err := getExpenseByHashFileDB(context.Background(), db, hashFile)
+			expense, err := db.GetExpenseByHashFileDB(context.Background(), sqlDB, hashFile)
 			if err != nil {
 				logutil.Errorf("while getting expense by hash file: %v", err)
 				http.Error(w, "not found", http.StatusNotFound)
@@ -253,7 +250,7 @@ func addHandlers(mux *http.ServeMux, db *sql.DB, basePath, username string, pass
 			}
 			http.ServeFile(w, r, expense.FilePath)
 		case "contract":
-			doc, err := getDocumentByHashFile(context.Background(), db, hashFile)
+			doc, err := db.GetSupplierContractByHashFileDB(context.Background(), sqlDB, hashFile)
 			if err != nil {
 				logutil.Errorf("while getting document by hash file: %v", err)
 				http.Error(w, "not found", http.StatusNotFound)
@@ -271,7 +268,7 @@ func addHandlers(mux *http.ServeMux, db *sql.DB, basePath, username string, pass
 			return
 		}
 
-		missions, err := getMissionsDB(context.Background(), db)
+		missions, err := db.GetMissionsDB(context.Background(), sqlDB)
 		if err != nil {
 			logutil.Errorf("while listing interventions: %v", err)
 
@@ -284,7 +281,7 @@ func addHandlers(mux *http.ServeMux, db *sql.DB, basePath, username string, pass
 			return
 		}
 
-		expenses, err := getExpensesDB(context.Background(), db)
+		expenses, err := db.GetExpensesDB(context.Background(), sqlDB)
 		if err != nil {
 			logutil.Errorf("while listing expenses: %v", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -367,7 +364,7 @@ func addHandlers(mux *http.ServeMux, db *sql.DB, basePath, username string, pass
 		// message.Headers.MessageID().
 		logutil.Infof("received message: message-id %s, sub: %s", message.Headers.MessageID(), message.Headers.Subject())
 
-		tx, err := db.Begin()
+		tx, err := sqlDB.Begin()
 		if err != nil {
 			http.Error(w, "while starting transaction: "+err.Error(), http.StatusInternalServerError)
 			return

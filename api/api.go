@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"bytes"
@@ -19,61 +19,79 @@ import (
 	"time"
 
 	"github.com/cloudmailin/cloudmailin-go"
+	"github.com/maelvls/foncia/db"
 	"github.com/maelvls/foncia/logutil"
 	"github.com/sethgrid/gencurl"
 	"github.com/shurcooL/graphql"
 	"golang.org/x/oauth2"
 )
 
-type Mission struct {
-	ID          string      // "64850e8019d5d64c415d13dd"
-	Number      string      // "7000YRK51"
-	Label       string      // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
-	Status      string      // "WORK_IN_PROGRESS"
-	StartedAt   time.Time   // "2023-04-24T22:00:00.000Z" (time.RFC3339)
-	Description string      // "BONJOUR,\n\nVEUILLEZ ENREGISTER LE C02\t\nMERCI CORDIALEMENT"
-	Kind        MissionKind // "Incident" | "Repair"
-	WorkOrders  []WorkOrder
+type MissionAPI struct {
+	ID          string         // "64850e8019d5d64c415d13dd"
+	Number      string         // "7000YRK51"
+	Label       string         // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
+	Status      string         // "WORK_IN_PROGRESS"
+	StartedAt   time.Time      // "2023-04-24T22:00:00.000Z" (time.RFC3339)
+	Description string         // "BONJOUR,\n\nVEUILLEZ ENREGISTER LE C02\t\nMERCI CORDIALEMENT"
+	Kind        MissionKindAPI // "Incident" | "Repair"
+	WorkOrders  []WorkOrderAPI
 }
 
-type MissionOrExpense struct {
-	Mission *Mission
-	Expense *Expense
-}
-
-type WorkOrder struct {
+type WorkOrderAPI struct {
 	ID              string    // "64850e80df57eb4ade3cf63c"
 	Number          string    // "OSMIL802702875"
 	Label           string    // "BOUVIER SECURITE INCENDIE - DEMANDE INTERVENTION P"
 	RepairDateStart time.Time // "2022-10-18T22:00:00.000Z"
 	RepairDateEnd   time.Time // "2022-10-18T22:00:00.000Z"
-	Supplier        Supplier
+	Supplier        SupplierAPI
 }
 
-type MissionKind string
+type MissionKindAPI string
 
 var (
-	Incident MissionKind = "Incident"
-	Repair   MissionKind = "Repair"
+	Incident MissionKindAPI = "Incident"
+	Repair   MissionKindAPI = "Repair"
 )
 
 // The `authClient` given as input is only used to authenticate and is not used
 // after that. A fresh client is returned.
-func authenticatedClient(authClient *http.Client, username string, password secret) (*http.Client, error) {
-	enableDebugCurlLogs(authClient)
+func AuthenticatedClient(authClient *http.Client, username string, password Password) (*http.Client, error) {
+	EnableDebugCurlLogs(authClient)
 
-	token, err := getToken(authClient, username, password)
+	token, err := GetToken(authClient, username, password)
 	if err != nil {
 		logutil.Errorf("while authenticating: %v", err)
 		os.Exit(1)
 	}
 
+	return AuthenticatedClientToken(token), nil
+}
+
+func AuthenticatedClientToken(token Token) *http.Client {
 	client := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: string(token)},
 	))
-	enableDebugCurlLogs(client)
+	EnableDebugCurlLogs(client)
+	return client
+}
 
-	return client, nil
+// Detect when 429 too many requests is returned by the server.
+func IsTooManyRequests(body []byte) bool {
+	var resp struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	err := json.Unmarshal(body, &resp)
+	if err != nil {
+		return false
+	}
+	for _, err := range resp.Errors {
+		if err.Message == "429: Too Many Requests" {
+			return true
+		}
+	}
+	return false
 }
 
 // After getting the token, create a client with the following:
@@ -100,7 +118,7 @@ func authenticatedClient(authClient *http.Client, username string, password secr
 //	  -H 'sec-fetch-site: same-site' \
 //	  -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0' \
 //	  --data-raw $'{"query":"mutation login($request: LoginRequest\u0021) {\\n  login(request: $request) {\\n    token\\n    __typename\\n  }\\n}","variables":{"request":{"username":"","password":"","appId":"myfoncia"}},"operationName":"login"}'
-func getToken(client *http.Client, username string, password secret) (Token, error) {
+func GetToken(client *http.Client, username string, password Password) (Token, error) {
 	// Redirects don't make sense for HTML pages. For example, a 302 redirect
 	// might actually indicate an error.
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
@@ -131,6 +149,9 @@ func getToken(client *http.Client, username string, password secret) (Token, err
 				Token string `json:"token"`
 			} `json:"login"`
 		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
 	}
 
 	err = DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", query, map[string]interface{}{
@@ -142,6 +163,10 @@ func getToken(client *http.Client, username string, password secret) (Token, err
 	}, &loginResp)
 	if err != nil {
 		return "", fmt.Errorf("error while querying loginResp: %w", err)
+	}
+
+	if len(loginResp.Errors) > 0 {
+		return "", fmt.Errorf("error while logging in: %s", loginResp.Errors[0].Message)
 	}
 
 	// We parse the JWT to know when the token expires. We can't verify the JWT
@@ -219,8 +244,8 @@ func GetAccountUUID(client *http.Client) (string, error) {
 
 // Repairs and Incidents. Use GetAccountUUID to get the accountUUID.
 // `fromCursor` allows you to skip missions that you already have.
-func getMissionsLive(client *http.Client, accountUUID string, fromCursor string) (_ []Mission, lastCursor string, _ error) {
-	var interventions []Mission
+func GetMissionsAPI(client *http.Client, accountUUID string, fromCursor string) (_ []MissionAPI, lastCursor string, _ error) {
+	var interventions []MissionAPI
 
 	type PageInfo struct {
 		EndCursor   string `json:"endCursor"`
@@ -334,7 +359,7 @@ func getMissionsLive(client *http.Client, accountUUID string, fromCursor string)
 					return nil, "", fmt.Errorf("error parsing time: %w", err)
 				}
 			}
-			interventions = append(interventions, Mission{
+			interventions = append(interventions, MissionAPI{
 				ID:          edge.Node.ID,
 				Number:      edge.Node.Number,
 				Label:       edge.Node.Label,
@@ -424,7 +449,7 @@ func getMissionsLive(client *http.Client, accountUUID string, fromCursor string)
 					return nil, "", fmt.Errorf("error parsing time: %w", err)
 				}
 			}
-			interventions = append(interventions, Mission{
+			interventions = append(interventions, MissionAPI{
 				ID:          edge.Node.ID,
 				Number:      edge.Node.Number,
 				Label:       edge.Node.Label,
@@ -454,7 +479,7 @@ func getMissionsLive(client *http.Client, accountUUID string, fromCursor string)
 	return interventions, *cursor, nil
 }
 
-func getWorkOrdersLive(client *http.Client, accountUUID, missionID string) (_ []WorkOrder, _ error) {
+func GetWorkOrdersAPI(client *http.Client, accountUUID, missionID string) (_ []WorkOrderAPI, _ error) {
 	const getWorkOrders = `
 		query getWorkOrders($accountUuid: EncodedID!, $missionId: ID!, $first: Int, $before: Cursor, $after: Cursor) {
 			workOrders(accountUuid: $accountUuid, missionId: $missionId, first: $first, before: $before, after: $after) {
@@ -511,7 +536,7 @@ func getWorkOrdersLive(client *http.Client, accountUUID, missionID string) (_ []
 		return nil, fmt.Errorf("error while querying getWorkOrdersResp for mission %s: %w", missionID, err)
 	}
 
-	var orders []WorkOrder
+	var orders []WorkOrderAPI
 	for _, edge := range getWorkOrdersResp.Data.WorkOrders.Edges {
 		var start, end time.Time
 		if edge.Node.RepairDate.Start != "" {
@@ -527,13 +552,13 @@ func getWorkOrdersLive(client *http.Client, accountUUID, missionID string) (_ []
 			}
 		}
 
-		orders = append(orders, WorkOrder{
+		orders = append(orders, WorkOrderAPI{
 			ID:              edge.Node.ID,
 			Number:          edge.Node.Number,
 			Label:           edge.Node.Label,
 			RepairDateStart: start,
 			RepairDateEnd:   end,
-			Supplier: Supplier{
+			Supplier: SupplierAPI{
 				ID:        edge.Node.Supplier.ID,
 				Name:      edge.Node.Supplier.Name,
 				FirstName: edge.Node.Supplier.FirstName,
@@ -545,7 +570,7 @@ func getWorkOrdersLive(client *http.Client, accountUUID, missionID string) (_ []
 	return orders, nil
 }
 
-func enableDebugCurlLogs(client *http.Client) {
+func EnableDebugCurlLogs(client *http.Client) {
 	if client.Transport == nil {
 		client.Transport = http.DefaultTransport
 	}
@@ -643,47 +668,33 @@ func DoGraphQL[T any](client *http.Client, url, query string, variables map[stri
 	return nil
 }
 
-type Supplier struct {
-	ID       string
-	Name     string // Examples: "2NRT-POMPES ENVIRONNEMENT"
-	Activity string // Examples: "PLOM", "ADBE", "ISOL"
-
-	// DB-only fields.
-	Document Document
-
-	// Live-only fields.
+type SupplierAPI struct {
+	ID        string
+	Name      string // Examples: "2NRT-POMPES ENVIRONNEMENT"
+	Activity  string // Examples: "PLOM", "ADBE", "ISOL"
 	FirstName string // Almost always "null".
 }
 
-type Document struct {
-	ID       string
-	HashFile string // Example: "64850e805e5793033297f476"
-
-	// DB-only fields.
-	SupplierID string
-	FilePath   string // Example: "invoices/2023-03-09_2apf.pdf"
-	Filename   string // Example: "2023-03-09_2apf.pdf"
-
-	// Live-only fields.
-	OriginalFilename string // Example: "2023-03-09_2apf.pdf"
-	MimeType         string // Example: "application/pdf"
-	Category         string // Example: "contract", "reportVisit", "councilReportVisit"
-	CreatedAt        time.Time
-}
-
-type Contract struct {
-	Supplier  Supplier
-	Documents []Document
-
-	// Live-only fields.
+type SupplierContractAPI struct {
 	ID          string
 	Label       string
 	Description string
 	Number      string
-	EndingDate  string
+	EndingDate  time.Time
+	Supplier    SupplierAPI
+	Documents   []DocumentAPI
 }
 
-func getCouncilMissionSuppliersLive(client *http.Client, accountUUID string) ([]Contract, error) {
+type DocumentAPI struct {
+	ID               string
+	HashFile         db.HashFile // Only set when a document is attached. Example: "64850e805e5793033297f476"
+	OriginalFilename string      // Example: "2023-03-09_2apf.pdf"
+	MimeType         string      // Example: "application/pdf"
+	Category         string      // Example: "contract", "reportVisit", "councilReportVisit"
+	CreatedAt        time.Time   // Example: "2023-03-09T22:00:00.000Z"
+}
+
+func GetCouncilMissionSuppliersAPI(client *http.Client, accountUUID string) ([]SupplierContractAPI, error) {
 	const getSuppliersQuery = `
 		query getCouncilMissionSuppliers(
 		  $accountUuid: EncodedID!
@@ -785,75 +796,70 @@ func getCouncilMissionSuppliersLive(client *http.Client, accountUUID string) ([]
 		return nil, fmt.Errorf("error while querying getCouncilMissionSuppliers: %w", err)
 	}
 
-	var contracts []Contract
+	var contracts []SupplierContractAPI
 	for _, edge := range getCouncilMissionSuppliers.Data.CoownerAccount.TrusteeCouncil.SupplierContracts.Edges {
-		contracts = append(contracts, Contract{
+		var endingDate time.Time
+		if edge.Node.EndingDate != "" {
+			endingDate, err = time.Parse(time.RFC3339, edge.Node.EndingDate)
+			if err != nil {
+				logutil.Errorf("error parsing time: %v", err)
+				continue
+			}
+		}
+
+		var docs []DocumentAPI
+		for _, doc := range edge.Node.Documents {
+			createdAt, err := time.Parse(time.RFC3339, doc.CreatedAt)
+			if err != nil {
+				logutil.Errorf("error parsing time: %v", err)
+				continue
+			}
+			docs = append(docs, DocumentAPI{
+				ID:               doc.ID,
+				HashFile:         db.HashFile(doc.HashFile),
+				OriginalFilename: doc.OriginalFilename,
+				MimeType:         doc.MimeType,
+				Category:         doc.Category,
+				CreatedAt:        createdAt,
+			})
+		}
+
+		contracts = append(contracts, SupplierContractAPI{
 			ID:          edge.Node.ID,
 			Label:       edge.Node.Label,
 			Description: edge.Node.Description,
 			Number:      edge.Node.Number,
-			EndingDate:  edge.Node.EndingDate,
-			Supplier: Supplier{
-				ID:   edge.Node.Supplier.ID,
-				Name: edge.Node.Supplier.Name,
-
+			EndingDate:  endingDate,
+			Supplier: SupplierAPI{
+				ID:        edge.Node.Supplier.ID,
+				Name:      edge.Node.Supplier.Name,
 				FirstName: edge.Node.Supplier.FirstName,
 				Activity:  edge.Node.Supplier.Activity,
 			},
-			Documents: func() []Document {
-				var docs []Document
-				for _, doc := range edge.Node.Documents {
-					createdAt, err := time.Parse(time.RFC3339, doc.CreatedAt)
-					if err != nil {
-						logutil.Debugf("error parsing time: %v", err)
-						return nil
-					}
-					docs = append(docs, Document{
-						ID:               doc.ID,
-						HashFile:         doc.HashFile,
-						MimeType:         doc.MimeType,
-						OriginalFilename: doc.OriginalFilename,
-						Category:         doc.Category,
-						CreatedAt:        createdAt,
-					})
-				}
-				return docs
-			}(),
+			Documents: docs,
 		})
 	}
 	return contracts, nil
 }
 
-type Amount int
-
-func (a Amount) String() string {
-	// 1234567890 -> 1234567,90 €
-	return fmt.Sprintf("%d,%02d €", a/100, a%100)
-}
-
-// I use the label + date as a key in the DB. This is because the date isn't
-// unique. During an update, we may end up duplicating the same expense, but
-// I'll solve that later if that ever happens.
-type Expense struct {
-	InvoiceID string // Only set when a document is attached.
-	// The hash file comes from AWS S3. For example, the URL will look like this:
-	//  https://fon-mil-prod-plato-prv.s3.eu-west-3.amazonaws.com/9/d/8/7/b/64850e800e5a086a68e9d87b?...
-	//                                                                      <------- hashFile ------>
-	// I don't know how to calculate this hash file from the document's content.
-	HashFile string    // Only set when a document is attached.
-	Label    string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
-	Date     time.Time // May not be unique.
-	Amount   Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
-
-	// DB-only fields.
-	FilePath string // Example: "file/path/to/invoice.pdf". Empty when querying live.
-	Filename string // Example: "invoice.pdf". Empty when querying live.
+type ExpenseDocumentAPI struct {
+	// Only set when a document is attached. E.g., "64850e805e5793033297f476".
+	// We use that as an ID for the expense document since we don't have any
+	// other way. Note that the API sometimes returns expense documents that
+	// don't have an invoice ID. If you are using this as an ID, you should skip
+	// those.
+	InvoiceID string
+	Label     string      // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
+	Amount    db.Amount   // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
+	Date      time.Time   // May not be unique.
+	HashFile  db.HashFile // Only set when a document is attached. Example: "66fbf2a9294cd8ed17d7ce9a"
+	Category  string      // Example: "expense".
 }
 
 // Important: don't call getInvoiceURL if invoiceID exists but the hashFile is
 // empty. If that's the case, the invoice PDF doesn't exist, and getInvoiceURL
 // will return an empty URL.
-func getInvoiceURL(client *http.Client, invoiceID string) (string, error) {
+func GetInvoiceURL(client *http.Client, invoiceID string) (filename, fileURL string, _ error) {
 	const getInvoiceURLQuery = `query getInvoiceURL($invoiceId: String!) {invoiceURL(invoiceId: $invoiceId)}`
 	var getInvoiceURLResp struct {
 		Data struct {
@@ -865,13 +871,18 @@ func getInvoiceURL(client *http.Client, invoiceID string) (string, error) {
 		"invoiceId": invoiceID,
 	}, &getInvoiceURLResp)
 	if err != nil {
-		return "", fmt.Errorf("error while querying getInvoiceURLResp: %w", err)
+		return "", "", fmt.Errorf("while querying getInvoiceURLResp: %w", err)
 	}
 
-	return getInvoiceURLResp.Data.InvoiceURL, nil
+	filename, err = getFilenameFromURL(getInvoiceURLResp.Data.InvoiceURL)
+	if err != nil {
+		return "", "", fmt.Errorf("while getting filename from URL: %w", err)
+	}
+
+	return filename, getInvoiceURLResp.Data.InvoiceURL, nil
 }
 
-func getDocumentURL(client *http.Client, hash string) (string, error) {
+func GetDocumentURL(client *http.Client, hash string) (filename, fileURL string, _ error) {
 	const getDocumentURLQuery = `query getDocumentURL($hash: String!) {documentURL(hash: $hash)}`
 	var getDocumentURLResp struct {
 		Data struct {
@@ -883,13 +894,74 @@ func getDocumentURL(client *http.Client, hash string) (string, error) {
 		"hash": hash,
 	}, &getDocumentURLResp)
 	if err != nil {
-		return "", fmt.Errorf("error while querying getDocumentURL: %w", err)
+		return "", "", fmt.Errorf("error while querying getDocumentURL: %w", err)
 	}
 
-	return getDocumentURLResp.Data.DocumentURL, nil
+	filename, err = getFilenameFromURL(getDocumentURLResp.Data.DocumentURL)
+	if err != nil {
+		return "", "", fmt.Errorf("error getting filename from URL: %w", err)
+	}
+	return filename, getDocumentURLResp.Data.DocumentURL, nil
 }
 
-func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense, error) {
+// The URLs are short-lived and look like this:
+// https://fon-mil-prod-plato-prv.s3.eu-west-3.amazonaws.com/e/6/6/6/2/674836bfb753160398ee6662?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=ASIAXMTESETVHY3LHMDR%2F20250129%2Feu-west-3%2Fs3%2Faws4_request&X-Amz-Date=20250129T171628Z&X-Amz-Expires=900&X-Amz-Security-Token=IQoJb3JpZ2luX2VjEIf%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaCWV1LXdlc3QtMyJHMEUCIQDj8iWPBGZspCL2CUSMniDTOhPCKTr8o17mjxtWdO00UwIgL4D1u5DtZfYCKCEpUX78c0b4SDYeR2VddKGkGdcNdpIqgAQIkP%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FARACGgw1MDgwOTA3ODcwNTAiDN51Bas9kmYPyShHAyrUA7wx2z79PWterZcfjBNa1kQmpd1SESDoHBUV05Bv%2FW2HIiGMDBVv1l1B4Xa4hH3ixDokqYjttUqbOde3oJLgKzhdSRx8AKWtNLxGFGRKg49bEi6TC2SjuOFCd51ZGOcLxRY1EnyP9jr9CaDsDk%2FJDurkEdInf8ASH56pXwpaz4BhCSn7PKexefL7YNfNmYFl0u9LAXR24%2FOCngnLP%2Fug0klrN3qttY50MxiLvKN1nnjwpBIr%2FMeGexwf0btY4LWgh6ipWURmdsCHyMQtfkn%2B7sAhQ3ujUXmcrRrTcffaqDckJEkfC2Od7y4CnTNWrHdgWrkR2ksD8pfjIrL4Iv2Ct8IhKaGmlG0sbiP5YprFHmLA1nkr87buei8EOkTfSiuZu%2FKGaWcYHOzdGQitRBeT4MZkNd4uOL%2F6V62ncHHP8MoD%2BXIBcQkL7W1cUkMXrkyHT6VaDGiEXLJ1J7Y194wE0uJq6XTfGtJc2SEzMDm4wN2TvSBUAjBo1RAmEDzMSV6evXNCv2oATxufxKDQ0HLJ0Dq6IWsm0pbMwc2n1pjdx9aHFpFd9U%2BJHwjruKQfpTbY2LYxc2LhkhHlW0xH2UzXWxO94eU%2BVIZLFiy2yuEUBVggIgTVCDDXhum8BjqlAdxyOC29dGCIo%2F3dk1vvqbzAppsm4mKv0TjM45BOiReDsu%2FPpEpLd1klWv7iWuW%2BG8uqQr0Gilfbt6y%2F6I5eOzYlm%2BfmYWCOPxVFAaR1iosjwpmpOKmDxow6O4CvntbXC1TgE8gUb3WLI45xq1A2kYMD9PjgoiZj01hia1qwh47bptY8%2BOnkCfF1UByAm2nis9fd5P75QLRVj%2B8DLqKbahlQ0O7jsA%3D%3D&X-Amz-Signature=7c1094dee2ee4812de265c48533846f9a353a4be234180ed47b0d772c91dcbd6&X-Amz-SignedHeaders=host&response-content-disposition=filename%3D%22IZQUIERDO%2520-%2520OSMIL806596688%2520-%25202024-11-28%2520-%252025-074.pdf%22&x-id=GetObject
+//
+// The file path is deduced from from one of the URL's query parameters:
+//
+//	response-content-disposition=filename%3D%22IZQUIERDO%2520-%2520OSMIL806596688%2520-%25202024-11-28%2520-%252025-074.pdf%22
+func getFilenameFromURL(fileURL string) (string, error) {
+	u, err := url.Parse(fileURL)
+	if err != nil {
+		return "", fmt.Errorf("error parsing URL: %w", err)
+	}
+	q := u.Query()
+	disposition := q.Get("response-content-disposition")
+	if disposition == "" {
+		return "", fmt.Errorf("could not find response-content-disposition in URL: %s", fileURL)
+	}
+
+	// Ensure that the Content-Disposition header starts with "attachment;".
+	// Otherwise, can't use mime.ParseMediaType.
+	if !strings.HasPrefix(disposition, "attachment;") {
+		disposition = "attachment;" + disposition
+	}
+
+	// Parse the filename from the Content-Disposition header.
+	// Example:
+	//     filename="example.pdf"
+	_, params, err := mime.ParseMediaType(disposition)
+	if err != nil {
+		return "", fmt.Errorf("while parsing response-content-disposition: %v", err)
+	}
+	filename := params["filename"]
+	if filename == "" {
+		return "", fmt.Errorf("no filename in response-content-disposition query parameter: %s", fileURL)
+	}
+
+	filename, err = url.QueryUnescape(filename)
+	if err != nil {
+		return "", fmt.Errorf("error url-decoding response-content-disposition filename field: %w", err)
+	}
+
+	// Replace all characters that are not allowed in a filename with an
+	// underscore. [^\d\.\-_~,;:\[\]\(\]]
+	filename = strings.Map(func(r rune) rune {
+		switch {
+		case 'a' <= r && r <= 'z', 'A' <= r && r <= 'Z', '0' <= r && r <= '9',
+			r == '.', r == '-', r == '_', r == '~', r == ',', r == ';', r == ':',
+			r == '[', r == ']', r == '(', r == ')' || r == ' ':
+			return r
+		default:
+			return '-'
+		}
+	}, filename)
+
+	return filename, nil
+}
+
+// This query is light and doesn't need to be paginated.
+func GetExpensesCurrentAPI(client *http.Client, accountUUID string) ([]ExpenseDocumentAPI, error) {
 	const getBuildingAccountingCurrentQuery = `
 		query getBuildingAccountingCurrent($uuid: EncodedID!) {
 		  coownerAccount(uuid: $uuid) {
@@ -924,7 +996,9 @@ func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense,
 					expenses {
 					  invoiceId
 					  piece {
+						id
 						hashFile
+						category
 					  }
 					  label
 					  date
@@ -997,7 +1071,6 @@ func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense,
 								Currency string `json:"currency"`
 							} `json:"nextVotedTotal"`
 							ExpenseTypes []struct {
-								ID            string `json:"id"`
 								AllocationID  string `json:"allocationId"`
 								Name          string `json:"name"`
 								Code          string `json:"code"`
@@ -1018,9 +1091,15 @@ func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense,
 									Currency string `json:"currency"`
 								} `json:"nextVotedTotal"`
 								Expenses []struct {
+									// For some reason, expenses don't have an
+									// ID. The invoice ID is sometimes empty...
+									// but we use that since we have no other
+									// way.
 									InvoiceID string `json:"invoiceId"`
 									Piece     struct {
+										ID       string `json:"id"`
 										HashFile string `json:"hashFile"`
+										Category string `json:"category"`
 									} `json:"piece"`
 									Label string `json:"label"`
 									Date  string `json:"date"`
@@ -1047,7 +1126,7 @@ func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense,
 		return nil, fmt.Errorf("error while querying getBuildingAccountingCurrentResp: %w", err)
 	}
 
-	var expenses []Expense
+	var expenses []ExpenseDocumentAPI
 	for _, allocation := range getBuildingAccountingCurrentResp.Data.CoownerAccount.TrusteeCouncil.AccountingCurrent.Allocations {
 		for _, expenseType := range allocation.ExpenseTypes {
 			for _, expense := range expenseType.Expenses {
@@ -1068,12 +1147,13 @@ func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense,
 						return nil, fmt.Errorf("error parsing time: %w", err)
 					}
 				}
-				expenses = append(expenses, Expense{
+				expenses = append(expenses, ExpenseDocumentAPI{
+					Category:  expense.Piece.Category,
+					HashFile:  db.HashFile(expense.Piece.HashFile),
 					InvoiceID: expense.InvoiceID,
-					HashFile:  expense.Piece.HashFile,
 					Label:     expense.Label,
 					Date:      date,
-					Amount:    Amount(amount),
+					Amount:    db.Amount(amount),
 				})
 			}
 		}
@@ -1082,7 +1162,7 @@ func getExpensesCurrentLive(client *http.Client, accountUUID string) ([]Expense,
 	return expenses, nil
 }
 
-type AccountingPeriod struct {
+type AccountingPeriodAPI struct {
 	ID          string
 	Name        string
 	OpeningDate time.Time
@@ -1090,39 +1170,42 @@ type AccountingPeriod struct {
 	Status      string
 }
 
-//		query getAccountingPeriods($accountUuid: EncodedID!, $sortBy: [SortByType!], $status: [AccountingPeriodStatusEnum!], $closingDateTo: String, $first: Int, $before: Cursor, $after: Cursor) {
-//		  coownerAccount(uuid: $accountUuid) {
-//		    uuid
-//		    trusteeCouncil {
-//		      accountingPeriods(
-//		        first: $first
-//		        before: $before
-//		        after: $after
-//		        sortBy: $sortBy
-//		        status: $status
-//		        closingDateTo: $closingDateTo
-//		      ) {
-//		        totalCount
-//		        pageInfo {
-//		          startCursor
-//		          endCursor
-//		          hasPreviousPage
-//		          hasNextPage
-//		        }
-//		        edges {
-//		          node {
-//		            id
-//	             name
-//	             openingDate
-//	             closingDate
-//	             status
-//		          }
-//		        }
-//		      }
-//		    }
-//		  }
-//		}
-func getAccountingPeriodsLive(client *http.Client, accountUUID string) ([]AccountingPeriod, error) {
+//	query getAccountingPeriods($accountUuid: EncodedID!, $sortBy: [SortByType!], $status: [AccountingPeriodStatusEnum!], $closingDateTo: String, $first: Int, $before: Cursor, $after: Cursor) {
+//	  coownerAccount(uuid: $accountUuid) {
+//	    uuid
+//	    trusteeCouncil {
+//	      accountingPeriods(
+//	        first: $first
+//	        before: $before
+//	        after: $after
+//	        sortBy: $sortBy
+//	        status: $status
+//	        closingDateTo: $closingDateTo
+//	      ) {
+//	        totalCount
+//	        pageInfo {
+//	          startCursor
+//	          endCursor
+//	          hasPreviousPage
+//	          hasNextPage
+//	        }
+//	        edges {
+//	          node {
+//	            id
+//	         name
+//	         openingDate
+//	         closingDate
+//	         status
+//	          }
+//	        }
+//	      }
+//	    }
+//	  }
+//	}
+//
+// This query is light and doesn't need to be paginated. No need to remember the
+// last cursor.
+func GetAccountingPeriodsLive(client *http.Client, accountUUID string) ([]AccountingPeriodAPI, error) {
 	const getAccountingPeriodsQuery = `
 		query getAccountingPeriods($accountUuid: EncodedID!, $sortBy: [SortByType!], $status: [AccountingPeriodStatusEnum!], $closingDateTo: String, $first: Int, $before: Cursor, $after: Cursor) {
 		  coownerAccount(uuid: $accountUuid) {
@@ -1190,7 +1273,7 @@ func getAccountingPeriodsLive(client *http.Client, accountUUID string) ([]Accoun
 		return nil, fmt.Errorf("error while querying getAccountingPeriodsResp: %w", err)
 	}
 
-	var periods []AccountingPeriod
+	var periods []AccountingPeriodAPI
 	for _, edge := range getAccountingPeriodsResp.Data.CoownerAccount.TrusteeCouncil.AccountingPeriods.Edges {
 		var openingDate, closingDate time.Time
 		if edge.Node.OpeningDate != "" {
@@ -1207,7 +1290,7 @@ func getAccountingPeriodsLive(client *http.Client, accountUUID string) ([]Accoun
 				return nil, fmt.Errorf("error parsing time: %w", err)
 			}
 		}
-		periods = append(periods, AccountingPeriod{
+		periods = append(periods, AccountingPeriodAPI{
 			ID:          edge.Node.ID,
 			Name:        edge.Node.Name,
 			OpeningDate: openingDate,
@@ -1219,7 +1302,10 @@ func getAccountingPeriodsLive(client *http.Client, accountUUID string) ([]Accoun
 }
 
 // query getBuildingAccountingRGDD($uuid: EncodedID!, $accountingPeriodId: String) {\n  coownerAccount(uuid: $uuid) {\n    uuid\n    trusteeCouncil {\n      pastAccountingRGDD(accountingPeriodId: $accountingPeriodId) {\n        totalToAllocate {\n          ...amount\n          __typename\n        }\n        totalVat {\n          ...amount\n          __typename\n        }\n        totalRecoverable {\n          ...amount\n          __typename\n        }\n        allocations {\n          ...allocation\n          __typename\n        }\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}\n\nfragment amount on Amount {\n  value\n  currency\n  __typename\n}\n\nfragment allocation on Allocation {\n  id\n  name\n  code\n  toAllocate {\n    ...amount\n    __typename\n  }\n  vat {\n    ...amount\n    __typename\n  }\n  recoverable {\n    ...amount\n    __typename\n  }\n  expenseTypes {\n    ...expenseType\n    __typename\n  }\n  __typename\n}\n\nfragment expenseType on ExpenseType {\n  id\n  allocationId\n  name\n  code\n  toAllocate {\n    ...amount\n    __typename\n  }\n  vat {\n    ...amount\n    __typename\n  }\n  recoverable {\n    ...amount\n    __typename\n  }\n  expenses {\n    ...expense\n    __typename\n  }\n  __typename\n}\n\nfragment expense on Expense {\n  id\n  label\n  date\n  invoiceId\n  piece {\n    hashFile\n    category\n    id\n    __typename\n  }\n  toAllocate {\n    ...amount\n    __typename\n  }\n  vat {\n    ...amount\n    __typename\n  }\n  recoverable {\n    ...amount\n    __typename\n  }\n  __typename\n}
-func getBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingPeriodID string) ([]Expense, error) {
+//
+// This query is light and doesn't need to be paginated. No need to remember the
+// last cursor.
+func GetBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingPeriodID string) ([]ExpenseDocumentAPI, error) {
 	const getBuildingAccountingRGDDQuery = `
 		query getBuildingAccountingRGDD($uuid: EncodedID!, $accountingPeriodId: String) {
 		  coownerAccount(uuid: $uuid) {
@@ -1272,10 +1358,10 @@ func getBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 		              currency
 		            }
 		            expenses {
-		              id
+					  id
+					  invoiceId
 		              label
 		              date
-		              invoiceId
 		              piece {
 		                hashFile
 		                category
@@ -1351,7 +1437,6 @@ func getBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 									Currency string `json:"currency"`
 								} `json:"recoverable"`
 								Expenses []struct {
-									ID        string `json:"id"`
 									Label     string `json:"label"`
 									Date      string `json:"date"`
 									InvoiceID string `json:"invoiceId"`
@@ -1390,7 +1475,7 @@ func getBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 		return nil, fmt.Errorf("error while querying getBuildingAccountingRGDDResp: %w", err)
 	}
 
-	var expenses []Expense
+	var expenses []ExpenseDocumentAPI
 	for _, allocation := range getBuildingAccountingRGDDResp.Data.CoownerAccount.TrusteeCouncil.PastAccountingRGDD.Allocations {
 		for _, expenseType := range allocation.ExpenseTypes {
 			for _, expense := range expenseType.Expenses {
@@ -1402,12 +1487,13 @@ func getBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 						return nil, fmt.Errorf("error parsing time: %w", err)
 					}
 				}
-				expenses = append(expenses, Expense{
-					InvoiceID: expense.InvoiceID,
-					HashFile:  expense.Piece.HashFile,
+				expenses = append(expenses, ExpenseDocumentAPI{
+					InvoiceID: expense.InvoiceID, // May be empty.
+					HashFile:  db.HashFile(expense.Piece.HashFile),
 					Label:     expense.Label,
 					Date:      date,
-					Amount:    Amount(expense.ToAllocate.Value),
+					Amount:    db.Amount(expense.ToAllocate.Value),
+					Category:  expense.Piece.Category,
 				})
 			}
 		}
@@ -1415,16 +1501,12 @@ func getBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 	return expenses, nil
 }
 
-// Returns the path to the downloaded file relative to the current folder.
-// Example, if `invoicesDir` is "invoices":
-//
-//	path:     "invoices/2024-04-05_2APF.pdf"
-func download(fileURL string, invoicesDir string) (path string, _ error) {
+func Download(client *http.Client, fileURL string, filePath string) error {
 	// No need to use the authenticated client here since the URL is
 	// authenticated using one of the query parameters.
-	resp, err := http.Get(fileURL)
+	resp, err := client.Get(fileURL)
 	if err != nil {
-		return "", fmt.Errorf("while downloading invoice: %v", err)
+		return fmt.Errorf("while downloading invoice: %v", err)
 	}
 	defer resp.Body.Close()
 	// Example:
@@ -1442,67 +1524,28 @@ func download(fileURL string, invoicesDir string) (path string, _ error) {
 	//  Server: AmazonS3
 	//  Content-Length: 370642
 
-	// Grab the HTTP headers that contain the file type, size, and name.
-	// This is useful for debugging.
-	disposition := resp.Header.Get("Content-Disposition")
-	if !strings.HasPrefix(disposition, "attachment;") {
-		disposition = "attachment;" + disposition
-	}
-
-	// Parse the filename from the Content-Disposition header.
-	// Example:
-	//     filename="example.pdf"
-	_, params, err := mime.ParseMediaType(disposition)
-	if err != nil {
-		return "", fmt.Errorf("while parsing Content-Disposition: %v", err)
-	}
-	filename := params["filename"]
-	if filename == "" {
-		return "", fmt.Errorf("no filename in Content-Disposition header")
-	}
-
-	// URL decode the filename.
-	filename, err = url.QueryUnescape(filename)
-	if err != nil {
-		return "", fmt.Errorf("while URL-decoding filename: %v", err)
-	}
-
-	// Replace all characters that are not allowed in a filename with an
-	// underscore.
-	// [^\d\.\-_~,;:\[\]\(\]]
-	filename = strings.Map(func(r rune) rune {
-		switch {
-		case 'a' <= r && r <= 'z', 'A' <= r && r <= 'Z', '0' <= r && r <= '9',
-			r == '.', r == '-', r == '_', r == '~', r == ',', r == ';', r == ':',
-			r == '[', r == ']', r == '(', r == ')' || r == ' ':
-			return r
-		default:
-			return '_'
-		}
-	}, filename)
-
 	var buf bytes.Buffer
+
 	_, err = io.Copy(&buf, resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("while reading file: %v", err)
+		return fmt.Errorf("while reading file: %v", err)
 	}
 
-	path = invoicesDir + "/" + filename
-	err = os.WriteFile(path, buf.Bytes(), 0644)
+	err = os.WriteFile(filePath, buf.Bytes(), 0644)
 	if err != nil {
-		return "", fmt.Errorf("while saving file to disk: %v", err)
+		return fmt.Errorf("while saving file to disk: %v", err)
 	}
 
-	return path, nil
+	return nil
 }
 
-type secret string
+type Password string
 
-func (p secret) String() string {
+func (p Password) String() string {
 	return "redacted"
 }
 
-func (p secret) Raw() string {
+func (p Password) Raw() string {
 	return string(p)
 }
 
@@ -1516,7 +1559,7 @@ func (t Token) StringOnPurpose() string {
 	return string(t)
 }
 
-func saveEmailToDB(ctx context.Context, db *sql.DB, message *cloudmailin.IncomingMail) error {
+func SaveEmailToDB(ctx context.Context, db *sql.DB, message *cloudmailin.IncomingMail) error {
 	// Save the message to the database.
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO emails (from, to, subject, body, received_at)
@@ -1527,6 +1570,15 @@ func saveEmailToDB(ctx context.Context, db *sql.DB, message *cloudmailin.Incomin
 	}
 
 	return nil
+}
+
+type AccountDocumentAPI struct {
+	ID               string
+	HashFile         db.HashFile
+	MimeType         string
+	OriginalFilename string
+	Category         string // Example: "reportVisit"
+	CreatedAt        time.Time
 }
 
 //	{
@@ -1540,7 +1592,7 @@ func saveEmailToDB(ctx context.Context, db *sql.DB, message *cloudmailin.Incomin
 //	 },
 //	 "operationName": "getAccountDocuments"
 //	}
-func getAccountDocumentsLive(client *http.Client, accountUUID, documentCategory, after string) ([]Document, error) {
+func GetAccountDocumentsAPI(client *http.Client, accountUUID, documentCategory, after string) ([]AccountDocumentAPI, error) {
 	const getAccountDocumentsQuery = `
 		query getAccountDocuments($accountUuid: EncodedID!, $first: Int, $after: Cursor, $documentCategory: MyFonciaFileCategoryEnum!, $originalFilename: String, $subCategories: [String!], $fromDate: String, $toDate: String, $missionGeneralAssemblyIds: [String!]) {
 		  account(uuid: $accountUuid) {
@@ -1620,7 +1672,7 @@ func getAccountDocumentsLive(client *http.Client, accountUUID, documentCategory,
 		return nil, fmt.Errorf("error while querying getAccountDocumentsResp: %w", err)
 	}
 
-	var docs []Document
+	var docs []AccountDocumentAPI
 	for _, edge := range getAccountDocumentsResp.Data.Account.Documents.Edges {
 
 		createdAt, err := time.Parse(time.RFC3339, edge.Node.CreatedAt)
@@ -1629,9 +1681,9 @@ func getAccountDocumentsLive(client *http.Client, accountUUID, documentCategory,
 			return nil, err
 		}
 
-		docs = append(docs, Document{
+		docs = append(docs, AccountDocumentAPI{
 			ID:               edge.Node.ID,
-			HashFile:         edge.Node.HashFile,
+			HashFile:         db.HashFile(edge.Node.HashFile),
 			MimeType:         edge.Node.MimeType,
 			OriginalFilename: edge.Node.OriginalFilename,
 			Category:         edge.Node.Category,

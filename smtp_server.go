@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/mail"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/emersion/go-smtp"
@@ -33,39 +32,17 @@ func ServeSMTP(ctx context.Context, db *sql.DB, smtpListen net.Listener) error {
 		// Unlike http.Server, smtp.Server doesn't have a built-in context. This
 		// func works around that.
 		<-ctx.Done()
-		logutil.Infof("ServeSMTP: context cancelled, stopping the SMTP server")
 		err := s.Close()
 		if err != nil {
 			logutil.Errorf("ServeSMTP: while closing SMTP server: %v", err)
 		}
 	}()
+	logutil.Infof("serving SMTP server on %s", smtpListen.Addr())
 
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(fmt.Errorf("ServeSMTP: cancelled without a reason"))
-
-	// This "single use" waitgroup allows us to wait for the SMTP server to
-	// cleanly stop before ServeSMTP returns. We could have used a channel
-	// instead.
-	wg := sync.WaitGroup{}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer cancel(fmt.Errorf("ServeSMTP: SMTP server stopped for some reason"))
-		logutil.Infof("serving SMTP server on %s", smtpListen.Addr())
-
-		err := s.Serve(smtpListen)
-		if err != nil {
-			cancel(fmt.Errorf("while serving SMTP server: %w", err))
-			return
-		}
-	}()
-
-	wg.Wait()
-	if ctx.Err() != nil {
-		return context.Cause(ctx)
+	err := s.Serve(smtpListen)
+	if err != nil && err != smtp.ErrServerClosed {
+		return fmt.Errorf("ServeSMTP: while serving SMTP: %w", err)
 	}
-
 	return nil
 }
 
