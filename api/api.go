@@ -618,11 +618,11 @@ func DoGraphQL[T any](client *http.Client, url, query string, variables map[stri
 	if err != nil {
 		return fmt.Errorf("error marshaling request body: %w", err)
 	}
-	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
+	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return fmt.Errorf("error creating request: %w", err)
 	}
-	httpResp, err := client.Do(httpReq)
+	httpResp, err := Do(client, httpReq)
 	if err != nil {
 		return fmt.Errorf("error while querying: %w", err)
 	}
@@ -851,7 +851,7 @@ type ExpenseDocumentAPI struct {
 	InvoiceID string
 	Label     string      // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
 	Amount    db.Amount   // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
-	Date      time.Time   // May not be unique.
+	Date      time.Time   // May not be unique. Example: "2024-03-01T00:00:00.000Z". Use time.RFC3339Nano to marshall.
 	HashFile  db.HashFile // Only set when a document is attached. Example: "66fbf2a9294cd8ed17d7ce9a"
 	Category  string      // Example: "expense".
 }
@@ -876,7 +876,7 @@ func GetInvoiceURL(client *http.Client, invoiceID string) (filename, fileURL str
 
 	filename, err = getFilenameFromURL(getInvoiceURLResp.Data.InvoiceURL)
 	if err != nil {
-		return "", "", fmt.Errorf("while getting filename from URL: %w", err)
+		return "", "", fmt.Errorf("while getting filename from %s: %w", getInvoiceURLResp.Data.InvoiceURL, err)
 	}
 
 	return filename, getInvoiceURLResp.Data.InvoiceURL, nil
@@ -1504,7 +1504,12 @@ func GetBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 func Download(client *http.Client, fileURL string, filePath string) error {
 	// No need to use the authenticated client here since the URL is
 	// authenticated using one of the query parameters.
-	resp, err := client.Get(fileURL)
+	req, err := http.NewRequest(http.MethodGet, fileURL, nil)
+	if err != nil {
+		return fmt.Errorf("while creating request: %v", err)
+	}
+
+	resp, err := Do(client, req)
 	if err != nil {
 		return fmt.Errorf("while downloading invoice: %v", err)
 	}
@@ -1691,4 +1696,35 @@ func GetAccountDocumentsAPI(client *http.Client, accountUUID, documentCategory, 
 		})
 	}
 	return docs, nil
+}
+
+// I found that after many calls, the server starts returning:
+//
+//	HTTP/2.0 403
+//	date: Wed, 29 Jan 2025 20:27:28 GMT
+//	content-type: application/json
+//	content-length: 23
+//	x-amzn-requestid: d612d465-164e-4821-968c-d43a2bc1066f
+//	x-amzn-errortype: ForbiddenException
+//	x-amz-apigw-id: FKtPnFBhCGYEU3w=
+//
+//	{"message":"Forbidden"}
+//
+// I suspect that the server is rate-limiting me. This func is meant to wrap
+// client.Do calls and retry them if they fail with a 403.
+func Do(client *http.Client, req *http.Request) (*http.Response, error) {
+	for i := 0; i < 3; i++ {
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("while doing request: %w", err)
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			logutil.Debugf("received 403, suspecting rate-limiting, retrying...")
+			resp.Body.Close()
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("received 403 three times in a row, giving up")
 }

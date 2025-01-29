@@ -161,6 +161,13 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 				logutil.Debugf("file %q not found, downloading invoice %q", eDB.FilePath, e.InvoiceID)
 			}
 
+			// I found that the graphql query 'getInvoiceURL' returns an empty
+			// URL if the invoiceID exists but the hashFile is empty.
+			if e.HashFile == "" {
+				logutil.Infof("no hash file found for expense %s, skipping download", e.ID())
+				continue
+			}
+
 			filename, invoiceURL, err := api.GetInvoiceURL(client, e.InvoiceID)
 			if err != nil {
 				return fmt.Errorf("while getting invoice URL: %v", err)
@@ -265,6 +272,13 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 	for i, doc := range docs {
 		// No need to download if it is already present on disk.
 		if fileExists(doc.FilePath) {
+			continue
+		}
+
+		// I found that the graphql query 'getDocumentURL' returns an empty URL
+		// if the hashFile is empty.
+		if doc.HashFile == "" {
+			logutil.Infof("no hash file found for document %s, skipping download", doc.ID)
 			continue
 		}
 

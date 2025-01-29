@@ -32,7 +32,7 @@ const missionsTableSQL = `
 		kind TEXT,
 		label TEXT,
 		status TEXT,
-		started_at TEXT,             -- time.RFC3339
+		started_at TEXT,             -- time.RFC3339Nano
 		description TEXT
 	);
 	create index IF NOT EXISTS idx_entries_started_at on missions (started_at);
@@ -44,7 +44,7 @@ type MissionDB struct {
 	Kind        string    // "Incident" | "Repair"
 	Label       string    // "ATELIER METALLERIE FERRONNERIE - VALIDATION DEVIS "
 	Status      string    // "WORK_IN_PROGRESS"
-	StartedAt   time.Time // "2023-04-24T22:00:00.000Z" (time.RFC3339)
+	StartedAt   time.Time // "2023-04-24T22:00:00.000Z" (time.RFC3339Nano)
 	Description string    // "BONJOUR,\n\nVEUILLEZ ENREGISTER LE C02\t\nMERCI CORDIALEMENT"
 	WorkOrders  []WorkOrderDB
 }
@@ -55,8 +55,8 @@ const workOrdersTableSQL = `
 		mission_id TEXT NOT NULL,
 		number TEXT,
 		label TEXT,
-		repair_date_start TEXT,      -- time.RFC3339
-		repair_date_end TEXT,        -- time.RFC3339
+		repair_date_start TEXT,      -- time.RFC3339Nano
+		repair_date_end TEXT,        -- time.RFC3339Nano
 		supplier_id TEXT,
 		supplier_name TEXT,
 		supplier_activity TEXT,
@@ -78,7 +78,7 @@ const expensesTableSQL = `
 		invoice_id TEXT,       -- May be "" if no invoice file
 		label TEXT,
 		amount INTEGER,
-		date TEXT,             -- time.RFC3339
+		date TEXT,             -- time.RFC3339Nano
 		file_path TEXT,        -- May be "" if no invoice file
 		hash_file TEXT         -- May be "" if no invoice file
 	);`
@@ -438,7 +438,7 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 
 	for _, e := range expense {
 		req := "UPDATE expenses SET file_path = ? where	invoice_id = ? and label = ? and hash_file = ? and date = ? and amount = ?;"
-		values := []interface{}{e.FilePath, e.InvoiceID, e.Label, e.HashFile, e.Date.Format(time.RFC3339), e.Amount}
+		values := []interface{}{e.FilePath, e.InvoiceID, e.Label, e.HashFile, e.Date.Format(time.RFC3339Nano), e.Amount}
 		res, err := tx.ExecContext(ctx, req, values...)
 		if err != nil {
 			return fmt.Errorf("while updating expenses: %v", err)
@@ -453,7 +453,7 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 			logutil.Debugf("db: updated expense %q: %+v", e.Date, e)
 		} else {
 			req := "INSERT INTO expenses (invoice_id, label, amount, date, file_path, hash_file) VALUES (?, ?, ?, ?, ?, ?);"
-			values := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339), e.FilePath, e.HashFile}
+			values := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile}
 			_, err := tx.ExecContext(ctx, req, values...)
 			if err != nil {
 				return fmt.Errorf("while inserting expenses: %v", err)
@@ -510,7 +510,7 @@ func (a Amount) String() string {
 //	invoice_id TEXT,       -- May be "" if no invoice file
 //	label TEXT,
 //	amount INTEGER,
-//	date TEXT,             -- time.RFC3339
+//	date TEXT,             -- time.RFC3339Nano
 //	file_path TEXT,        -- May be "" if no invoice file
 //	hash_file TEXT         -- May be "" if no invoice file
 //
@@ -552,7 +552,7 @@ type ExpenseDocumentDB struct {
 	InvoiceID string    // Sometimes set. Not sure what it is for. E.g.: "64850e805e5793033297f476".
 	Label     string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
 	Amount    Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
-	Date      time.Time // May not be unique.
+	Date      time.Time // May not be unique. Example: "2024-07-01T21:59:59.000Z".
 	FilePath  string    // Only set when a document is attached. Example: "invoices/OU CHANNA - CT01037406 - 2024-10-01 - _27.pdf"
 	HashFile  HashFile  // Only set when a document is attached. Example: "66fbf2a9294cd8ed17d7ce9a"
 }
@@ -613,7 +613,7 @@ func GetExpenseByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) (E
 	if err != nil {
 		return ExpenseDocumentDB{}, fmt.Errorf("while querying database: %w", err)
 	}
-	e.Date, err = time.Parse(time.RFC3339, date)
+	e.Date, err = time.Parse(time.RFC3339Nano, date)
 	if err != nil {
 		return ExpenseDocumentDB{}, fmt.Errorf("while parsing 'date': %v", err)
 	}
@@ -643,7 +643,7 @@ func SaveWorkOrdersToDB(ctx context.Context, db *sql.DB, workOrders []WorkOrderD
 	var values []interface{}
 	for _, w := range workOrders {
 		req += "(?, ?, ?, ?, ?, ?, ?, ?, ?),"
-		values = append(values, w.ID, w.MissionID, w.Number, w.Label, w.RepairDateStart.Format(time.RFC3339), w.RepairDateEnd.Format(time.RFC3339), w.Supplier.ID, w.Supplier.Name, w.Supplier.Activity)
+		values = append(values, w.ID, w.MissionID, w.Number, w.Label, w.RepairDateStart.Format(time.RFC3339Nano), w.RepairDateEnd.Format(time.RFC3339Nano), w.Supplier.ID, w.Supplier.Name, w.Supplier.Activity)
 	}
 
 	// No need to do anything if there are no work orders to insert.
@@ -690,7 +690,7 @@ func SaveMissionsToDB(ctx context.Context, db *sql.DB, missions ...MissionDB) er
 	var values []interface{}
 	for _, e := range missions {
 		req += "(?, ?, ?, ?, ?, ?, ?),"
-		values = append(values, e.ID, e.Number, e.Kind, e.Label, e.Status, e.StartedAt.Format(time.RFC3339), e.Description)
+		values = append(values, e.ID, e.Number, e.Kind, e.Label, e.Status, e.StartedAt.Format(time.RFC3339Nano), e.Description)
 	}
 	req = strings.TrimSuffix(req, ",")
 	_, err := db.ExecContext(ctx, req, values...)
@@ -717,7 +717,7 @@ func GetMissionsDB(ctx context.Context, db *sql.DB) ([]MissionDB, error) {
 			return nil, fmt.Errorf("while scanning row: %v", err)
 		}
 
-		m.StartedAt, err = time.Parse(time.RFC3339, startedAt)
+		m.StartedAt, err = time.Parse(time.RFC3339Nano, startedAt)
 		if err != nil {
 			return nil, fmt.Errorf("while parsing 'started_at': %v", err)
 		}
@@ -789,11 +789,11 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 		wo.Supplier.Name = supplName.String
 		wo.Supplier.Activity = supplActivity.String
 
-		wo.RepairDateStart, err = time.Parse(time.RFC3339, repairDateStart)
+		wo.RepairDateStart, err = time.Parse(time.RFC3339Nano, repairDateStart)
 		if err != nil {
 			return nil, fmt.Errorf("while parsing 'repair_date_start': %v", err)
 		}
-		wo.RepairDateEnd, err = time.Parse(time.RFC3339, repairDateEnd)
+		wo.RepairDateEnd, err = time.Parse(time.RFC3339Nano, repairDateEnd)
 		if err != nil {
 			return nil, fmt.Errorf("while parsing 'repair_date_end': %v", err)
 		}
@@ -820,7 +820,7 @@ func GetExpensesDB(ctx context.Context, db *sql.DB) ([]ExpenseDocumentDB, error)
 			return nil, fmt.Errorf("while scanning row: %v", err)
 		}
 
-		e.Date, err = time.Parse(time.RFC3339, date)
+		e.Date, err = time.Parse(time.RFC3339Nano, date)
 		if err != nil {
 			return nil, fmt.Errorf("while parsing 'date': %v", err)
 		}
@@ -923,7 +923,7 @@ func GetLastSyncs(ctx context.Context, db *sql.DB) (map[string]LastSync, error) 
 
 // For example: SetLastSyncForQuery(ctx, db, "getCouncilMissionSuppliers", "cursor")
 func SetLastSyncForQuery(ctx context.Context, db *sql.DB, queryName, cursor string) error {
-	_, err := db.ExecContext(ctx, "REPLACE INTO last_syncs (graphql_query_name, last_cursor, date) VALUES (?, ?, ?);", queryName, cursor, time.Now().Format(time.RFC3339))
+	_, err := db.ExecContext(ctx, "REPLACE INTO last_syncs (graphql_query_name, last_cursor, date) VALUES (?, ?, ?);", queryName, cursor, time.Now().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("while inserting into last_syncs: %v", err)
 	}
