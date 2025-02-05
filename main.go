@@ -129,7 +129,7 @@ func main() {
 		}
 		defer sqlDB.Close()
 
-		err = db.InitSchemaDB(context.Background(), sqlDB)
+		err = db.InitAndUpdateDB(context.Background(), sqlDB)
 		if err != nil {
 			logutil.Errorf("while creating schema: %v", err)
 			os.Exit(1)
@@ -316,7 +316,7 @@ func main() {
 		}
 		defer sqlDB.Close()
 
-		err = db.InitSchemaDB(context.Background(), sqlDB)
+		err = db.InitAndUpdateDB(context.Background(), sqlDB)
 		if err != nil {
 			logutil.Errorf("while creating schema: %v", err)
 			os.Exit(1)

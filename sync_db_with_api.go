@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -124,26 +125,26 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	// For now, the fetched expenses won't contain the FilePath field. It will
 	// be set later on.
 	var expensesLive []db.ExpenseDocumentDB
-	// expensesFromAPI, err := api.GetExpensesCurrentAPI(client, uuid)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("while getting expenses: %v", err)
-	// }
-	// for _, e := range expensesFromAPI {
-	// 	expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e))
-	// }
-	// periods, err := api.GetAccountingPeriodsLive(client, uuid)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("while getting accounting periods: %v", err)
-	// }
-	// for _, period := range periods {
-	// 	cur, err := api.GetBuildingAccountingRGDDLive(client, uuid, period.ID)
-	// 	if err != nil {
-	// 		return nil, fmt.Errorf("while getting building accounting RGDD: %v", err)
-	// 	}
-	// 	for _, e := range cur {
-	// 		expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e))
-	// 	}
-	// }
+	expensesFromAPI, err := api.GetBuildingAccountingCurrent(client, uuid)
+	if err != nil {
+		return nil, fmt.Errorf("while getting expenses: %v", err)
+	}
+	for _, e := range expensesFromAPI {
+		expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e, db.SourceAccounting))
+	}
+	periods, err := api.GetAccountingPeriodsLive(client, uuid)
+	if err != nil {
+		return nil, fmt.Errorf("while getting accounting periods: %v", err)
+	}
+	for _, period := range periods {
+		cur, err := api.GetBuildingAccountingRGDDLive(client, uuid, period.ID)
+		if err != nil {
+			return nil, fmt.Errorf("while getting building accounting RGDD: %v", err)
+		}
+		for _, e := range cur {
+			expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e, db.SourceAccounting))
+		}
+	}
 
 	ids, err := api.GetRepairBudgets(client, uuid)
 	if err != nil {
@@ -155,7 +156,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 			return nil, fmt.Errorf("while getting repair budget details: %v", err)
 		}
 		for _, e := range got {
-			expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e))
+			expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e, db.SourceRepairs))
 		}
 	}
 
@@ -193,23 +194,23 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 			var fileURL, filename string
 			if e.HashFile != "" {
 				filename, fileURL, err = api.GetDocumentURL(client, e.HashFile)
-				if err != nil {
-					return fmt.Errorf("while getting invoice URL: %v", err)
-				}
-				if fileURL == "" {
-					logutil.Infof("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
+				switch {
+				case errors.Is(err, api.ErrEmptyURL):
+					logutil.Infof("no document URL found for hash file '%s', skipping download. Expense: %+v", e.HashFile, e)
 					continue
+				case err != nil:
+					return fmt.Errorf("while getting document URL from hash file %s: %w", e.HashFile, err)
 				}
 			} else if e.InvoiceID != "" {
 				// I found that the graphql query 'getInvoiceURL' returns an empty
 				// URL if the invoiceID exists but the hashFile is empty.
 				filename, fileURL, err = api.GetInvoiceURL(client, e.InvoiceID)
-				if err != nil {
-					return fmt.Errorf("while getting invoice URL: %v", err)
-				}
-				if fileURL == "" {
+				switch {
+				case errors.Is(err, api.ErrEmptyURL):
 					logutil.Infof("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
 					continue
+				case err != nil:
+					return fmt.Errorf("while getting invoice URL from invoice ID %v: %w", e.InvoiceID, err)
 				}
 			} else {
 				panic("programmer mistake: either HashFile or InvoiceID should be set")

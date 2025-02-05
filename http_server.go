@@ -117,7 +117,11 @@ var tmpl = template.Must(template.New("base").Parse(`
 				{{with .Expense}}
 				<tr id="{{or .HashFile .InvoiceID}}">
 					<td><a href="{{$.BasePath}}#{{ or .HashFile .InvoiceID }}">{{.Date.Format "02 Jan 2006"}}</a></td>
-					<td>Facture</td>
+					<td>Facture
+						{{if eq .Source "repairs"}}
+							<small>(compte travaux)</small>
+						{{end}}
+					</td>
 					<td>{{.Label}}</td>
 					<td><small>
 						{{.Amount}}

@@ -46,7 +46,7 @@ func ExtractSuppliersFromContracts(contracts []api.SupplierContractAPI) []db.Sup
 
 // WARNING: the `FilePath` field is not set by this function. You need to set it
 // manually afterwards.
-func ExpenseDocumentAPIToDB(e api.ExpenseDocumentAPI) db.ExpenseDocumentDB {
+func ExpenseDocumentAPIToDB(e api.ExpenseDocumentAPI, src db.Source) db.ExpenseDocumentDB {
 	return db.ExpenseDocumentDB{
 		Label:     e.Label,
 		Date:      e.Date,
@@ -54,6 +54,7 @@ func ExpenseDocumentAPIToDB(e api.ExpenseDocumentAPI) db.ExpenseDocumentDB {
 		InvoiceID: e.InvoiceID,
 		HashFile:  e.HashFile,
 		FilePath:  "", // Remember to set this later on.
+		Source:    src,
 	}
 }
 

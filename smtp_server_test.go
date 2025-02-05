@@ -56,7 +56,7 @@ func TestSMTPServer(t *testing.T) {
 	t.Run("run server", func(t *testing.T) {
 		sqlDB, err := sql.Open("sqlite", ":memory:")
 		require.NoError(t, err)
-		err = db.InitSchemaDB(context.Background(), sqlDB)
+		err = db.InitAndUpdateDB(context.Background(), sqlDB)
 		require.NoError(t, err)
 
 		d := t.TempDir()

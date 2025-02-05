@@ -851,12 +851,15 @@ type ExpenseDocumentAPI struct {
 	Amount    db.Amount   // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
 	Date      time.Time   // May not be unique. Example: "2024-03-01T00:00:00.000Z". Use time.RFC3339Nano to marshall.
 	HashFile  db.HashFile // Only set when a document is attached. Example: "66fbf2a9294cd8ed17d7ce9a"
-	Category  string      // Example: "expense".
 }
+
+var ErrEmptyURL = fmt.Errorf("empty URL")
 
 // Important: don't call getInvoiceURL if invoiceID exists but the hashFile is
 // empty. If that's the case, the invoice PDF doesn't exist, and getInvoiceURL
-// will return an empty URL.
+// will return an empty URL. To know if the URL returned was empty:
+//
+//	errors.Is(err, api.ErrEmptyURL)
 func GetInvoiceURL(client *http.Client, invoiceID string) (filename, fileURL string, _ error) {
 	const getInvoiceURLQuery = `query getInvoiceURL($invoiceId: String!) {invoiceURL(invoiceId: $invoiceId)}`
 	var getInvoiceURLResp struct {
@@ -872,6 +875,10 @@ func GetInvoiceURL(client *http.Client, invoiceID string) (filename, fileURL str
 		return "", "", fmt.Errorf("while querying getInvoiceURLResp: %w", err)
 	}
 
+	if getInvoiceURLResp.Data.InvoiceURL == "" {
+		return "", "", fmt.Errorf("getInvoiceURL: %w", ErrEmptyURL)
+	}
+
 	filename, err = getFilenameFromURL(getInvoiceURLResp.Data.InvoiceURL)
 	if err != nil {
 		return "", "", fmt.Errorf("while getting filename from %s: %w", getInvoiceURLResp.Data.InvoiceURL, err)
@@ -880,6 +887,9 @@ func GetInvoiceURL(client *http.Client, invoiceID string) (filename, fileURL str
 	return filename, getInvoiceURLResp.Data.InvoiceURL, nil
 }
 
+// To know if the URL returned was empty:
+//
+//	errors.Is(err, api.ErrEmptyURL)
 func GetDocumentURL(client *http.Client, hash db.HashFile) (filename, fileURL string, _ error) {
 	const getDocumentURLQuery = `query getDocumentURL($hash: String!) {documentURL(hash: $hash)}`
 	var getDocumentURLResp struct {
@@ -893,6 +903,10 @@ func GetDocumentURL(client *http.Client, hash db.HashFile) (filename, fileURL st
 	}, &getDocumentURLResp)
 	if err != nil {
 		return "", "", fmt.Errorf("error while querying getDocumentURL: %w", err)
+	}
+
+	if getDocumentURLResp.Data.DocumentURL == "" {
+		return "", "", fmt.Errorf("getDocumentURL: %w", ErrEmptyURL)
 	}
 
 	filename, err = getFilenameFromURL(getDocumentURLResp.Data.DocumentURL)
@@ -1146,7 +1160,6 @@ func GetBuildingAccountingCurrent(client *http.Client, accountUUID string) ([]Ex
 					}
 				}
 				expenses = append(expenses, ExpenseDocumentAPI{
-					Category:  expense.Piece.Category,
 					HashFile:  db.HashFile(expense.Piece.HashFile),
 					InvoiceID: expense.InvoiceID,
 					Label:     expense.Label,
@@ -1458,7 +1471,6 @@ func GetBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 					Label:     expense.Label,
 					Date:      date,
 					Amount:    db.Amount(expense.ToAllocate.Value),
-					Category:  expense.Piece.Category,
 				})
 			}
 		}
@@ -2018,7 +2030,6 @@ func GetRepairBudgetDetailsAPI(client *http.Client, accountUUID, budgetID string
 					Label:     expense.Label,
 					Date:      date,
 					Amount:    db.Amount(expense.ToAllocate.Value),
-					Category:  expense.Piece.Category,
 				})
 			}
 		}

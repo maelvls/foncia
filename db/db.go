@@ -36,20 +36,6 @@ type MissionDB struct {
 	WorkOrders  []WorkOrderDB
 }
 
-const workOrdersTableSQL = `
-	CREATE TABLE IF NOT EXISTS work_orders (
-		id TEXT UNIQUE,
-		mission_id TEXT NOT NULL,
-		number TEXT,
-		label TEXT,
-		repair_date_start TEXT,      -- time.RFC3339Nano
-		repair_date_end TEXT,        -- time.RFC3339Nano
-		supplier_id TEXT,
-		supplier_name TEXT,
-		supplier_activity TEXT,
-		FOREIGN KEY(mission_id) REFERENCES missions(id)
-	);`
-
 type WorkOrderDB struct {
 	ID              string    // "64850e80df57eb4ade3cf63c"
 	MissionID       string    // "64850e8019d5d64c415d13dd"
@@ -60,29 +46,56 @@ type WorkOrderDB struct {
 	Supplier        SupplierDB
 }
 
-const expensesTableSQL = `
-	CREATE TABLE IF NOT EXISTS expenses (
-		invoice_id TEXT,       -- May be "" if no invoice file
-		label TEXT,
-		amount INTEGER,
-		date TEXT,             -- time.RFC3339Nano
-		file_path TEXT,        -- May be "" if no invoice file
-		hash_file TEXT         -- May be "" if no invoice file
-	);`
-
-func InitSchemaDB(ctx context.Context, db *sql.DB) error {
+func InitAndUpdateDB(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, missionsTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create table 'missions': %w", err)
 	}
-	_, err = db.ExecContext(ctx, workOrdersTableSQL)
+	_, err = db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS work_orders (
+			id TEXT UNIQUE,
+			mission_id TEXT NOT NULL,
+			number TEXT,
+			label TEXT,
+			repair_date_start TEXT,      -- time.RFC3339Nano
+			repair_date_end TEXT,        -- time.RFC3339Nano
+			supplier_id TEXT,
+			supplier_name TEXT,
+			supplier_activity TEXT,
+			FOREIGN KEY(mission_id) REFERENCES missions(id)
+		);`)
 	if err != nil {
 		return fmt.Errorf("failed to create table 'work_orders': %w", err)
 	}
-	_, err = db.ExecContext(ctx, expensesTableSQL)
+	_, err = db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS expenses (
+			invoice_id TEXT,       -- May be "" if no invoice file
+			label TEXT,
+			amount INTEGER,
+			date TEXT,             -- time.RFC3339Nano
+			file_path TEXT,        -- May be "" if no invoice file
+			hash_file TEXT         -- May be "" if no invoice file
+		);`)
 	if err != nil {
 		return fmt.Errorf("failed to create table 'expenses': %w", err)
 	}
+	// Add the source column to the expenses table if this column doesn't exist.
+	// First, check if the column exists.
+	var sourceColumnExists bool
+	err = db.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pragma_table_info('expenses') WHERE name = 'source') AS column_exists;").Scan(&sourceColumnExists)
+	if err != nil {
+		return fmt.Errorf("failed to check if column 'source' exists in table 'expenses': %w", err)
+	}
+	if !sourceColumnExists {
+		_, err = db.ExecContext(ctx, `
+		ALTER TABLE expenses ADD COLUMN source TEXT; -- "accounting" or "repairs"
+	`)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to add column 'source' to table 'expenses': %w", err)
+	}
+
 	_, err = db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS suppliers (
 			id TEXT UNIQUE,
@@ -420,9 +433,22 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 	}()
 
 	for _, e := range expense {
-		req := "UPDATE expenses SET file_path = ? where	invoice_id = ? and label = ? and hash_file = ? and date = ? and amount = ?;"
-		values := []interface{}{e.FilePath, e.InvoiceID, e.Label, e.HashFile, e.Date.Format(time.RFC3339Nano), e.Amount}
-		res, err := tx.ExecContext(ctx, req, values...)
+		var req string
+		var args []interface{}
+		switch {
+		case e.HashFile != "":
+			req = "UPDATE expenses SET invoice_id = ?, label = ?, amount = ?, date = ?, file_path = ?, hash_file = ?, source = ? WHERE hash_file = ?;"
+			args = []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.HashFile}
+
+		case e.InvoiceID != "":
+			req = "UPDATE expenses SET invoice_id = ?, label = ?, amount = ?, date = ?, file_path = ?, hash_file = ?, source = ? WHERE invoice_id = ?;"
+			args = []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.InvoiceID}
+
+		default:
+			req = "UPDATE expenses SET invoice_id = ?, label = ?, amount = ?, date = ?, file_path = ?, hash_file = ?, source = ? WHERE label = ? AND date = ? AND amount = ?;"
+			args = []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount}
+		}
+		res, err := tx.ExecContext(ctx, req, args...)
 		if err != nil {
 			return fmt.Errorf("while updating expenses: %v", err)
 		}
@@ -435,9 +461,9 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 		if n > 0 {
 			logutil.Debugf("db: updated expense %q: %+v", e.Date, e)
 		} else {
-			req := "INSERT INTO expenses (invoice_id, label, amount, date, file_path, hash_file) VALUES (?, ?, ?, ?, ?, ?);"
-			values := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile}
-			_, err := tx.ExecContext(ctx, req, values...)
+			req := "INSERT INTO expenses (invoice_id, label, amount, date, file_path, hash_file, source) VALUES (?, ?, ?, ?, ?, ?, ?);"
+			args := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source}
+			_, err := tx.ExecContext(ctx, req, args...)
 			if err != nil {
 				return fmt.Errorf("while inserting expenses: %v", err)
 			}
@@ -567,7 +593,21 @@ type ExpenseDocumentDB struct {
 	// case, the HashFile is the one to use (arbitrary choice) since both
 	// GetInvoiceURL and GetDocumentURL return the same document.
 	InvoiceID string
+
+	Source Source
 }
+
+// Expenses can come from two different sources:
+//
+//	GetBuildingAccountingCurrent: "accounting"
+//	GetBuildingAccountingRGDD:    "accounting"
+//	GetBuildingAccountingRepairs: "repairs"
+type Source string
+
+const (
+	SourceAccounting Source = "accounting"
+	SourceRepairs    Source = "repairs"
+)
 
 type ExpenseDocumentID string
 
@@ -676,7 +716,8 @@ func (a ExpenseDocumentDB) Equal(b ExpenseDocumentDB) bool {
 		a.Amount == b.Amount &&
 		a.Date.Equal(b.Date) &&
 		a.FilePath == b.FilePath &&
-		a.HashFile == b.HashFile
+		a.HashFile == b.HashFile &&
+		a.Source == b.Source
 }
 
 func Merge(oldFromDB, newFromAPI ExpenseDocumentDB) ExpenseDocumentDB {
@@ -696,7 +737,8 @@ func (e ExpenseDocumentDB) Filename() string {
 func GetExpenseByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) (ExpenseDocumentDB, error) {
 	var e ExpenseDocumentDB
 	var date string
-	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file FROM expenses WHERE hash_file = ?", hashFile).Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile)
+	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file, source FROM expenses WHERE hash_file = ?", hashFile).
+		Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile, &e.Source)
 	if err != nil {
 		return ExpenseDocumentDB{}, fmt.Errorf("while querying database: %w", err)
 	}
@@ -712,7 +754,8 @@ func GetExpenseByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) (E
 func GetExpenseByInvoiceID(ctx context.Context, db *sql.DB, invoiceID string) (ExpenseDocumentDB, error) {
 	var e ExpenseDocumentDB
 	var date string
-	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file FROM expenses WHERE invoice_id = ?", invoiceID).Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile)
+	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file, source FROM expenses WHERE invoice_id = ?", invoiceID).
+		Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile, &e.Source)
 	if err != nil {
 		return ExpenseDocumentDB{}, fmt.Errorf("while querying database: %w", err)
 	}
@@ -907,7 +950,7 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 }
 
 func GetExpensesDB(ctx context.Context, db *sql.DB) ([]ExpenseDocumentDB, error) {
-	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file FROM expenses ORDER BY date DESC")
+	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file, source FROM expenses ORDER BY date DESC")
 	if err != nil {
 		return nil, fmt.Errorf("while querying database: %v", err)
 	}
@@ -917,11 +960,13 @@ func GetExpensesDB(ctx context.Context, db *sql.DB) ([]ExpenseDocumentDB, error)
 	for rows.Next() {
 		var e ExpenseDocumentDB
 		var date string
-		err = rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile)
+		var source sql.NullString // The `source` field was added later on, so it may be NULL.
+		err = rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile, &source)
 		if err != nil {
 			return nil, fmt.Errorf("while scanning row: %v", err)
 		}
 
+		e.Source = Source(source.String)
 		e.Date, err = time.Parse(time.RFC3339Nano, date)
 		if err != nil {
 			return nil, fmt.Errorf("while parsing 'date': %v", err)
