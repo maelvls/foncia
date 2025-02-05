@@ -531,13 +531,42 @@ func (a Amount) String() string {
 //	    },
 //	    "isFromPreviousPeriod": false
 //	}
+//
+//
+//	In other cases, the invoice ID is set, but the piece.hashFile is empty.
+//
+//	{
+//	    "id": "66867e37f427db1e7de3adc1",
+//	    "label": "SAS ALPES CONTROLES - BUREAU CONTROLE BARD/ISO 243100L1 310C2147 - 22/04/24",
+//	    "date": "2024-07-04T10:49:27.350Z",
+//	    "invoiceId": "662754b5777741968892fda5",
+//	    "piece": null,
+//	    "toAllocate": {
+//	        "value": 60338,
+//	        "currency": "EUR"
+//	    },
+//	}
 type ExpenseDocumentDB struct {
-	InvoiceID string    // DO NOT USE. Use HashFile to identify document. HashFile is always set when InvoiceID is set, but the reverse isn't true. E.g.: "64850e805e5793033297f476".
-	Label     string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
-	Amount    Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
-	Date      time.Time // May not be unique. Example: "2024-07-01T21:59:59.000Z".
-	FilePath  string    // Only set when a document is attached. Example: "invoices/OU CHANNA - CT01037406 - 2024-10-01 - _27.pdf"
-	HashFile  HashFile  // Only set when a document is attached. Example: "66fbf2a9294cd8ed17d7ce9a"
+	Label  string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
+	Amount Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
+	Date   time.Time // May not be unique. Example: "2024-07-01T21:59:59.000Z".
+
+	// Only set when a document is attached, i.e., when HashFile or InvoiceID is
+	// set. Example: "invoices/OU CHANNA - CT01037406 - 2024-10-01 - _27.pdf"
+	FilePath string
+
+	// Only set when a document is attached. To be used with GetDocumentURL.
+	// Example: "66fbf2a9294cd8ed17d7ce9a"
+	HashFile HashFile
+
+	// Only set when a document is attached. Rarely useful since HashFile is
+	// widely available, unlike InvoiceID. To be used with GetInvoiceURL.
+	// Example: "64850e805e5793033297f476".
+	//
+	// Sometimes, both the InvoiceID and the HashFile are available. In that
+	// case, the HashFile is the one to use (arbitrary choice) since both
+	// GetInvoiceURL and GetDocumentURL return the same document.
+	InvoiceID string
 }
 
 type ExpenseDocumentID string
@@ -597,6 +626,7 @@ type ExpenseDocumentID string
 type ExpenseDocumentsIndex struct {
 	Elements          []ExpenseDocumentDB
 	ByHashFile        map[HashFile]int
+	ByInvoiceID       map[string]int
 	ByLabelDateAmount map[string]int
 }
 
@@ -604,10 +634,12 @@ func NewExpenseDocumentsIndex(expenses []ExpenseDocumentDB) ExpenseDocumentsInde
 	index := ExpenseDocumentsIndex{
 		Elements:          expenses,
 		ByHashFile:        make(map[HashFile]int),
+		ByInvoiceID:       make(map[string]int),
 		ByLabelDateAmount: make(map[string]int),
 	}
 	for i, e := range expenses {
 		index.ByHashFile[e.HashFile] = i
+		index.ByInvoiceID[e.InvoiceID] = i
 		index.ByLabelDateAmount[fmt.Sprintf("%s-%s-%d", e.Label, e.Date.Format(time.RFC3339Nano), e.Amount)] = i
 	}
 	return index
@@ -618,6 +650,13 @@ func NewExpenseDocumentsIndex(expenses []ExpenseDocumentDB) ExpenseDocumentsInde
 func (idx ExpenseDocumentsIndex) Match(partial ExpenseDocumentDB) (ExpenseDocumentDB, bool) {
 	if partial.HashFile != "" {
 		i, ok := idx.ByHashFile[partial.HashFile]
+		if ok {
+			return idx.Elements[i], true
+		}
+	}
+
+	if partial.InvoiceID != "" {
+		i, ok := idx.ByInvoiceID[partial.InvoiceID]
 		if ok {
 			return idx.Elements[i], true
 		}
@@ -658,6 +697,22 @@ func GetExpenseByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) (E
 	var e ExpenseDocumentDB
 	var date string
 	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file FROM expenses WHERE hash_file = ?", hashFile).Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile)
+	if err != nil {
+		return ExpenseDocumentDB{}, fmt.Errorf("while querying database: %w", err)
+	}
+	e.Date, err = time.Parse(time.RFC3339Nano, date)
+	if err != nil {
+		return ExpenseDocumentDB{}, fmt.Errorf("while parsing 'date': %v", err)
+	}
+
+	return e, nil
+}
+
+// errors.Is(err, sql.NoRows) when not found.
+func GetExpenseByInvoiceID(ctx context.Context, db *sql.DB, invoiceID string) (ExpenseDocumentDB, error) {
+	var e ExpenseDocumentDB
+	var date string
+	err := db.QueryRowContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file FROM expenses WHERE invoice_id = ?", invoiceID).Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile)
 	if err != nil {
 		return ExpenseDocumentDB{}, fmt.Errorf("while querying database: %w", err)
 	}
@@ -788,7 +843,6 @@ func GetMissionsDB(ctx context.Context, db *sql.DB) ([]MissionDB, error) {
 		}
 		missions[i].WorkOrders = workOrders
 	}
-	logutil.Debugf("found %d missions", len(missions))
 	return missions, nil
 }
 

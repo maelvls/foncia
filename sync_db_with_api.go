@@ -14,6 +14,27 @@ import (
 	"github.com/maelvls/foncia/logutil"
 )
 
+func syncRepairExpenses(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid string, invoicesDir string) error {
+	// Unauthenticated client just used for downloading files from AWS.
+	downloadClient := &http.Client{}
+	api.EnableDebugCurlLogs(downloadClient)
+
+	// Create dir if missing.
+	err := os.MkdirAll(invoicesDir, 0755)
+	if err != nil {
+		return fmt.Errorf("while creating directory: %v", err)
+	}
+
+	var docs []db.ExpenseDocumentDB
+
+	err = db.UpsertExpensesWithDB(ctx, sqlDB, docs...)
+	if err != nil {
+		return fmt.Errorf("while saving repair expenses: %v", err)
+	}
+
+	return nil
+}
+
 // Returns the new items.
 func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid string) ([]db.MissionDB, error) {
 	missions, _, err := api.GetMissionsAPI(client, uuid, "")
@@ -103,23 +124,37 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	// For now, the fetched expenses won't contain the FilePath field. It will
 	// be set later on.
 	var expensesLive []db.ExpenseDocumentDB
-	expensesFromAPI, err := api.GetExpensesCurrentAPI(client, uuid)
+	// expensesFromAPI, err := api.GetExpensesCurrentAPI(client, uuid)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("while getting expenses: %v", err)
+	// }
+	// for _, e := range expensesFromAPI {
+	// 	expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e))
+	// }
+	// periods, err := api.GetAccountingPeriodsLive(client, uuid)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("while getting accounting periods: %v", err)
+	// }
+	// for _, period := range periods {
+	// 	cur, err := api.GetBuildingAccountingRGDDLive(client, uuid, period.ID)
+	// 	if err != nil {
+	// 		return nil, fmt.Errorf("while getting building accounting RGDD: %v", err)
+	// 	}
+	// 	for _, e := range cur {
+	// 		expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e))
+	// 	}
+	// }
+
+	ids, err := api.GetRepairBudgets(client, uuid)
 	if err != nil {
-		return nil, fmt.Errorf("while getting expenses: %v", err)
+		return nil, fmt.Errorf("while getting repair IDs: %v", err)
 	}
-	for _, e := range expensesFromAPI {
-		expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e))
-	}
-	periods, err := api.GetAccountingPeriodsLive(client, uuid)
-	if err != nil {
-		return nil, fmt.Errorf("while getting accounting periods: %v", err)
-	}
-	for _, period := range periods {
-		cur, err := api.GetBuildingAccountingRGDDLive(client, uuid, period.ID)
+	for _, id := range ids {
+		got, err := api.GetRepairBudgetDetailsAPI(client, uuid, id)
 		if err != nil {
-			return nil, fmt.Errorf("while getting building accounting RGDD: %v", err)
+			return nil, fmt.Errorf("while getting repair budget details: %v", err)
 		}
-		for _, e := range cur {
+		for _, e := range got {
 			expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e))
 		}
 	}
@@ -142,41 +177,50 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 				*e = db.Merge(eDB, *e)
 			}
 
-			// The PDF URL can either be fetched using the invoice ID or the
-			// hash file.
-			if e.HashFile == "" {
+			// The PDF URL can either be fetched using the InvoiceID or the
+			// HashFile.
+			if e.HashFile == "" && e.InvoiceID == "" {
 				continue
 			}
 
 			if fileExists(e.FilePath) {
 				continue
+			} else if e.FilePath != "" {
+				logutil.Debugf("file needs to be downloaded for '%s' (%s, %d)", e.FilePath, e.Label, e.Date, e.Amount)
+			}
+
+			// First try using the HashFile, then the InvoiceID.
+			var fileURL, filename string
+			if e.HashFile != "" {
+				filename, fileURL, err = api.GetDocumentURL(client, e.HashFile)
+				if err != nil {
+					return fmt.Errorf("while getting invoice URL: %v", err)
+				}
+				if fileURL == "" {
+					logutil.Infof("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
+					continue
+				}
+			} else if e.InvoiceID != "" {
+				// I found that the graphql query 'getInvoiceURL' returns an empty
+				// URL if the invoiceID exists but the hashFile is empty.
+				filename, fileURL, err = api.GetInvoiceURL(client, e.InvoiceID)
+				if err != nil {
+					return fmt.Errorf("while getting invoice URL: %v", err)
+				}
+				if fileURL == "" {
+					logutil.Infof("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
+					continue
+				}
 			} else {
-				logutil.Debugf("file %q not found, downloading for '%s' (%s, %d)", e.FilePath, e.Label, e.Date, e.Amount)
+				panic("programmer mistake: either HashFile or InvoiceID should be set")
+			}
+			e.FilePath = path.Join(invoicesDir, filename)
+
+			if fileExists(e.FilePath) {
+				logutil.Debugf("file %q already exists, skipping download", e.FilePath)
 			}
 
-			// I found that the graphql query 'getInvoiceURL' returns an empty
-			// URL if the invoiceID exists but the hashFile is empty.
-			if e.HashFile == "" {
-				logutil.Infof("no hash file found for expense '%s' (%s, %d), skipping download", e.Label, e.Date, e.Amount)
-				continue
-			}
-
-			filename, fileURL, err := api.GetDocumentURL(client, e.HashFile)
-			if err != nil {
-				return fmt.Errorf("while getting invoice URL: %v", err)
-			}
-			if fileURL == "" {
-				logutil.Infof("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
-				continue
-			}
-			filePath := path.Join(invoicesDir, filename)
-			e.FilePath = filePath
-
-			if fileExists(filePath) {
-				logutil.Debugf("file %q already exists, skipping download", filePath)
-			}
-
-			err = api.Download(downloadClient, fileURL, filePath)
+			err = api.Download(downloadClient, fileURL, e.FilePath)
 			if err != nil {
 				return fmt.Errorf("while downloading invoice for expense %s: %v", fileURL, err)
 			}

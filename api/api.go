@@ -355,7 +355,7 @@ func GetMissionsAPI(client *http.Client, accountUUID string, fromCursor string) 
 			var startedAt time.Time
 			if edge.Node.StartedAt != "" {
 				var err error
-				startedAt, err = time.Parse(time.RFC3339, edge.Node.StartedAt)
+				startedAt, err = time.Parse(time.RFC3339Nano, edge.Node.StartedAt)
 				if err != nil {
 					logutil.Debugf("error parsing time: %v", err)
 					return nil, "", fmt.Errorf("error parsing time: %w", err)
@@ -446,7 +446,7 @@ func GetMissionsAPI(client *http.Client, accountUUID string, fromCursor string) 
 		for _, edge := range getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.Edges {
 			var startedAt time.Time
 			if edge.Node.StartedAt != "" {
-				startedAt, err = time.Parse(time.RFC3339, edge.Node.StartedAt)
+				startedAt, err = time.Parse(time.RFC3339Nano, edge.Node.StartedAt)
 				if err != nil {
 					return nil, "", fmt.Errorf("error parsing time: %w", err)
 				}
@@ -542,13 +542,13 @@ func GetWorkOrdersAPI(client *http.Client, accountUUID, missionID string) (_ []W
 	for _, edge := range getWorkOrdersResp.Data.WorkOrders.Edges {
 		var start, end time.Time
 		if edge.Node.RepairDate.Start != "" {
-			start, err = time.Parse(time.RFC3339, edge.Node.RepairDate.Start)
+			start, err = time.Parse(time.RFC3339Nano, edge.Node.RepairDate.Start)
 			if err != nil {
 				return nil, fmt.Errorf("error parsing time: %w", err)
 			}
 		}
 		if edge.Node.RepairDate.End != "" {
-			end, err = time.Parse(time.RFC3339, edge.Node.RepairDate.End)
+			end, err = time.Parse(time.RFC3339Nano, edge.Node.RepairDate.End)
 			if err != nil {
 				return nil, fmt.Errorf("error parsing time: %w", err)
 			}
@@ -798,7 +798,7 @@ func GetCouncilMissionSuppliersAPI(client *http.Client, accountUUID string) ([]S
 	for _, edge := range getCouncilMissionSuppliers.Data.CoownerAccount.TrusteeCouncil.SupplierContracts.Edges {
 		var endingDate time.Time
 		if edge.Node.EndingDate != "" {
-			endingDate, err = time.Parse(time.RFC3339, edge.Node.EndingDate)
+			endingDate, err = time.Parse(time.RFC3339Nano, edge.Node.EndingDate)
 			if err != nil {
 				logutil.Errorf("error parsing time: %v", err)
 				continue
@@ -807,7 +807,7 @@ func GetCouncilMissionSuppliersAPI(client *http.Client, accountUUID string) ([]S
 
 		var docs []DocumentAPI
 		for _, doc := range edge.Node.Documents {
-			createdAt, err := time.Parse(time.RFC3339, doc.CreatedAt)
+			createdAt, err := time.Parse(time.RFC3339Nano, doc.CreatedAt)
 			if err != nil {
 				logutil.Errorf("error parsing time: %v", err)
 				continue
@@ -959,7 +959,7 @@ func getFilenameFromURL(fileURL string) (string, error) {
 }
 
 // This query is light and doesn't need to be paginated.
-func GetExpensesCurrentAPI(client *http.Client, accountUUID string) ([]ExpenseDocumentAPI, error) {
+func GetBuildingAccountingCurrent(client *http.Client, accountUUID string) ([]ExpenseDocumentAPI, error) {
 	const getBuildingAccountingCurrentQuery = `
 		query getBuildingAccountingCurrent($uuid: EncodedID!) {
 		  coownerAccount(uuid: $uuid) {
@@ -1140,7 +1140,7 @@ func GetExpensesCurrentAPI(client *http.Client, accountUUID string) ([]ExpenseDo
 				var date time.Time
 				if expense.Date != "" {
 					var err error
-					date, err = time.Parse(time.RFC3339, expense.Date)
+					date, err = time.Parse(time.RFC3339Nano, expense.Date)
 					if err != nil {
 						return nil, fmt.Errorf("error parsing time: %w", err)
 					}
@@ -1168,39 +1168,6 @@ type AccountingPeriodAPI struct {
 	Status      string
 }
 
-//	query getAccountingPeriods($accountUuid: EncodedID!, $sortBy: [SortByType!], $status: [AccountingPeriodStatusEnum!], $closingDateTo: String, $first: Int, $before: Cursor, $after: Cursor) {
-//	  coownerAccount(uuid: $accountUuid) {
-//	    uuid
-//	    trusteeCouncil {
-//	      accountingPeriods(
-//	        first: $first
-//	        before: $before
-//	        after: $after
-//	        sortBy: $sortBy
-//	        status: $status
-//	        closingDateTo: $closingDateTo
-//	      ) {
-//	        totalCount
-//	        pageInfo {
-//	          startCursor
-//	          endCursor
-//	          hasPreviousPage
-//	          hasNextPage
-//	        }
-//	        edges {
-//	          node {
-//	            id
-//	         name
-//	         openingDate
-//	         closingDate
-//	         status
-//	          }
-//	        }
-//	      }
-//	    }
-//	  }
-//	}
-//
 // This query is light and doesn't need to be paginated. No need to remember the
 // last cursor.
 func GetAccountingPeriodsLive(client *http.Client, accountUUID string) ([]AccountingPeriodAPI, error) {
@@ -1276,14 +1243,14 @@ func GetAccountingPeriodsLive(client *http.Client, accountUUID string) ([]Accoun
 		var openingDate, closingDate time.Time
 		if edge.Node.OpeningDate != "" {
 			var err error
-			openingDate, err = time.Parse(time.RFC3339, edge.Node.OpeningDate)
+			openingDate, err = time.Parse(time.RFC3339Nano, edge.Node.OpeningDate)
 			if err != nil {
 				return nil, fmt.Errorf("error parsing time: %w", err)
 			}
 		}
 		if edge.Node.ClosingDate != "" {
 			var err error
-			closingDate, err = time.Parse(time.RFC3339, edge.Node.ClosingDate)
+			closingDate, err = time.Parse(time.RFC3339Nano, edge.Node.ClosingDate)
 			if err != nil {
 				return nil, fmt.Errorf("error parsing time: %w", err)
 			}
@@ -1480,7 +1447,7 @@ func GetBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 				var date time.Time
 				if expense.Date != "" {
 					var err error
-					date, err = time.Parse(time.RFC3339, expense.Date)
+					date, err = time.Parse(time.RFC3339Nano, expense.Date)
 					if err != nil {
 						return nil, fmt.Errorf("error parsing time: %w", err)
 					}
@@ -1673,7 +1640,7 @@ func GetAccountDocumentsAPI(client *http.Client, accountUUID, documentCategory, 
 	var docs []AccountDocumentAPI
 	for _, edge := range getAccountDocumentsResp.Data.Account.Documents.Edges {
 
-		createdAt, err := time.Parse(time.RFC3339, edge.Node.CreatedAt)
+		createdAt, err := time.Parse(time.RFC3339Nano, edge.Node.CreatedAt)
 		if err != nil {
 			logutil.Debugf("error parsing time: %v", err)
 			return nil, err
@@ -1689,6 +1656,375 @@ func GetAccountDocumentsAPI(client *http.Client, accountUUID, documentCategory, 
 		})
 	}
 	return docs, nil
+}
+
+// Annual General Meeting (AGM) of Co-Owners ("Assemblée Générale"). The `after`
+// parameter is the cursor to use to get the next page of results. Leave it
+// empty to get the first page.
+func GetCouncilProjectDocumentsAPI(client *http.Client, accountUUID, after string) ([]AccountDocumentAPI, error) {
+	const getCouncilProjectDocumentsQuery = `
+    query getCouncilProjectDocuments($accountUuid: EncodedID!, $sortBy: [SortByType!], $first: Int, $after: Cursor, $skipNotPaginatedData: Boolean! = false) {
+        coownerAccount(uuid: $accountUuid) {
+            uuid
+            pastGeneralAssembly @skip(if: $skipNotPaginatedData) {
+                id
+                label
+                officialMeeting {
+                    date
+                }
+                meetingPlace {
+                    address1
+                    address2
+                    city
+                    zipCode
+                    countryCode
+                }
+                lastValidPostalVoteReceptionDate
+                hasAccessToPostalVote
+                hasPreVoting
+                status
+            }
+            nextGeneralAssembly @skip(if: $skipNotPaginatedData) {
+                id
+                label
+                officialMeeting {
+                    date
+                }
+                meetingPlace {
+                    address1
+                    address2
+                    city
+                    zipCode
+                    countryCode
+                }
+                lastValidPostalVoteReceptionDate
+                hasAccessToPostalVote
+                hasPreVoting
+                status
+            }
+            trusteeCouncil {
+                projectDocuments(first: $first, after: $after, sortBy: $sortBy) {
+                    totalCount
+                    pageInfo {
+                        startCursor
+                        endCursor
+                        hasPreviousPage
+                        hasNextPage
+                    }
+                    edges {
+                        node {
+                            id
+                            hashFile
+                            mimeType
+                            originalFilename
+                            category
+                            createdAt
+                        }
+                    }
+                }
+            }
+        }
+    }
+`
+	var getCouncilProjectDocumentsResp struct {
+		Data struct {
+			CoownerAccount struct {
+				TrusteeCouncil struct {
+					ProjectDocuments struct {
+						TotalCount int `json:"totalCount"`
+						PageInfo   struct {
+							StartCursor     string `json:"startCursor"`
+							EndCursor       string `json:"endCursor"`
+							HasPreviousPage bool   `json:"hasPreviousPage"`
+							HasNextPage     bool   `json:"hasNextPage"`
+						} `json:"pageInfo"`
+						Edges []struct {
+							Node struct {
+								ID               string `json:"id"`
+								HashFile         string `json:"hashFile"`
+								MimeType         string `json:"mimeType"`
+								OriginalFilename string `json:"originalFilename"`
+								Category         string `json:"category"`
+								CreatedAt        string `json:"createdAt"`
+							} `json:"node"`
+						} `json:"edges"`
+					} `json:"projectDocuments"`
+				} `json:"trusteeCouncil"`
+			} `json:"coownerAccount"`
+		} `json:"data"`
+	}
+
+	var cursor *string
+	if after != "" {
+		cursor = &after
+	}
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getCouncilProjectDocumentsQuery, map[string]interface{}{
+		"accountUuid":          accountUUID,
+		"first":                100, // I found that it is the maximum accepted value.
+		"after":                cursor,
+		"skipNotPaginatedData": false,
+	}, &getCouncilProjectDocumentsResp)
+	if err != nil {
+		return nil, fmt.Errorf("error while querying getCouncilProjectDocumentsResp: %w", err)
+	}
+
+	var docs []AccountDocumentAPI
+	for _, edge := range getCouncilProjectDocumentsResp.Data.CoownerAccount.TrusteeCouncil.ProjectDocuments.Edges {
+		createdAt, err := time.Parse(time.RFC3339Nano, edge.Node.CreatedAt)
+		if err != nil {
+			logutil.Debugf("error parsing time: %v", err)
+			return nil, err
+		}
+
+		docs = append(docs, AccountDocumentAPI{
+			ID:               edge.Node.ID,
+			HashFile:         db.HashFile(edge.Node.HashFile),
+			MimeType:         edge.Node.MimeType,
+			OriginalFilename: edge.Node.OriginalFilename,
+			Category:         edge.Node.Category,
+			CreatedAt:        createdAt,
+		})
+	}
+
+	return docs, nil
+}
+
+func GetRepairBudgets(client *http.Client, accountUUID string) ([]string, error) {
+	const getRepairBudgetsQuery = `
+        query getRepairBudgets($accountUuid: EncodedID!) {
+          repairBudgets(accountUuid: $accountUuid) {
+            id
+            label
+            validatedAmount {
+              value
+              currency
+            }
+          }
+        }`
+	var listRepairIDsResp struct {
+		Data struct {
+			RepairBudgets []struct {
+				ID string `json:"id"`
+			} `json:"repairBudgets"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getRepairBudgetsQuery, map[string]interface{}{
+		"accountUuid": accountUUID,
+	}, &listRepairIDsResp)
+	if err != nil {
+		return nil, fmt.Errorf("error while querying listRepairIDsResp: %w", err)
+	}
+
+	var repairIDs []string
+	for _, repair := range listRepairIDsResp.Data.RepairBudgets {
+		repairIDs = append(repairIDs, repair.ID)
+	}
+	return repairIDs, nil
+}
+
+func GetRepairBudgetDetailsAPI(client *http.Client, accountUUID, budgetID string) ([]ExpenseDocumentAPI, error) {
+	if accountUUID == "" {
+		return nil, errors.New("accountUUID is empty")
+	}
+	if budgetID == "" {
+		return nil, errors.New("budgetID is empty")
+	}
+	const getRepairBudgetDetailsQuery = `
+		query getRepairBudgetDetails($accountUuid: EncodedID!, $budgetId: ID!) {
+		  coownerAccount(uuid: $accountUuid) {
+		    uuid
+		    trusteeCouncil {
+		      repairBudgets(accountUuid: $accountUuid, budgetId: $budgetId) {
+		        budgetId
+		        totalToAllocate {
+		          value
+		          currency
+		        }
+		        totalVat {
+		          value
+		          currency
+		        }
+		        totalRecoverable {
+		          value
+		          currency
+		        }
+		        allocations {
+		          id
+		          name
+		          code
+		          toAllocate {
+		            value
+		            currency
+		          }
+		          vat {
+		            value
+		            currency
+		          }
+		          recoverable {
+		            value
+		            currency
+		          }
+		          expenseTypes {
+		            id
+		            allocationId
+		            name
+		            code
+		            toAllocate {
+		              value
+		              currency
+		            }
+		            vat {
+		              value
+		              currency
+		            }
+		            recoverable {
+		              value
+		              currency
+		            }
+		            expenses {
+		              id
+		              label
+		              date
+		              invoiceId
+		              piece {
+		                hashFile
+		                category
+		                id
+		              }
+		              toAllocate {
+		                value
+		                currency
+		              }
+		              vat {
+		                value
+		                currency
+		              }
+		              recoverable {
+		                value
+		                currency
+		              }
+		            }
+		          }
+		        }
+		      }
+		    }
+		  }
+		}`
+	var getRepairBudgetDetailsResp struct {
+		Data struct {
+			CoownerAccount struct {
+				TrusteeCouncil struct {
+					RepairBudgets struct {
+						TotalToAllocate struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"totalToAllocate"`
+						TotalVat struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"totalVat"`
+						TotalRecoverable struct {
+							Value    int    `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"totalRecoverable"`
+						Allocations []struct {
+							ID         string `json:"id"`
+							Name       string `json:"name"`
+							Code       string `json:"code"`
+							ToAllocate struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"toAllocate"`
+							Vat struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"vat"`
+							Recoverable struct {
+								Value    int    `json:"value"`
+								Currency string `json:"currency"`
+							} `json:"recoverable"`
+							ExpenseTypes []struct {
+								ID           string `json:"id"`
+								AllocationID string `json:"allocationId"`
+								Name         string `json:"name"`
+								Code         string `json:"code"`
+								ToAllocate   struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"toAllocate"`
+								Vat struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"vat"`
+								Recoverable struct {
+									Value    int    `json:"value"`
+									Currency string `json:"currency"`
+								} `json:"recoverable"`
+								Expenses []struct {
+									ID        string `json:"id"`
+									InvoiceID string `json:"invoiceId"`
+									Label     string `json:"label"`
+									Date      string `json:"date"`
+									Piece     struct {
+										HashFile string `json:"hashFile"`
+										Category string `json:"category"`
+										ID       string `json:"id"`
+									} `json:"piece"`
+									ToAllocate struct {
+										Value    int    `json:"value"`
+										Currency string `json:"currency"`
+									} `json:"toAllocate"`
+									Vat struct {
+										Value    int    `json:"value"`
+										Currency string `json:"currency"`
+									} `json:"vat"`
+									Recoverable struct {
+										Value    int    `json:"value"`
+										Currency string `json:"currency"`
+									} `json:"recoverable"`
+								} `json:"expenses"`
+							} `json:"expenseTypes"`
+						} `json:"allocations"`
+					} `json:"repairBudgets"`
+				} `json:"trusteeCouncil"`
+			} `json:"coownerAccount"`
+		} `json:"data"`
+	}
+
+	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getRepairBudgetDetailsQuery, map[string]interface{}{
+		"accountUuid": accountUUID,
+		"budgetId":    budgetID,
+	}, &getRepairBudgetDetailsResp)
+	if err != nil {
+		return nil, fmt.Errorf("error while querying getRepairBudgetDetailsResp: %w", err)
+	}
+
+	var expenses []ExpenseDocumentAPI
+	for _, allocation := range getRepairBudgetDetailsResp.Data.CoownerAccount.TrusteeCouncil.RepairBudgets.Allocations {
+		for _, expenseType := range allocation.ExpenseTypes {
+			for _, expense := range expenseType.Expenses {
+				var date time.Time
+				if expense.Date != "" {
+					var err error
+					date, err = time.Parse(time.RFC3339Nano, expense.Date)
+					if err != nil {
+						return nil, fmt.Errorf("error parsing time: %w", err)
+					}
+				}
+				expenses = append(expenses, ExpenseDocumentAPI{
+					InvoiceID: expense.InvoiceID, // May be empty.
+					HashFile:  db.HashFile(expense.Piece.HashFile),
+					Label:     expense.Label,
+					Date:      date,
+					Amount:    db.Amount(expense.ToAllocate.Value),
+					Category:  expense.Piece.Category,
+				})
+			}
+		}
+	}
+
+	return expenses, nil
 }
 
 // I found that after many calls, the server starts returning:

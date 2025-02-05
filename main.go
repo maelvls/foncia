@@ -341,8 +341,6 @@ func main() {
 			$(cat email.mbox)
 			.
 			EOF
-
-
 		`))
 
 		wg := sync.WaitGroup{}

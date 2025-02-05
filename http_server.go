@@ -115,15 +115,21 @@ var tmpl = template.Must(template.New("base").Parse(`
 				</tr>
 				{{end}}
 				{{with .Expense}}
-				<tr id="{{.HashFile}}">
-					<td><a href="{{$.BasePath}}#{{ .HashFile }}">{{.Date.Format "02 Jan 2006"}}</a></td>
+				<tr id="{{or .HashFile .InvoiceID}}">
+					<td><a href="{{$.BasePath}}#{{ or .HashFile .InvoiceID }}">{{.Date.Format "02 Jan 2006"}}</a></td>
 					<td>Facture</td>
 					<td>{{.Label}}</td>
 					<td><small>
 						{{.Amount}}
 					</small></td>
 					{{if .FilePath}}
-						<td><small><a href="{{$.BasePath}}/dl/invoice/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
+						<td><small>
+						{{if .HashFile}}
+							<a href="{{$.BasePath}}/dl/invoice/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a>
+						{{else if .InvoiceID}}
+							<a href="{{$.BasePath}}/dl/invoiceid/{{.InvoiceID}}/{{.Filename}}">{{.Filename}}</a>
+						{{end}}
+						</small></td>
 					{{else if .HashFile}}
 						<td><small>PDF en attente de téléchargement</small></td>
 					{{else}}
@@ -215,10 +221,20 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, basePat
 }
 
 func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync func() (time.Time, error)) error {
-	// Download the invoice PDF. Example:
+	// Download a PDF. The /invoice endpoint historically relies on hash files,
+	// that's why a second endpoint /invoiceid was added to support invoice IDs.
+	//
 	//  GET /dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
+	//                  <----------------------> <--------->
+	//                         <hash_file>        <filename>
+	//
 	//  GET /dl/contract/660d79500178f21ab3ffc357/contract.pdf
-	//                   <hash_file>              <filename>
+	//                   <----------------------> <---------->
+	//                          <hash_file>        <filename>
+	//
+	//  GET /dl/invoiceid/660d79500178f21ab3ffc357/invoice.pdf
+	//                    <----------------------> <---------->
+	//                          <invoice_id>        <filename>
 	mux.HandleFunc("/dl/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -245,6 +261,14 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 			expense, err := db.GetExpenseByHashFileDB(context.Background(), sqlDB, hashFile)
 			if err != nil {
 				logutil.Errorf("while getting expense by hash file: %v", err)
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			http.ServeFile(w, r, expense.FilePath)
+		case "invoiceid":
+			expense, err := db.GetExpenseByInvoiceID(context.Background(), sqlDB, hashFile)
+			if err != nil {
+				logutil.Errorf("while getting expense by invoice ID: %v", err)
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
