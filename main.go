@@ -452,20 +452,20 @@ func missionToNtfyBody(m db.MissionDB) string {
 func authFetchSave(client *http.Client, db *sql.DB, uuid, invoicesDir string) ([]db.MissionDB, []db.ExpenseDocumentDB, error) {
 	ctx := context.Background()
 
-	// newMissions, err := syncLiveMissionsWithDB(ctx, client, db, uuid)
-	// if err != nil {
-	// 	return nil, nil, fmt.Errorf("while saving to database: %v", err)
-	// }
+	newMissions, err := syncLiveMissionsWithDB(ctx, client, db, uuid)
+	if err != nil {
+		return nil, nil, fmt.Errorf("while saving to database: %v", err)
+	}
 	newExpenses, err := syncExpensesWithDB(ctx, client, db, uuid, invoicesDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}
-	// err = syncSuppliersWithDB(ctx, client, db, uuid, invoicesDir)
-	// if err != nil {
-	// 	return nil, nil, fmt.Errorf("while saving to database: %v", err)
-	// }
+	err = syncSuppliersWithDB(ctx, client, db, uuid, invoicesDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("while saving to database: %v", err)
+	}
 
-	return nil, newExpenses, nil
+	return newMissions, newExpenses, nil
 }
 
 func getCreds() (string, api.Password) {

@@ -115,8 +115,8 @@ var tmpl = template.Must(template.New("base").Parse(`
 				</tr>
 				{{end}}
 				{{with .Expense}}
-				<tr id="{{.InvoiceID}}">
-					<td><a href="{{$.BasePath}}#{{ .InvoiceID }}">{{.Date.Format "02 Jan 2006"}}</a></td>
+				<tr id="{{.HashFile}}">
+					<td><a href="{{$.BasePath}}#{{ .HashFile }}">{{.Date.Format "02 Jan 2006"}}</a></td>
 					<td>Facture</td>
 					<td>{{.Label}}</td>
 					<td><small>
@@ -218,7 +218,7 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 	// Download the invoice PDF. Example:
 	//  GET /dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
 	//  GET /dl/contract/660d79500178f21ab3ffc357/contract.pdf
-	//                                 <hash_file>              <filename>
+	//                   <hash_file>              <filename>
 	mux.HandleFunc("/dl/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

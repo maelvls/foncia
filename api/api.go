@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -16,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cloudmailin/cloudmailin-go"
@@ -618,11 +620,7 @@ func DoGraphQL[T any](client *http.Client, url, query string, variables map[stri
 	if err != nil {
 		return fmt.Errorf("error marshaling request body: %w", err)
 	}
-	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(reqBody))
-	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
-	}
-	httpResp, err := Do(client, httpReq)
+	httpResp, err := Do(client, http.MethodPost, url, reqBody)
 	if err != nil {
 		return fmt.Errorf("error while querying: %w", err)
 	}
@@ -882,7 +880,7 @@ func GetInvoiceURL(client *http.Client, invoiceID string) (filename, fileURL str
 	return filename, getInvoiceURLResp.Data.InvoiceURL, nil
 }
 
-func GetDocumentURL(client *http.Client, hash string) (filename, fileURL string, _ error) {
+func GetDocumentURL(client *http.Client, hash db.HashFile) (filename, fileURL string, _ error) {
 	const getDocumentURLQuery = `query getDocumentURL($hash: String!) {documentURL(hash: $hash)}`
 	var getDocumentURLResp struct {
 		Data struct {
@@ -1504,12 +1502,7 @@ func GetBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 func Download(client *http.Client, fileURL string, filePath string) error {
 	// No need to use the authenticated client here since the URL is
 	// authenticated using one of the query parameters.
-	req, err := http.NewRequest(http.MethodGet, fileURL, nil)
-	if err != nil {
-		return fmt.Errorf("while creating request: %v", err)
-	}
-
-	resp, err := Do(client, req)
+	resp, err := Do(client, http.MethodGet, fileURL, nil)
 	if err != nil {
 		return fmt.Errorf("while downloading invoice: %v", err)
 	}
@@ -1710,20 +1703,38 @@ func GetAccountDocumentsAPI(client *http.Client, accountUUID, documentCategory, 
 //
 //	{"message":"Forbidden"}
 //
+// Also, in some instances, it returns an error with `peer closed connection`.
+//
 // I suspect that the server is rate-limiting me. This func is meant to wrap
 // client.Do calls and retry them if they fail with a 403.
-func Do(client *http.Client, req *http.Request) (*http.Response, error) {
+func Do(client *http.Client, method string, url string, body []byte) (*http.Response, error) {
+	b := bytes.NewReader(body)
 	for i := 0; i < 3; i++ {
-		resp, err := client.Do(req)
+		_, err := b.Seek(0, 0)
 		if err != nil {
-			return nil, fmt.Errorf("while doing request: %w", err)
+			return nil, fmt.Errorf("while seeking body: %w", err)
 		}
-		if resp.StatusCode == http.StatusForbidden {
-			logutil.Debugf("received 403, suspecting rate-limiting, retrying...")
+		req, err := http.NewRequest(method, url, b)
+		if err != nil {
+			return nil, fmt.Errorf("while creating request: %w", err)
+		}
+
+		resp, err := client.Do(req)
+		switch {
+		case errors.Is(err, syscall.ECONNRESET):
+			logutil.Infof("received connection reset, suspecting rate-limiting, retrying...")
 			resp.Body.Close()
-			time.Sleep(1 * time.Second)
+			time.Sleep(10 * time.Second)
+			continue
+		case err != nil:
+			return nil, fmt.Errorf("while doing request: %w", err)
+		case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusBadGateway:
+			logutil.Infof("received %d, suspecting rate-limiting, retrying...", resp.StatusCode)
+			resp.Body.Close()
+			time.Sleep(10 * time.Second)
 			continue
 		}
+
 		return resp, nil
 	}
 	return nil, fmt.Errorf("received 403 three times in a row, giving up")

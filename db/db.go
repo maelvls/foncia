@@ -356,7 +356,7 @@ func UpsertSuppliersToDB(ctx context.Context, db *sql.DB, suppliers []SupplierDB
 		req := "INSERT INTO suppliers (id, name, activity) VALUES (?, ?, ?);"
 		_, err := tx.ExecContext(ctx, req, s.ID, s.Name, s.Activity)
 		if err != nil {
-			return fmt.Errorf("while inserting into suppliers: %v", err)
+			return fmt.Errorf("db: while inserting supplier %q: %v", s.ID, err)
 		}
 		logutil.Debugf("db: added supplier %q: %+v", s.ID, s)
 	}
@@ -549,7 +549,7 @@ func (a Amount) String() string {
 //	    "isFromPreviousPeriod": false
 //	}
 type ExpenseDocumentDB struct {
-	InvoiceID string    // Sometimes set. Not sure what it is for. E.g.: "64850e805e5793033297f476".
+	InvoiceID string    // DO NOT USE. Use HashFile to identify document. HashFile is always set when InvoiceID is set, but the reverse isn't true. E.g.: "64850e805e5793033297f476".
 	Label     string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
 	Amount    Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
 	Date      time.Time // May not be unique. Example: "2024-07-01T21:59:59.000Z".
@@ -562,8 +562,8 @@ type ExpenseDocumentID string
 // Foncia's API doesn't return an ID for the expenses returned by
 // getBuildingAccountingCurrent. Thus, I have to create my own ID. This isn't
 // ideal since some expenses have the same tuple (invoiceId, label, hashFile,
-// date, amount). The closest items I have found can be separated thanks
-// to their date:
+// date, amount). The closest items I have found can be separated thanks to
+// their date:
 //
 //	{
 //	  "invoiceId": null,
@@ -582,13 +582,70 @@ type ExpenseDocumentID string
 //	  "isFromPreviousPeriod": true,
 //	}
 //
+// Sometimes, there is a hash file but no invoice ID:
+//
+//	{
+//	  "invoiceId": null,
+//	  "piece": {
+//	    "hashFile": "678f833860313bc2ff80e5b4",
+//	    "__typename": "Document"
+//	  },
+//	  "label": "Honoraires Forfaitaires du 01/01/2025 au 31/01/2025",
+//	  "date": "2025-01-21T11:21:24.342Z",
+//	  "amount": {
+//	    "value": 56480,
+//	    "currency": "EUR",
+//	    "__typename": "Debit"
+//	  },
+//	  "isFromPreviousPeriod": false,
+//	}
+//
+// But I have never found a case where the invoice ID is set but not the hash
+// file. Thus, I won't be using the invoice to identify the expenses; I will use
+// the hashfile if it exists, and (label, date, amount) otherwise. Note that the
+// hash file may appear later on, so the item should be updated in the database
+// when the hash file starts appearing for a given (label, date, amount).
+//
 // What's weird is that getBuildingAccountingRGDD does return an ID for the
 // expenses...
 //
 // Note that we may end up with duplicate expenses in the database when
 // upserting, but that's a risk I'm willing to take.
-func (e ExpenseDocumentDB) ID() ExpenseDocumentID {
-	return ExpenseDocumentID(fmt.Sprintf("%s-%s-%s-%s-%d", e.InvoiceID, e.Label, e.HashFile, e.Date.Format(time.RFC3339Nano), e.Amount))
+type ExpenseDocumentsIndex struct {
+	Elements          []ExpenseDocumentDB
+	ByHashFile        map[HashFile]int
+	ByLabelDateAmount map[string]int
+}
+
+func NewExpenseDocumentsIndex(expenses []ExpenseDocumentDB) ExpenseDocumentsIndex {
+	index := ExpenseDocumentsIndex{
+		Elements:          expenses,
+		ByHashFile:        make(map[HashFile]int),
+		ByLabelDateAmount: make(map[string]int),
+	}
+	for i, e := range expenses {
+		index.ByHashFile[e.HashFile] = i
+		index.ByLabelDateAmount[fmt.Sprintf("%s-%s-%d", e.Label, e.Date.Format(time.RFC3339Nano), e.Amount)] = i
+	}
+	return index
+}
+
+// Match returns a pointer to the original slice of expenses so that you can
+// modify the original slice if you want to.
+func (idx ExpenseDocumentsIndex) Match(partial ExpenseDocumentDB) (ExpenseDocumentDB, bool) {
+	if partial.HashFile != "" {
+		i, ok := idx.ByHashFile[partial.HashFile]
+		if ok {
+			return idx.Elements[i], true
+		}
+	}
+
+	i, ok := idx.ByLabelDateAmount[fmt.Sprintf("%s-%s-%d", partial.Label, partial.Date.Format(time.RFC3339Nano), partial.Amount)]
+	if ok {
+		return idx.Elements[i], true
+	}
+
+	return ExpenseDocumentDB{}, false
 }
 
 func (a ExpenseDocumentDB) Equal(b ExpenseDocumentDB) bool {
@@ -598,6 +655,14 @@ func (a ExpenseDocumentDB) Equal(b ExpenseDocumentDB) bool {
 		a.Date.Equal(b.Date) &&
 		a.FilePath == b.FilePath &&
 		a.HashFile == b.HashFile
+}
+
+func Merge(oldFromDB, newFromAPI ExpenseDocumentDB) ExpenseDocumentDB {
+	// Everything from the API is used except for the file path, since the file
+	// path is only stored in DB.
+	merged := newFromAPI
+	merged.FilePath = oldFromDB.FilePath
+	return merged
 }
 
 func (e ExpenseDocumentDB) Filename() string {

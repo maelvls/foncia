@@ -27,6 +27,23 @@ func SupplierAPIToDB(s api.SupplierAPI) db.SupplierDB {
 	}
 }
 
+func ExtractSuppliersFromContracts(contracts []api.SupplierContractAPI) []db.SupplierDB {
+	// There might be multiple contracts with the same supplier, so we need to
+	// de-duplicate.
+	exists := make(map[string]struct{})
+
+	var suppliers []db.SupplierDB
+	for _, c := range contracts {
+		_, already := exists[c.Supplier.ID]
+		if already {
+			continue
+		}
+		exists[c.Supplier.ID] = struct{}{}
+		suppliers = append(suppliers, SupplierAPIToDB(c.Supplier))
+	}
+	return suppliers
+}
+
 // WARNING: the `FilePath` field is not set by this function. You need to set it
 // manually afterwards.
 func ExpenseDocumentAPIToDB(e api.ExpenseDocumentAPI) db.ExpenseDocumentDB {

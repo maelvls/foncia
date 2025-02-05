@@ -48,8 +48,6 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql
 	i := 0
 	err = DoInBatches(batchSize, newMissions, func(batchMissions []db.MissionDB) error {
 		i++
-		logutil.Debugf("batch %d", i)
-
 		var batchWorkOrders []db.WorkOrderDB
 
 		// Let's update each mission with its work orders.
@@ -131,82 +129,77 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		return nil, fmt.Errorf("while getting existing expenses: %v", err)
 	}
 
-	mapExpensesInDB := make(map[db.ExpenseDocumentID]db.ExpenseDocumentDB) // expense.ID() -> expense
-	for _, item := range expensesInDB {
-		mapExpensesInDB[item.ID()] = item
-	}
+	expensesInDBIndex := db.NewExpenseDocumentsIndex(expensesInDB)
 
 	var newExpensesDB []db.ExpenseDocumentDB
 	// Save the invoice PDFs to disk. By "live", I mean that it's the expenses
 	// that were fetched from the API.
 	err = DoInBatches(1, expensesLive, func(liveExpenses []db.ExpenseDocumentDB) error {
-		for i, e := range liveExpenses {
-			// I noticed that certain expenses have an invoiceID but no PDF
-			// document attached, and that appears to be the case when the
-			// hashFile is empty. So I skip downloading when there is no
-			// invoiceID or when the hashFile is empty.
-			if e.InvoiceID == "" || e.HashFile == "" {
+		for i := range liveExpenses {
+			e := &liveExpenses[i]
+
+			if eDB, found := expensesInDBIndex.Match(*e); found {
+				*e = db.Merge(eDB, *e)
+			}
+
+			// The PDF URL can either be fetched using the invoice ID or the
+			// hash file.
+			if e.HashFile == "" {
 				continue
 			}
 
-			// No need to download if it is already present on disk.
-			eDB, found := mapExpensesInDB[e.ID()]
-			if found && fileExists(eDB.FilePath) {
+			if fileExists(e.FilePath) {
 				continue
-			}
-			if !found {
-				logutil.Debugf("expense %s not found in DB", e.ID())
-			}
-			if found && !fileExists(eDB.FilePath) {
-				logutil.Debugf("file %q not found, downloading invoice %q", eDB.FilePath, e.InvoiceID)
+			} else {
+				logutil.Debugf("file %q not found, downloading for '%s' (%s, %d)", e.FilePath, e.Label, e.Date, e.Amount)
 			}
 
 			// I found that the graphql query 'getInvoiceURL' returns an empty
 			// URL if the invoiceID exists but the hashFile is empty.
 			if e.HashFile == "" {
-				logutil.Infof("no hash file found for expense %s, skipping download", e.ID())
+				logutil.Infof("no hash file found for expense '%s' (%s, %d), skipping download", e.Label, e.Date, e.Amount)
 				continue
 			}
 
-			filename, invoiceURL, err := api.GetInvoiceURL(client, e.InvoiceID)
+			filename, fileURL, err := api.GetDocumentURL(client, e.HashFile)
 			if err != nil {
 				return fmt.Errorf("while getting invoice URL: %v", err)
 			}
-			if invoiceURL == "" {
-				logutil.Infof("no invoice URL found for invoice ID %q, skipping download. Expense: %+v", e.InvoiceID, e)
+			if fileURL == "" {
+				logutil.Infof("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
 				continue
 			}
 			filePath := path.Join(invoicesDir, filename)
+			e.FilePath = filePath
+
 			if fileExists(filePath) {
-				continue
+				logutil.Debugf("file %q already exists, skipping download", filePath)
 			}
 
-			err = api.Download(downloadClient, invoiceURL, filePath)
+			err = api.Download(downloadClient, fileURL, filePath)
 			if err != nil {
-				return fmt.Errorf("while downloading invoice for expense %s: %v", invoiceURL, err)
+				return fmt.Errorf("while downloading invoice for expense %s: %v", fileURL, err)
 			}
-
-			liveExpenses[i].FilePath = filePath
 		}
 
 		var newExpenses, changedExpences []db.ExpenseDocumentDB
 		for _, expLive := range liveExpenses {
-			expDB, found := mapExpensesInDB[expLive.ID()]
+			expDB, found := expensesInDBIndex.Match(expLive)
 			if !found {
 				logutil.Debugf("found new expense %s (%s)", expLive.Label, expLive.Date)
 				newExpenses = append(newExpenses, expLive)
 				continue
 			}
 
-			// Many expenses don't have an invoice PDF attached for a couple of
-			// weeks. That's why we want to update the invoice_id if we found
-			// that it changed. Note that some fields are unique to the database
-			// Expense (Filename, FilePath), that's why we don't compare them.
-			// The date and label are used as keys, so they are not compared.
+			// Many expenses don't have a PDF attached (= no HashFile) for a
+			// couple of weeks. That's why we want to update the HashFile if we
+			// found that it has changed.
 			//
-			// Note that the FilePath is the only value that can be updated,
-			// since it is the only value that does not participate to the ID()
-			// func.
+			// Due to a change in date formats in DB (from RFC3339 to
+			// RFC3339Nano), the date may also change as long as the HashFile is
+			// present.
+			//
+			// The Invoice ID may also change if it is set on the live API.
 			if !expDB.Equal(expLive) {
 				diff := cmp.Diff(expDB, expLive)
 				logutil.Debugf("found changed expense %q: %s, diff: %s", expLive.Date, expLive.Label, diff)
@@ -241,10 +234,8 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 		return fmt.Errorf("while getting suppliers: %v", err)
 	}
 
-	var suppliersLive []db.SupplierDB
-	for _, c := range supplierContractsLive {
-		suppliersLive = append(suppliersLive, SupplierAPIToDB(c.Supplier))
-	}
+	suppliersLive := ExtractSuppliersFromContracts(supplierContractsLive)
+
 	err = db.UpsertSuppliersToDB(ctx, sqlDB, suppliersLive)
 	if err != nil {
 		return fmt.Errorf("while saving suppliers: %v", err)
@@ -282,13 +273,14 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 			continue
 		}
 
-		filename, fileURL, err := api.GetDocumentURL(client, string(doc.HashFile))
+		filename, fileURL, err := api.GetDocumentURL(client, doc.HashFile)
 		if err != nil {
 			return fmt.Errorf("while getting document URL: %v", err)
 		}
 
 		filePath := path.Join(invoicesDir, filename)
 		docs[i].FilePath = filePath
+
 		if fileExists(filePath) {
 			continue
 		}
@@ -331,4 +323,33 @@ func DoInBatches[T any](batchSize int, elmts []T, do func([]T) error) error {
 	}
 
 	return nil
+}
+
+// The `Expenses` table is a bit special because it doesn't have a unique ID I
+// can use. Some items have an `hashFile` that can be used as a unique ID, so we
+// first use this. If the `hashFile` is empty, we use the rest of the fields to
+// (date, amount, label) to identify the expense.
+type Indexer[T any] struct {
+	Index map[string]T
+}
+
+func NewIndexer[T any](elmts []T, key func(T) string) Indexer[T] {
+	index := make(map[string]T)
+	for _, e := range elmts {
+		index[key(e)] = e
+	}
+	return Indexer[T]{Index: index}
+}
+
+func (i Indexer[T]) Get(key string) (T, bool) {
+	e, found := i.Index[key]
+	return e, found
+}
+
+func (i Indexer[T]) Keys() []string {
+	var keys []string
+	for k := range i.Index {
+		keys = append(keys, k)
+	}
+	return keys
 }
