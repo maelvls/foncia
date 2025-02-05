@@ -12,19 +12,6 @@ import (
 	"github.com/maelvls/foncia/logutil"
 )
 
-const lastSyncTableSQL = `
-	CREATE TABLE IF NOT EXISTS last_syncs (
-		graphql_query_name TEXT PRIMARY KEY, -- Name of the GraphQL query that was last used to sync the database.
-		last_cursor TEXT,                    -- Cursor of the last page of the last GraphQL query.
-		date TEXT                            -- Date of the last sync. RFC3339.
-	);`
-
-type lastSync struct {
-	graphqlQueryName string
-	lastCursor       string
-	date             time.Time
-}
-
 const missionsTableSQL = `
 	CREATE TABLE IF NOT EXISTS missions (
 		id TEXT UNIQUE,
@@ -84,11 +71,7 @@ const expensesTableSQL = `
 	);`
 
 func InitSchemaDB(ctx context.Context, db *sql.DB) error {
-	_, err := db.ExecContext(ctx, lastSyncTableSQL)
-	if err != nil {
-		return fmt.Errorf("failed to create table 'last_sync': %w", err)
-	}
-	_, err = db.ExecContext(ctx, missionsTableSQL)
+	_, err := db.ExecContext(ctx, missionsTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create table 'missions': %w", err)
 	}
