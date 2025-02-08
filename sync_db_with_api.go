@@ -196,7 +196,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 				filename, fileURL, err = api.GetDocumentURL(client, e.HashFile)
 				switch {
 				case errors.Is(err, api.ErrEmptyURL):
-					logutil.Infof("no document URL found for hash file '%s', skipping download. Expense: %+v", e.HashFile, e)
+					logutil.Debugf("no document URL found for hash file '%s', skipping download. Expense: %+v", e.HashFile, e)
 					continue
 				case err != nil:
 					return fmt.Errorf("while getting document URL from hash file %s: %w", e.HashFile, err)
@@ -207,7 +207,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 				filename, fileURL, err = api.GetInvoiceURL(client, e.InvoiceID)
 				switch {
 				case errors.Is(err, api.ErrEmptyURL):
-					logutil.Infof("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
+					logutil.Debugf("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
 					continue
 				case err != nil:
 					return fmt.Errorf("while getting invoice URL from invoice ID %v: %w", e.InvoiceID, err)
