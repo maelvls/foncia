@@ -55,6 +55,23 @@ func ExpenseDocumentAPIToDB(e api.ExpenseDocumentAPI, src db.Source) db.ExpenseD
 		HashFile:  e.HashFile,
 		FilePath:  "", // Remember to set this later on.
 		Source:    src,
+		AccountingKey: db.AccountingKey{
+			Allocation:  e.AccountingAllocation,
+			ExpenseType: e.AccountingExpenseType,
+		},
+	}
+}
+
+// WARNING: the `FilePath` field is not set by this function. You need to set it
+// manually afterwards.
+func AccountDocumentAPIToDB(a api.AccountDocumentAPI) db.AccountDocumentDB {
+	return db.AccountDocumentDB{
+		ID:        a.ID,
+		HashFile:  a.HashFile,
+		FilePath:  "", // Remember to set this later on.
+		MimeType:  a.MimeType,
+		Category:  a.Category,
+		CreatedAt: a.CreatedAt,
 	}
 }
 

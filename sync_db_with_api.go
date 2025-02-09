@@ -219,6 +219,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 
 			if fileExists(e.FilePath) {
 				logutil.Debugf("file %q already exists, skipping download", e.FilePath)
+				continue
 			}
 
 			err = api.Download(downloadClient, fileURL, e.FilePath)
@@ -299,7 +300,10 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 	if err != nil {
 		return fmt.Errorf("while getting existing documents: %v", err)
 	}
-	docsToBeAdded, docsToBeUpdated, _ := db.MergeSupplierContractDocsDB(docsInDB, docsLive)
+	docsToBeAdded, docsToBeUpdated, deleted := db.MergeSupplierContractDocsDB(docsInDB, docsLive)
+	if len(deleted) > 0 {
+		logutil.Errorf("found that %d supplier documents were deleted from the API, not deleting them", len(deleted))
+	}
 
 	// Since we use upsert, let's combine the two slices.
 	docs := append(docsToBeAdded, docsToBeUpdated...)
@@ -336,9 +340,76 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 		}
 	}
 
-	err = db.UpsertDocumentsWithDB(ctx, sqlDB, docs)
+	err = db.UpsertContractDocumentsWithDB(ctx, sqlDB, docs)
 	if err != nil {
 		return fmt.Errorf("while saving documents: %v", err)
+	}
+
+	return nil
+}
+
+func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid, invoicesDir string) error {
+	// Unauthenticated client just used for downloading files from AWS.
+	downloadClient := &http.Client{}
+	api.EnableDebugCurlLogs(downloadClient)
+
+	accountDocumentsLive, err := api.GetAccountDocuments(client, uuid, db.DocumentCategoryReportVisit)
+	if err != nil {
+		return fmt.Errorf("while getting account documents: %v", err)
+	}
+
+	var docsLive []db.AccountDocumentDB
+	for _, d := range accountDocumentsLive {
+		docsLive = append(docsLive, AccountDocumentAPIToDB(d))
+	}
+
+	docsInDB, err := db.GetAccountDocumentsDB(ctx, sqlDB)
+	if err != nil {
+		return fmt.Errorf("while getting existing documents: %v", err)
+	}
+	docsToBeAdded, docsToBeUpdated, deleted := db.MergeAccountDocumenntsDB(docsInDB, docsLive)
+	if len(deleted) > 0 {
+		logutil.Errorf("found that %d account documents were deleted from the API, not deleting them", len(deleted))
+	}
+
+	// Since we use upsert, let's combine the two slices.
+	docs := append(docsToBeAdded, docsToBeUpdated...)
+
+	// Let's set the FilePath for each document.
+	for i, doc := range docs {
+		// No need to download if it is already present on disk.
+		if fileExists(doc.FilePath) {
+			continue
+		}
+
+		// I found that the graphql query 'getDocumentURL' returns an empty URL
+		// if the hashFile is empty.
+		if doc.HashFile == "" {
+			logutil.Infof("no hash file found for document %s, skipping download", doc.ID)
+			continue
+		}
+
+		filename, fileURL, err := api.GetDocumentURL(client, doc.HashFile)
+		if err != nil {
+			return fmt.Errorf("while getting document URL: %v", err)
+		}
+
+		filePath := path.Join(invoicesDir, filename)
+		docs[i].FilePath = filePath
+
+		if fileExists(filePath) {
+			continue
+		}
+
+		err = api.Download(downloadClient, fileURL, filePath)
+		if err != nil {
+			return fmt.Errorf("while downloading document: %v", err)
+		}
+	}
+
+	err = db.UpsertAccountDocumentsWithDB(ctx, sqlDB, docs)
+	if err != nil {
+		return fmt.Errorf("while saving account documents: %v", err)
 	}
 
 	return nil

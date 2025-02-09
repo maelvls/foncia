@@ -17,8 +17,9 @@ import (
 )
 
 type MissionOrExpense struct {
-	Mission *db.MissionDB
-	Expense *db.ExpenseDocumentDB
+	Mission         *db.MissionDB
+	Expense         *db.ExpenseDocumentDB
+	AccountDocument *db.AccountDocumentDB
 }
 
 type tmlpData struct {
@@ -95,7 +96,7 @@ var tmpl = template.Must(template.New("base").Parse(`
 				{{with .Mission}}
 				<tr id="{{ .ID }}">
 					<td><a href="{{$.BasePath}}#{{ .ID }}">{{.StartedAt.Format "02 Jan 2006"}}</a></td>
-					<td>{{ .Kind }} {{ .Number }}</br><small>{{ .Status }}</small></td>
+					<td>{{ .KindFrench }} </br><small>{{ .StatusFrench }}</small></td>
 					<td>{{.Label}}</td>
 					<td><small>{{.Description}}</small></td>
 					<td>
@@ -103,11 +104,11 @@ var tmpl = template.Must(template.New("base").Parse(`
 							{{range .WorkOrders}}
 								{{.Number}}
 								{{.Label}}
-								{{.RepairDateStart.Format "02/01/2006"}}–{{.RepairDateEnd.Format "02/01/2006"}}
+								{{.RepairDateEnd.Format "02/01/2006"}}
 								{{.Supplier.Name}}
 								{{.Supplier.Activity}}</br>
 								{{range .Supplier.Documents}}
-									(<small><a href="{{$.BasePath}}/dl/contract/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small>)
+									(<small><a href="{{$.BasePath}}/dl/contract/{{.HashFile}}/{{.FilePath}}">{{.FilePath}}</a></small>)
 								{{end}}
 							{{end}}
 						</small>
@@ -119,7 +120,13 @@ var tmpl = template.Must(template.New("base").Parse(`
 					<td><a href="{{$.BasePath}}#{{ or .HashFile .InvoiceID }}">{{.Date.Format "02 Jan 2006"}}</a></td>
 					<td>Facture
 						{{if eq .Source "repairs"}}
+							</br>
 							<small>(compte travaux)</small>
+						{{end}}
+						{{if .AccountingKey}}
+							</br>
+							<small><small>{{.AccountingKey.Allocation}},
+							{{.AccountingKey.ExpenseType}}</small></small>
 						{{end}}
 					</td>
 					<td>{{.Label}}</td>
@@ -138,6 +145,19 @@ var tmpl = template.Must(template.New("base").Parse(`
 						<td><small>PDF en attente de téléchargement</small></td>
 					{{else}}
 						<td><small>Pas de PDF</small></td>
+					{{end}}
+				</tr>
+				{{end}}
+				{{with .AccountDocument}}
+				<tr id="{{.ID}}">
+					<td><a href="{{$.BasePath}}#{{.ID}}">{{.CreatedAt.Format "02 Jan 2006"}}</a></td>
+					<td>Document</td>
+					<td>{{.CategoryFrench}}</td>
+					<td><small>{{.MimeType}}</small></td>
+					{{if .FilePath}}
+						<td><small><a href="{{$.BasePath}}/dl/doc/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
+					{{else}}
+						<td><small>PDF en attente de téléchargement</small></td>
 					{{end}}
 				</tr>
 				{{end}}
@@ -239,6 +259,10 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 	//  GET /dl/invoiceid/660d79500178f21ab3ffc357/invoice.pdf
 	//                    <----------------------> <---------->
 	//                          <invoice_id>        <filename>
+	//
+	//  GET /dl/doc/660d79500178f21ab3ffc357/invoice.pdf
+	//              <----------------------> <---------->
+	//              <account_document's id>    <filename>
 	mux.HandleFunc("/dl/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -262,25 +286,33 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 
 		switch typ {
 		case "invoice":
-			expense, err := db.GetExpenseByHashFileDB(context.Background(), sqlDB, hashFile)
-			if err != nil {
+			expenses, err := db.GetExpensesByHashFileDB(context.Background(), sqlDB, hashFile)
+			if err != nil || len(expenses) == 0 {
 				logutil.Errorf("while getting expense by hash file: %v", err)
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			http.ServeFile(w, r, expense.FilePath)
+			http.ServeFile(w, r, expenses[0].FilePath)
 		case "invoiceid":
-			expense, err := db.GetExpenseByInvoiceID(context.Background(), sqlDB, hashFile)
-			if err != nil {
+			expenses, err := db.GetExpensesByInvoiceID(context.Background(), sqlDB, hashFile)
+			if err != nil || expenses == nil {
 				logutil.Errorf("while getting expense by invoice ID: %v", err)
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			http.ServeFile(w, r, expense.FilePath)
+			http.ServeFile(w, r, expenses[0].FilePath)
 		case "contract":
 			doc, err := db.GetSupplierContractByHashFileDB(context.Background(), sqlDB, hashFile)
 			if err != nil {
 				logutil.Errorf("while getting document by hash file: %v", err)
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			http.ServeFile(w, r, doc.FilePath)
+		case "doc":
+			doc, err := db.GetAccountDocumentByHashFileDB(context.Background(), sqlDB, hashFile)
+			if err != nil {
+				logutil.Errorf("while getting account document by hash file: %v", err)
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
@@ -301,10 +333,7 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 			logutil.Errorf("while listing interventions: %v", err)
 
 			w.WriteHeader(http.StatusInternalServerError)
-			tmlpErr.Execute(w, tmlpErrData{
-				Error:   fmt.Sprintf("Error while listing interventions: %s", err),
-				Version: version,
-			})
+			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Error while listing interventions: %s", err), Version: version})
 
 			return
 		}
@@ -313,10 +342,15 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 		if err != nil {
 			logutil.Errorf("while listing expenses: %v", err)
 			w.WriteHeader(http.StatusInternalServerError)
-			tmlpErr.Execute(w, tmlpErrData{
-				Error:   fmt.Sprintf("Error while listing expenses: %s", err),
-				Version: version,
-			})
+			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Error while listing expenses: %s", err), Version: version})
+			return
+		}
+
+		accDocs, err := db.GetAccountDocumentsDB(context.Background(), sqlDB)
+		if err != nil {
+			logutil.Errorf("while listing account documents: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Error while listing account documents: %s", err), Version: version})
 			return
 		}
 
@@ -330,6 +364,10 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 			e := e
 			combined = append(combined, MissionOrExpense{Expense: &e})
 		}
+		for _, a := range accDocs {
+			a := a
+			combined = append(combined, MissionOrExpense{AccountDocument: &a})
+		}
 
 		sort.Slice(combined, func(i, j int) bool {
 			di, dj := time.Time{}, time.Time{}
@@ -339,11 +377,18 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 			if combined[i].Expense != nil {
 				di = combined[i].Expense.Date
 			}
+			if combined[i].AccountDocument != nil {
+				di = combined[i].AccountDocument.CreatedAt
+			}
+
 			if combined[j].Mission != nil {
 				dj = combined[j].Mission.StartedAt
 			}
 			if combined[j].Expense != nil {
 				dj = combined[j].Expense.Date
+			}
+			if combined[j].AccountDocument != nil {
+				dj = combined[j].AccountDocument.CreatedAt
 			}
 			return di.After(dj)
 		})
@@ -370,7 +415,6 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 		)
 		if err != nil {
 			logutil.Errorf("executing template: %v", err)
-			http.Error(w, "error", http.StatusInternalServerError)
 			return
 		}
 	}))

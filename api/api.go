@@ -851,6 +851,9 @@ type ExpenseDocumentAPI struct {
 	Amount    db.Amount   // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
 	Date      time.Time   // May not be unique. Example: "2024-03-01T00:00:00.000Z". Use time.RFC3339Nano to marshall.
 	HashFile  db.HashFile // Only set when a document is attached. Example: "66fbf2a9294cd8ed17d7ce9a"
+
+	AccountingAllocation  string // Example: "CHARGES GENERALES"
+	AccountingExpenseType string // Example: "CONTRAT D'ENTRETIEN"
 }
 
 var ErrEmptyURL = fmt.Errorf("empty URL")
@@ -1160,11 +1163,13 @@ func GetBuildingAccountingCurrent(client *http.Client, accountUUID string) ([]Ex
 					}
 				}
 				expenses = append(expenses, ExpenseDocumentAPI{
-					HashFile:  db.HashFile(expense.Piece.HashFile),
-					InvoiceID: expense.InvoiceID,
-					Label:     expense.Label,
-					Date:      date,
-					Amount:    db.Amount(amount),
+					HashFile:              db.HashFile(expense.Piece.HashFile),
+					InvoiceID:             expense.InvoiceID,
+					Label:                 expense.Label,
+					Date:                  date,
+					Amount:                db.Amount(amount),
+					AccountingAllocation:  allocation.Name,
+					AccountingExpenseType: expenseType.Name,
 				})
 			}
 		}
@@ -1466,11 +1471,13 @@ func GetBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 					}
 				}
 				expenses = append(expenses, ExpenseDocumentAPI{
-					InvoiceID: expense.InvoiceID, // May be empty.
-					HashFile:  db.HashFile(expense.Piece.HashFile),
-					Label:     expense.Label,
-					Date:      date,
-					Amount:    db.Amount(expense.ToAllocate.Value),
+					InvoiceID:             expense.InvoiceID, // May be empty.
+					HashFile:              db.HashFile(expense.Piece.HashFile),
+					Label:                 expense.Label,
+					Date:                  date,
+					Amount:                db.Amount(expense.ToAllocate.Value),
+					AccountingAllocation:  allocation.Name,
+					AccountingExpenseType: expenseType.Name,
 				})
 			}
 		}
@@ -1554,22 +1561,11 @@ type AccountDocumentAPI struct {
 	HashFile         db.HashFile
 	MimeType         string
 	OriginalFilename string
-	Category         string // Example: "reportVisit"
+	Category         db.DocumentCategory // Example: "reportVisit"
 	CreatedAt        time.Time
 }
 
-//	{
-//	 "query": "query getAccountDocuments($accountUuid: EncodedID!, $first: Int, $after: Cursor, $documentCategory: MyFonciaFileCategoryEnum!, $originalFilename: String, $subCategories: [String!], $fromDate: String, $toDate: String, $missionGeneralAssemblyIds: [String!]) {\n  account(uuid: $accountUuid) {\n    uuid\n    documents(\n      documentCategory: $documentCategory\n      first: $first\n      after: $after\n      originalFilename: $originalFilename\n      subCategories: $subCategories\n      fromDate: $fromDate\n      toDate: $toDate\n      missionGeneralAssemblyIds: $missionGeneralAssemblyIds\n    ) {\n      totalCount\n      pageInfo {\n        ...pageInfo\n        __typename\n      }\n      edges {\n        node {\n          ...document\n          __typename\n        }\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}\n\nfragment pageInfo on PageInfo {\n  startCursor\n  endCursor\n  hasPreviousPage\n  hasNextPage\n  pageNumber\n  itemsPerPage\n  totalDisplayPages\n  totalPages\n  __typename\n}\n\nfragment document on Document {\n  id\n  hashFile\n  mimeType\n  originalFilename\n  category\n  createdAt\n  __typename\n}",
-//	 "variables": {
-//	   "accountUuid": "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9",
-//	   "documentCategory": "reportVisit",
-//	   "originalFilename": "",
-//	   "subCategories": [],
-//	   "after": "eyJwYWdlTnVtYmVyIjoyLCJpdGVtc1BlclBhZ2UiOjEwfQ"
-//	 },
-//	 "operationName": "getAccountDocuments"
-//	}
-func GetAccountDocumentsAPI(client *http.Client, accountUUID, documentCategory, after string) ([]AccountDocumentAPI, error) {
+func GetAccountDocuments(client *http.Client, accountUUID string, category db.DocumentCategory) ([]AccountDocumentAPI, error) {
 	const getAccountDocumentsQuery = `
 		query getAccountDocuments($accountUuid: EncodedID!, $first: Int, $after: Cursor, $documentCategory: MyFonciaFileCategoryEnum!, $originalFilename: String, $subCategories: [String!], $fromDate: String, $toDate: String, $missionGeneralAssemblyIds: [String!]) {
 		  account(uuid: $accountUuid) {
@@ -1638,12 +1634,13 @@ func GetAccountDocumentsAPI(client *http.Client, accountUUID, documentCategory, 
 		} `json:"data"`
 	}
 
+	var cursor *string
 	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getAccountDocumentsQuery, map[string]interface{}{
 		"accountUuid":      accountUUID,
-		"documentCategory": documentCategory,
 		"originalFilename": "",
 		"subCategories":    []string{},
-		"after":            after,
+		"documentCategory": category,
+		"after":            cursor,
 	}, &getAccountDocumentsResp)
 	if err != nil {
 		return nil, fmt.Errorf("error while querying getAccountDocumentsResp: %w", err)
@@ -1651,7 +1648,6 @@ func GetAccountDocumentsAPI(client *http.Client, accountUUID, documentCategory, 
 
 	var docs []AccountDocumentAPI
 	for _, edge := range getAccountDocumentsResp.Data.Account.Documents.Edges {
-
 		createdAt, err := time.Parse(time.RFC3339Nano, edge.Node.CreatedAt)
 		if err != nil {
 			logutil.Debugf("error parsing time: %v", err)
@@ -1663,7 +1659,7 @@ func GetAccountDocumentsAPI(client *http.Client, accountUUID, documentCategory, 
 			HashFile:         db.HashFile(edge.Node.HashFile),
 			MimeType:         edge.Node.MimeType,
 			OriginalFilename: edge.Node.OriginalFilename,
-			Category:         edge.Node.Category,
+			Category:         db.DocumentCategory(edge.Node.Category),
 			CreatedAt:        createdAt,
 		})
 	}
@@ -1793,7 +1789,7 @@ func GetCouncilProjectDocumentsAPI(client *http.Client, accountUUID, after strin
 			HashFile:         db.HashFile(edge.Node.HashFile),
 			MimeType:         edge.Node.MimeType,
 			OriginalFilename: edge.Node.OriginalFilename,
-			Category:         edge.Node.Category,
+			Category:         db.DocumentCategory(edge.Node.Category),
 			CreatedAt:        createdAt,
 		})
 	}
@@ -2025,11 +2021,13 @@ func GetRepairBudgetDetailsAPI(client *http.Client, accountUUID, budgetID string
 					}
 				}
 				expenses = append(expenses, ExpenseDocumentAPI{
-					InvoiceID: expense.InvoiceID, // May be empty.
-					HashFile:  db.HashFile(expense.Piece.HashFile),
-					Label:     expense.Label,
-					Date:      date,
-					Amount:    db.Amount(expense.ToAllocate.Value),
+					InvoiceID:             expense.InvoiceID, // May be empty.
+					HashFile:              db.HashFile(expense.Piece.HashFile),
+					Label:                 expense.Label,
+					Date:                  date,
+					Amount:                db.Amount(expense.ToAllocate.Value),
+					AccountingAllocation:  allocation.Name,
+					AccountingExpenseType: expenseType.Name,
 				})
 			}
 		}
@@ -2056,7 +2054,7 @@ func GetRepairBudgetDetailsAPI(client *http.Client, accountUUID, budgetID string
 // client.Do calls and retry them if they fail with a 403.
 func Do(client *http.Client, method string, url string, body []byte) (*http.Response, error) {
 	b := bytes.NewReader(body)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 10; i++ {
 		_, err := b.Seek(0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("while seeking body: %w", err)
@@ -2071,18 +2069,18 @@ func Do(client *http.Client, method string, url string, body []byte) (*http.Resp
 		case errors.Is(err, syscall.ECONNRESET):
 			logutil.Infof("received connection reset, suspecting rate-limiting, retrying...")
 			resp.Body.Close()
-			time.Sleep(10 * time.Second)
+			time.Sleep(30 * time.Second)
 			continue
 		case err != nil:
 			return nil, fmt.Errorf("while doing request: %w", err)
 		case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusBadGateway:
 			logutil.Infof("received %d, suspecting rate-limiting, retrying...", resp.StatusCode)
 			resp.Body.Close()
-			time.Sleep(10 * time.Second)
+			time.Sleep(30 * time.Second)
 			continue
 		}
 
 		return resp, nil
 	}
-	return nil, fmt.Errorf("received 403 three times in a row, giving up")
+	return nil, fmt.Errorf("retried multiple times, giving up")
 }
