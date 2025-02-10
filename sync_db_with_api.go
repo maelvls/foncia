@@ -164,7 +164,6 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	if err != nil {
 		return nil, fmt.Errorf("while getting existing expenses: %v", err)
 	}
-
 	expensesInDBIndex := db.NewExpenseDocumentsIndex(expensesInDB)
 
 	var newExpensesDB []db.ExpenseDocumentDB
@@ -173,6 +172,10 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	err = DoInBatches(1, expensesLive, func(liveExpenses []db.ExpenseDocumentDB) error {
 		for i := range liveExpenses {
 			e := &liveExpenses[i]
+
+			if e.Label == "Honoraires Forfaitaires du 10/01/2024 au 31/01/2024" {
+				logutil.Debugf("Honoraires Forfaitaires du 10/01/2024 au 31/01/2024")
+			}
 
 			if eDB, found := expensesInDBIndex.Match(*e); found {
 				*e = db.Merge(eDB, *e)
@@ -300,16 +303,20 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 	if err != nil {
 		return fmt.Errorf("while getting existing documents: %v", err)
 	}
-	docsToBeAdded, docsToBeUpdated, deleted := db.MergeSupplierContractDocsDB(docsInDB, docsLive)
-	if len(deleted) > 0 {
-		logutil.Errorf("found that %d supplier documents were deleted from the API, not deleting them", len(deleted))
+	mapDocsInDB := make(map[string]db.SupplierContractDocumentDB)
+	for i := range docsInDB {
+		mapDocsInDB[docsInDB[i].ID] = docsInDB[i]
 	}
 
-	// Since we use upsert, let's combine the two slices.
-	docs := append(docsToBeAdded, docsToBeUpdated...)
-
 	// Let's set the FilePath for each document.
-	for i, doc := range docs {
+	for i := range docsLive {
+		doc := &docsLive[i]
+
+		docDB, found := mapDocsInDB[doc.ID]
+		if found {
+			*doc = db.MergeSupplierDoc(docDB, *doc)
+		}
+
 		// No need to download if it is already present on disk.
 		if fileExists(doc.FilePath) {
 			continue
@@ -326,19 +333,25 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 		if err != nil {
 			return fmt.Errorf("while getting document URL: %v", err)
 		}
+		doc.FilePath = path.Join(invoicesDir, filename)
 
-		filePath := path.Join(invoicesDir, filename)
-		docs[i].FilePath = filePath
-
-		if fileExists(filePath) {
+		if fileExists(doc.FilePath) {
 			continue
 		}
 
-		err = api.Download(downloadClient, fileURL, filePath)
+		err = api.Download(downloadClient, fileURL, doc.FilePath)
 		if err != nil {
 			return fmt.Errorf("while downloading document: %v", err)
 		}
 	}
+
+	docsToBeAdded, docsToBeUpdated, deleted := db.MergeSupplierContractDocs(docsInDB, docsLive)
+	if len(deleted) > 0 {
+		logutil.Errorf("found that %d supplier documents were deleted from the API, not deleting them", len(deleted))
+	}
+
+	// Since we use upsert, let's combine the two slices.
+	docs := append(docsToBeAdded, docsToBeUpdated...)
 
 	err = db.UpsertContractDocumentsWithDB(ctx, sqlDB, docs)
 	if err != nil {
@@ -367,16 +380,20 @@ func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB 
 	if err != nil {
 		return fmt.Errorf("while getting existing documents: %v", err)
 	}
-	docsToBeAdded, docsToBeUpdated, deleted := db.MergeAccountDocumenntsDB(docsInDB, docsLive)
-	if len(deleted) > 0 {
-		logutil.Errorf("found that %d account documents were deleted from the API, not deleting them", len(deleted))
+	mapDocsInDB := make(map[string]db.AccountDocumentDB)
+	for i := range docsInDB {
+		mapDocsInDB[docsInDB[i].ID] = docsInDB[i]
 	}
 
-	// Since we use upsert, let's combine the two slices.
-	docs := append(docsToBeAdded, docsToBeUpdated...)
+	// Let's set the FilePath for each document. Document are edited in place.
+	for i := range docsLive {
+		doc := &docsLive[i]
 
-	// Let's set the FilePath for each document.
-	for i, doc := range docs {
+		docDB, found := mapDocsInDB[doc.ID]
+		if found {
+			*doc = db.MergeAccountDoc(docDB, *doc)
+		}
+
 		// No need to download if it is already present on disk.
 		if fileExists(doc.FilePath) {
 			continue
@@ -393,17 +410,32 @@ func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB 
 		if err != nil {
 			return fmt.Errorf("while getting document URL: %v", err)
 		}
+		doc.FilePath = path.Join(invoicesDir, filename)
 
-		filePath := path.Join(invoicesDir, filename)
-		docs[i].FilePath = filePath
-
-		if fileExists(filePath) {
+		if fileExists(doc.FilePath) {
 			continue
 		}
 
-		err = api.Download(downloadClient, fileURL, filePath)
+		err = api.Download(downloadClient, fileURL, doc.FilePath)
 		if err != nil {
 			return fmt.Errorf("while downloading document: %v", err)
+		}
+	}
+
+	docsToBeAdded, docsToBeUpdated, deleted := db.MergeAccountDocumentsDB(docsInDB, docsLive)
+	if len(deleted) > 0 {
+		logutil.Errorf("found that %d account documents were deleted from the API, not deleting them", len(deleted))
+	}
+
+	// Since we use upsert, let's combine the two slices.
+	docs := append(docsToBeAdded, docsToBeUpdated...)
+
+	// Show a diff in debug mode.
+	for _, doc := range docs {
+		docDB, found := mapDocsInDB[doc.ID]
+		if found {
+			diff := cmp.Diff(docDB, doc)
+			logutil.Debugf("diff for account document %s: %s", doc.ID, diff)
 		}
 	}
 

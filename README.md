@@ -29,10 +29,10 @@ ssh synology sh -lc bin/deploy-foncia
 KO_DOCKER_REPO=ghcr.io/maelvls/foncia KO_DEFAULTBASEIMAGE=alpine \
   ko build . --bare --tarball /tmp/out.tar --push=false --platform linux/arm64
 ssh pi docker load </tmp/out.tar
-ssh pi bash -lc foncia/deploy
+ssh pi bash -lc vls.dev/foncia/deploy
 ```
 
-with `foncia/deploy`:
+with `vls.dev/foncia/deploy`:
 
 ```bash
 docker container inspect foncia >/dev/null 2>/dev/null && docker rm -f foncia || true

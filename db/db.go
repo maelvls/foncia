@@ -289,7 +289,7 @@ func GetSupplierContractDocsDB(ctx context.Context, db *sql.DB) ([]SupplierContr
 // Documents are merged using their IDs. O(N^2) but OK because N is small. When
 // the previous value (e.g. filepath) was set the current value is empty, the
 // previous value is kept.
-func MergeSupplierContractDocsDB(previous, current []SupplierContractDocumentDB) (missing, updated, removed []SupplierContractDocumentDB) {
+func MergeSupplierContractDocs(previous, current []SupplierContractDocumentDB) (missing, updated, removed []SupplierContractDocumentDB) {
 	// Find the current documents that weren't there previously.
 	var newDocs []SupplierContractDocumentDB
 	for _, c := range current {
@@ -307,17 +307,17 @@ func MergeSupplierContractDocsDB(previous, current []SupplierContractDocumentDB)
 
 	// Find the documents that have changed.
 	var changedDocs []SupplierContractDocumentDB
-	for _, c := range current {
-		for _, p := range previous {
-			if c.ID != p.ID {
+	for _, cur := range current {
+		for _, prev := range previous {
+			if cur.ID != prev.ID {
 				continue
 			}
 
-			changed, hasChanged := MergeDoc(c, p)
+			hasChanged := EqualSupplierDocs(cur, prev)
 			if !hasChanged {
 				continue
 			}
-			changedDocs = append(changedDocs, changed)
+			changedDocs = append(changedDocs, MergeSupplierDoc(prev, cur))
 		}
 	}
 
@@ -342,7 +342,7 @@ func MergeSupplierContractDocsDB(previous, current []SupplierContractDocumentDB)
 // Documents are merged using their IDs. O(1) operation. Regarding the FilePath,
 // When the previous value was set the current value is empty, the previous
 // value is kept.
-func MergeAccountDocumenntsDB(previous, current []AccountDocumentDB) (missing, updated, removed []AccountDocumentDB) {
+func MergeAccountDocumentsDB(previous, current []AccountDocumentDB) (missing, updated, removed []AccountDocumentDB) {
 	// Find the current documents that weren't there previously.
 	var newDocs []AccountDocumentDB
 	for _, c := range current {
@@ -360,17 +360,17 @@ func MergeAccountDocumenntsDB(previous, current []AccountDocumentDB) (missing, u
 
 	// Find the documents that have changed.
 	var changedDocs []AccountDocumentDB
-	for _, c := range current {
-		for _, p := range previous {
-			if c.ID != p.ID {
+	for _, cur := range current {
+		for _, prev := range previous {
+			if cur.ID != prev.ID {
 				continue
 			}
 
-			changed, hasChanged := MergeAccountDoc(p, c)
+			hasChanged := EqualAccountDocs(prev, cur)
 			if !hasChanged {
 				continue
 			}
-			changedDocs = append(changedDocs, changed)
+			changedDocs = append(changedDocs, MergeAccountDoc(prev, cur))
 		}
 	}
 
@@ -394,38 +394,32 @@ func MergeAccountDocumenntsDB(previous, current []AccountDocumentDB) (missing, u
 
 // The FilePath needs to be carried over. That's why we need this special merge
 // function.
-func MergeAccountDoc(previous, current AccountDocumentDB) (AccountDocumentDB, bool) {
-	var merged AccountDocumentDB
+func MergeAccountDoc(previous, current AccountDocumentDB) AccountDocumentDB {
+	merged := current
+	merged.FilePath = previous.FilePath
+	return merged
+}
 
-	if current.FilePath == "" {
-		merged.FilePath = previous.FilePath
-	} else {
-		merged.FilePath = current.FilePath
-	}
-
-	merged.ID = current.ID
-	merged.Category = current.Category
-	merged.MimeType = current.MimeType
-	merged.CreatedAt = current.CreatedAt
-
-	return current, previous != merged
+func EqualAccountDocs(a, b AccountDocumentDB) bool {
+	// We ignore the file path, and compare the rest.
+	a.FilePath = ""
+	b.FilePath = ""
+	return a == b
 }
 
 // The FilePath needs to be carried over. That's why we need this special merge
 // function.
-func MergeDoc(previous, current SupplierContractDocumentDB) (SupplierContractDocumentDB, bool) {
-	var merged SupplierContractDocumentDB
+func MergeSupplierDoc(previous, current SupplierContractDocumentDB) SupplierContractDocumentDB {
+	merged := current
+	merged.FilePath = previous.FilePath
+	return merged
+}
 
-	if current.FilePath == "" {
-		merged.FilePath = previous.FilePath
-	} else {
-		merged.FilePath = current.FilePath
-	}
-
-	merged.ID = current.ID
-	merged.SupplierID = current.SupplierID
-
-	return current, previous != merged
+func EqualSupplierDocs(a, b SupplierContractDocumentDB) bool {
+	// We ignore the file path, and compare the rest.
+	a.FilePath = ""
+	b.FilePath = ""
+	return a == b
 }
 
 func GetSupplierContractByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) (SupplierContractDocumentDB, error) {
@@ -562,13 +556,8 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 		var args []interface{}
 		switch {
 		case e.HashFile != "":
-			req = "UPDATE expenses SET invoice_id = ?, label = ?, amount = ?, date = ?, file_path = ?, hash_file = ?, source = ?, accounting_allocation = ?, accounting_expense_type = ? WHERE hash_file = ? AND accounting_allocation = ? AND accounting_expense_type = ?;"
-			args = []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType}
-
-		case e.InvoiceID != "":
-			req = "UPDATE expenses SET invoice_id = ?, label = ?, amount = ?, date = ?, file_path = ?, hash_file = ?, source = ?, accounting_allocation = ?, accounting_expense_type = ? WHERE invoice_id = ? AND accounting_allocation = ? AND accounting_expense_type = ?;"
-			args = []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.InvoiceID, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType}
-
+			req = "UPDATE expenses SET invoice_id = ?, label = ?, amount = ?, date = ?, file_path = ?, hash_file = ?, source = ?, accounting_allocation = ?, accounting_expense_type = ? WHERE name = ? AND date = ? AND amount = ? AND accounting_allocation = ? AND accounting_expense_type = ? AND hash_file = ?;"
+			args = []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile}
 		default:
 			req = "UPDATE expenses SET invoice_id = ?, label = ?, amount = ?, date = ?, file_path = ?, hash_file = ?, source = ?, accounting_allocation = ?, accounting_expense_type = ? WHERE label = ? AND date = ? AND amount = ? AND accounting_allocation = ? AND accounting_expense_type = ?;"
 			args = []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType}
@@ -880,51 +869,94 @@ type ExpenseDocumentID string
 //
 //	allocations:
 //	  - name: CHARGES ASCENSEUR D
-//	    code: 601
+//	    code: "601"
 //	    expenseTypes:
 //	      - name: CONTRAT ETENDU ASCENSEUR
-//	        code: 136
+//	        code: "136"
 //	        expenses:
 //	          - invoiceId: 6615521aac44b7c09440aeaa
-//	            piece:
-//	              hashFile: 6615521a0ee3bdcd450363fa
+//	            piece: { hashFile: 6615521a0ee3bdcd450363fa }
 //	            label: TKE ENTRETIEN ASCENSEUR 2T2024
 //	            date: 2024-04-09T14:35:07.357Z
-//	            amount:
-//	              value: 41049
-//	              currency: EUR
-//	              __typename: Debit
+//	            amount: { value: 41049, currency: EUR, __typename: Debit }
 //	            isFromPreviousPeriod: true
 //	  - name: CHARGES ASCENSEUR C
-//	    code: 600
+//	    code: "600"
 //	    expenseTypes:
 //	      - name: CONTRAT ETENDU ASCENSEUR
-//	        code: 136
+//	        code: "136"
 //	        expenses:
 //	          - invoiceId: 6615521aac44b7c09440aeaa
-//	            piece:
-//	              hashFile: 6615521a0ee3bdcd450363fa
+//	            piece: { hashFile: 6615521a0ee3bdcd450363fa }
 //	            label: TKE ENTRETIEN ASCENSEUR 2T2024
 //	            date: 2024-04-09T14:35:07.357Z
-//	            amount:
-//	              value: 41048
-//	              currency: EUR
-//	              __typename: Debit
+//	            amount: { value: 41048, currency: EUR, __typename: Debit }
+//	            isFromPreviousPeriod: true
+//
+// Another problem I've seen is that some expenses have the same tuple (label,
+// date, amount). In the below example, the only way to differentiate the two
+// first expenses is to look at the hashFile:
+//
+//	allocations:
+//	  - name: "CHARGES UNITAIRES C"
+//	    code: "501"
+//	    expenseTypes:
+//	      - name: "CONTRAT EXTRACTEURS"
+//	        code: "126"
+//	        expenses:
+//	          - invoiceId: null
+//	            piece: { hashFile: 66dafe199f013b45ee991c96 }
+//	            label: ELECO
+//	            date: "2024-06-30T00:00:00.000Z"
+//	            amount: { value: 79200, currency: EUR, __typename: Debit }
+//	            isFromPreviousPeriod: true
+//	          - invoiceId: null
+//	            piece: { hashFile: 66e2b7bd424b4b0f0ab3954b }
+//	            label: ELECO
+//	            date: "2024-06-30T00:00:00.000Z"
+//	            amount: { value: 79200, currency: EUR, __typename: Debit }
+//	            isFromPreviousPeriod: true
+//	  - name: "CHARGES UNITAIRES D"
+//	    code: "502"
+//	    expenseTypes:
+//	      - name: "CONTRAT EXTRACTEURS"
+//	        code: "126"
+//	        expenses:
+//	          - invoiceId: null
+//	            piece: { hashFile: 66dafe459f013b45ee992188 }
+//	            label: ELECO
+//	            date: "2024-06-30T00:00:00.000Z"
+//	            amount: { value: 79200, currency: EUR, __typename: Debit }
+//	            isFromPreviousPeriod: true
+//	          - invoiceId: null
+//	            piece: { hashFile: 66dafd87d024fd1b510e1e37 }
+//	            label: ELECO
+//	            date: "2024-06-30T00:00:00.000Z"
+//	            amount: { value: 79200, currency: EUR, __typename: Debit }
 //	            isFromPreviousPeriod: true
 type ExpenseDocumentsIndex struct {
-	Elements          []ExpenseDocumentDB
-	ByHashFile        map[string]int
-	ByInvoiceID       map[string]int
-	ByLabelDateAmount map[string]int
+	Elements                     []ExpenseDocumentDB
+	ByLabelDateAmountKey         map[string]int
+	ByLabelDateAmountKeyHashfile map[string]int
 }
 
 func NewExpenseDocumentsIndex(expenses []ExpenseDocumentDB) ExpenseDocumentsIndex {
 	index := ExpenseDocumentsIndex{
-		Elements:          expenses,
-		ByLabelDateAmount: make(map[string]int),
+		Elements:                     expenses,
+		ByLabelDateAmountKey:         make(map[string]int),
+		ByLabelDateAmountKeyHashfile: make(map[string]int),
 	}
 	for i, e := range expenses {
-		index.ByLabelDateAmount[fmt.Sprintf("%s-%s-%d-%s", e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.String())] = i
+		if e.Label == "Honoraires Forfaitaires du 10/01/2024 au 31/01/2024" {
+			logutil.Debugf("Honoraires Forfaitaires du 10/01/2024 au 31/01/2024")
+		}
+		index.ByLabelDateAmountKey[fmt.Sprintf("%s-%s-%d-%s", e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.String())] = i
+	}
+	for i, e := range expenses {
+		if e.HashFile == "" {
+			continue
+		}
+		index.ByLabelDateAmountKeyHashfile[fmt.Sprintf("%s-%s-%d-%s-%s", e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.String(), e.HashFile)] = i
 	}
 	return index
 }
@@ -932,7 +964,17 @@ func NewExpenseDocumentsIndex(expenses []ExpenseDocumentDB) ExpenseDocumentsInde
 // Match returns a pointer to the original slice of expenses so that you can
 // modify the original slice if you want to.
 func (idx ExpenseDocumentsIndex) Match(partial ExpenseDocumentDB) (ExpenseDocumentDB, bool) {
-	i, ok := idx.ByLabelDateAmount[fmt.Sprintf("%s-%s-%d-%s", partial.Label, partial.Date.Format(time.RFC3339Nano), partial.Amount, partial.AccountingKey.String())]
+	if partial.Label == "Honoraires Forfaitaires du 10/01/2024 au 31/01/2024" {
+		logutil.Debugf("Honoraires Forfaitaires du 10/01/2024 au 31/01/2024")
+	}
+	if partial.HashFile != "" {
+		i, ok := idx.ByLabelDateAmountKeyHashfile[fmt.Sprintf("%s-%s-%d-%s-%s", partial.Label, partial.Date.Format(time.RFC3339Nano), partial.Amount, partial.AccountingKey.String(), partial.HashFile)]
+		if ok {
+			return idx.Elements[i], true
+		}
+	}
+
+	i, ok := idx.ByLabelDateAmountKey[fmt.Sprintf("%s-%s-%d-%s", partial.Label, partial.Date.Format(time.RFC3339Nano), partial.Amount, partial.AccountingKey.String())]
 	if ok {
 		return idx.Elements[i], true
 	}
@@ -941,14 +983,10 @@ func (idx ExpenseDocumentsIndex) Match(partial ExpenseDocumentDB) (ExpenseDocume
 }
 
 func (a ExpenseDocumentDB) Equal(b ExpenseDocumentDB) bool {
-	return a.InvoiceID == b.InvoiceID &&
-		a.Label == b.Label &&
-		a.Amount == b.Amount &&
-		a.Date.Equal(b.Date) &&
-		a.FilePath == b.FilePath &&
-		a.HashFile == b.HashFile &&
-		a.Source == b.Source &&
-		a.AccountingKey == b.AccountingKey
+	// We ignore the file path, and compare the rest.
+	a.FilePath = ""
+	b.FilePath = ""
+	return a == b
 }
 
 func Merge(oldFromDB, newFromAPI ExpenseDocumentDB) ExpenseDocumentDB {
@@ -1326,7 +1364,7 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 }
 
 func GetExpensesDB(ctx context.Context, db *sql.DB) ([]ExpenseDocumentDB, error) {
-	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type FROM expenses ORDER BY date DESC")
+	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type FROM expenses")
 	if err != nil {
 		return nil, fmt.Errorf("while querying database: %w", err)
 	}
