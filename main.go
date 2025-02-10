@@ -44,6 +44,7 @@ var (
 	//  go run . rm-last-expense
 	//  go run . rm-last-mission
 	syncPeriod = flag.Duration("sync-period", 10*time.Minute, "Period at which to sync with the live API.")
+	readOnly   = flag.Bool("read-only", false, "Disable synchronization with the live API.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
 )
@@ -180,69 +181,73 @@ func main() {
 			os.Exit(1)
 		}
 
-		go func() {
-			// When the database is empty, we do an initial fetch to populate
-			// it; since it most likely means that these items aren't new, we
-			// don't send Ntfy notifications.
-			var skipNotif bool
-			empty, err := db.IsEmptyDB(context.Background(), sqlDB)
-			if err != nil {
-				logutil.Errorf("while checking if database is empty: %v", err)
-				os.Exit(1)
-			}
-			if empty {
-				skipNotif = true
-			}
-
-			for {
-				logutil.Debugf("updating database by fetching from live")
-				newMissions, newExpenses, err := authFetchSave(client, sqlDB, uuid, *invoicesDir)
-				writeLastSync(err)
+		if !*readOnly {
+			go func() {
+				// When the database is empty, we do an initial fetch to populate
+				// it; since it most likely means that these items aren't new, we
+				// don't send Ntfy notifications.
+				var skipNotif bool
+				empty, err := db.IsEmptyDB(context.Background(), sqlDB)
 				if err != nil {
-					logutil.Errorf("while fetching and updating database: %v", err)
+					logutil.Errorf("while checking if database is empty: %v", err)
+					os.Exit(1)
+				}
+				if empty {
+					skipNotif = true
 				}
 
-				if len(newMissions) > 0 || len(newExpenses) > 0 {
-					logutil.Debugf("found %d new missions and %d new expenses", len(newMissions), len(newExpenses))
-				} else {
-					logutil.Debugf("no new mission and no new expense")
-				}
-				if skipNotif {
-					skipNotif = false
-					continue
-				}
-				for _, e := range newMissions {
-					logutil.Infof("new mission: %s", e.Label)
-					err := ntfy(*ntfyTopic, ntfyMsg{
-						HeaderTags:     "tools",
-						HeaderTitle:    "Nouvelle intervention",
-						Body:           missionToNtfyBody(e),
-						HeaderClick:    serveBaseURL + *serveBasePath + "#" + e.ID,
-						HeaderPriority: "default",
-					})
+				for {
+					logutil.Debugf("updating database by fetching from live")
+					newMissions, newExpenses, err := authFetchSave(client, sqlDB, uuid, *invoicesDir)
+					writeLastSync(err)
 					if err != nil {
-						logutil.Errorf("while sending notification: %v", err)
-						writeLastSync(err)
+						logutil.Errorf("while fetching and updating database: %v", err)
 					}
-				}
-				for _, e := range newExpenses {
-					logutil.Infof("new expense: %s", e.Label)
-					err := ntfy(*ntfyTopic, ntfyMsg{
-						HeaderTags:     "money",
-						HeaderTitle:    "Nouvelle facture",
-						Body:           e.Label + " (" + e.Amount.String() + ")",
-						HeaderClick:    serveBaseURL + *serveBasePath + "#" + e.InvoiceID,
-						HeaderPriority: "default",
-					})
-					if err != nil {
-						logutil.Errorf("while sending notification: %v", err)
-						writeLastSync(err)
-					}
-				}
 
-				time.Sleep(*syncPeriod)
-			}
-		}()
+					if len(newMissions) > 0 || len(newExpenses) > 0 {
+						logutil.Debugf("found %d new missions and %d new expenses", len(newMissions), len(newExpenses))
+					} else {
+						logutil.Debugf("no new mission and no new expense")
+					}
+					if skipNotif {
+						skipNotif = false
+						continue
+					}
+					for _, e := range newMissions {
+						logutil.Infof("new mission: %s", e.Label)
+						err := ntfy(*ntfyTopic, ntfyMsg{
+							HeaderTags:     "tools",
+							HeaderTitle:    "Nouvelle intervention",
+							Body:           missionToNtfyBody(e),
+							HeaderClick:    serveBaseURL + *serveBasePath + "#" + e.ID,
+							HeaderPriority: "default",
+						})
+						if err != nil {
+							logutil.Errorf("while sending notification: %v", err)
+							writeLastSync(err)
+						}
+					}
+					for _, e := range newExpenses {
+						logutil.Infof("new expense: %s", e.Label)
+						err := ntfy(*ntfyTopic, ntfyMsg{
+							HeaderTags:     "money",
+							HeaderTitle:    "Nouvelle facture",
+							Body:           e.Label + " (" + e.Amount.String() + ")",
+							HeaderClick:    serveBaseURL + *serveBasePath + "#" + e.InvoiceID,
+							HeaderPriority: "default",
+						})
+						if err != nil {
+							logutil.Errorf("while sending notification: %v", err)
+							writeLastSync(err)
+						}
+					}
+
+					time.Sleep(*syncPeriod)
+				}
+			}()
+		} else {
+			logutil.Infof("running in read-only mode, skipping synchronization")
+		}
 
 		var htmlHeader string
 		if *htmlHeaderFile != "" {
