@@ -313,8 +313,7 @@ func MergeSupplierContractDocs(previous, current []SupplierContractDocumentDB) (
 				continue
 			}
 
-			hasChanged := EqualSupplierDocs(cur, prev)
-			if !hasChanged {
+			if EqualSupplierDocs(cur, prev) {
 				continue
 			}
 			changedDocs = append(changedDocs, MergeSupplierDoc(prev, cur))
@@ -366,8 +365,7 @@ func MergeAccountDocumentsDB(previous, current []AccountDocumentDB) (missing, up
 				continue
 			}
 
-			hasChanged := EqualAccountDocs(prev, cur)
-			if !hasChanged {
+			if EqualAccountDocs(prev, cur) {
 				continue
 			}
 			changedDocs = append(changedDocs, MergeAccountDoc(prev, cur))
@@ -518,7 +516,7 @@ func UpsertContractDocumentsWithDB(ctx context.Context, db *sql.DB, documents []
 			return fmt.Errorf("while getting rows affected: %w", err)
 		}
 		if n != 0 {
-			logutil.Debugf("db: updated document %q: %+v", e.ID, e)
+			logutil.Debugf("db: updated contract document %q: %+v", e.ID, e)
 			continue
 		}
 
@@ -552,16 +550,8 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 	}()
 
 	for _, e := range expense {
-		var req string
-		var args []interface{}
-		switch {
-		case e.HashFile != "":
-			req = "UPDATE expenses SET invoice_id = ?, label = ?, amount = ?, date = ?, file_path = ?, hash_file = ?, source = ?, accounting_allocation = ?, accounting_expense_type = ? WHERE name = ? AND date = ? AND amount = ? AND accounting_allocation = ? AND accounting_expense_type = ? AND hash_file = ?;"
-			args = []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile}
-		default:
-			req = "UPDATE expenses SET invoice_id = ?, label = ?, amount = ?, date = ?, file_path = ?, hash_file = ?, source = ?, accounting_allocation = ?, accounting_expense_type = ? WHERE label = ? AND date = ? AND amount = ? AND accounting_allocation = ? AND accounting_expense_type = ?;"
-			args = []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType}
-		}
+		req := "UPDATE expenses SET file_path = ?, source = ? WHERE label = ? AND date = ? AND amount = ? AND accounting_allocation = ? AND accounting_expense_type = ? AND hash_file = ?;"
+		args := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile}
 		res, err := tx.ExecContext(ctx, req, args...)
 		if err != nil {
 			return fmt.Errorf("while updating expenses: %w", err)
@@ -947,8 +937,8 @@ func NewExpenseDocumentsIndex(expenses []ExpenseDocumentDB) ExpenseDocumentsInde
 		ByLabelDateAmountKeyHashfile: make(map[string]int),
 	}
 	for i, e := range expenses {
-		if e.Label == "Honoraires Forfaitaires du 10/01/2024 au 31/01/2024" {
-			logutil.Debugf("Honoraires Forfaitaires du 10/01/2024 au 31/01/2024")
+		if e.HashFile != "" {
+			continue
 		}
 		index.ByLabelDateAmountKey[fmt.Sprintf("%s-%s-%d-%s", e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.String())] = i
 	}
@@ -964,9 +954,6 @@ func NewExpenseDocumentsIndex(expenses []ExpenseDocumentDB) ExpenseDocumentsInde
 // Match returns a pointer to the original slice of expenses so that you can
 // modify the original slice if you want to.
 func (idx ExpenseDocumentsIndex) Match(partial ExpenseDocumentDB) (ExpenseDocumentDB, bool) {
-	if partial.Label == "Honoraires Forfaitaires du 10/01/2024 au 31/01/2024" {
-		logutil.Debugf("Honoraires Forfaitaires du 10/01/2024 au 31/01/2024")
-	}
 	if partial.HashFile != "" {
 		i, ok := idx.ByLabelDateAmountKeyHashfile[fmt.Sprintf("%s-%s-%d-%s-%s", partial.Label, partial.Date.Format(time.RFC3339Nano), partial.Amount, partial.AccountingKey.String(), partial.HashFile)]
 		if ok {

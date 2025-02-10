@@ -173,10 +173,6 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		for i := range liveExpenses {
 			e := &liveExpenses[i]
 
-			if e.Label == "Honoraires Forfaitaires du 10/01/2024 au 31/01/2024" {
-				logutil.Debugf("Honoraires Forfaitaires du 10/01/2024 au 31/01/2024")
-			}
-
 			if eDB, found := expensesInDBIndex.Match(*e); found {
 				*e = db.Merge(eDB, *e)
 			}
