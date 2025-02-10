@@ -28,6 +28,7 @@ type tmlpData struct {
 	NtfyTopic  string
 	Items      []MissionOrExpense
 	Version    string
+	Filter     string
 }
 
 var defaultHeaderTmpl = `
@@ -80,6 +81,22 @@ var tmpl = template.Must(template.New("base").Parse(`
 	<h1>Suivi des factures et ordres de service de la copro TERRA NOSTRA 2</h1>
 
 	{{ template "header" . }}
+
+	<form action="/" method="GET">
+		<input type="radio" id="all" name="filter" value="" {{if eq .Filter ""}}checked{{end}}>
+		<label for="all">Tous</label>
+
+		<input type="radio" id="expenses" name="filter" value="expenses" {{if eq .Filter "expenses"}}checked{{end}}>
+		<label for="expenses">Factures (compte courant et compte travaux)</label>
+
+		<input type="radio" id="missions" name="filter" value="missions" {{if eq .Filter "missions"}}checked{{end}}>
+		<label for="missions">Ordres de mission et ordres de réparation</label>
+
+		<input type="radio" id="visits" name="filter" value="visits" {{if eq .Filter "visits"}}checked{{end}}>
+		<label for="visits">Rapports de visite</label>
+
+		<input type="submit" value="Filtrer">
+	</form>
 
 	<table>
 		<thead>
@@ -323,75 +340,46 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 	}))
 
 	mux.HandleFunc("/", logRequest(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		filterParam := r.URL.Query().Get("filter")
 
-		missions, err := db.GetMissionsDB(context.Background(), sqlDB)
-		if err != nil {
-			logutil.Errorf("while listing interventions: %v", err)
+		const (
+			filterShowAll  = ""
+			filterExpenses = "expenses"
+			filterMissions = "missions"
+			filterVisits   = "visits" // Account documents with the category "reportVisit"
+		)
 
+		var f filter
+		switch filterParam {
+		case filterShowAll:
+			f = filter{} // Zero value = show all.
+		case filterExpenses:
+			f = filter{HideExpenses: false, HideMissions: true, HideVisits: true}
+		case filterMissions:
+			f = filter{HideExpenses: true, HideMissions: false, HideVisits: true}
+		case filterVisits:
+			f = filter{HideExpenses: true, HideMissions: true, HideVisits: false}
+		default:
 			w.WriteHeader(http.StatusInternalServerError)
-			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Error while listing interventions: %s", err), Version: version})
-
+			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Invalid filter: %q", filterParam), Version: version})
 			return
 		}
 
-		expenses, err := db.GetExpensesDB(context.Background(), sqlDB)
+		filteredItems, err := fetchFromDB(ctx, sqlDB, f)
 		if err != nil {
-			logutil.Errorf("while listing expenses: %v", err)
+			logutil.Errorf("while listing: %v", err)
+
 			w.WriteHeader(http.StatusInternalServerError)
-			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Error while listing expenses: %s", err), Version: version})
+			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Error while listing: %s", err), Version: version})
+
 			return
 		}
-
-		accDocs, err := db.GetAccountDocumentsDB(context.Background(), sqlDB)
-		if err != nil {
-			logutil.Errorf("while listing account documents: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Error while listing account documents: %s", err), Version: version})
-			return
-		}
-
-		// Combine them.
-		var combined []MissionOrExpense
-		for _, m := range missions {
-			m := m
-			combined = append(combined, MissionOrExpense{Mission: &m})
-		}
-		for _, e := range expenses {
-			e := e
-			combined = append(combined, MissionOrExpense{Expense: &e})
-		}
-		for _, a := range accDocs {
-			a := a
-			combined = append(combined, MissionOrExpense{AccountDocument: &a})
-		}
-
-		sort.Slice(combined, func(i, j int) bool {
-			di, dj := time.Time{}, time.Time{}
-			if combined[i].Mission != nil {
-				di = combined[i].Mission.StartedAt
-			}
-			if combined[i].Expense != nil {
-				di = combined[i].Expense.Date
-			}
-			if combined[i].AccountDocument != nil {
-				di = combined[i].AccountDocument.CreatedAt
-			}
-
-			if combined[j].Mission != nil {
-				dj = combined[j].Mission.StartedAt
-			}
-			if combined[j].Expense != nil {
-				dj = combined[j].Expense.Date
-			}
-			if combined[j].AccountDocument != nil {
-				dj = combined[j].AccountDocument.CreatedAt
-			}
-			return di.After(dj)
-		})
 
 		w.Header().Set("Content-Type", "text/html")
 
@@ -410,9 +398,10 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 			BasePath:   basePath,
 			SyncStatus: statusMsg,
 			NtfyTopic:  *ntfyTopic,
-			Items:      combined,
-			Version:    version + " (" + date + ")"},
-		)
+			Items:      filteredItems,
+			Version:    version + " (" + date + ")",
+			Filter:     filterParam,
+		})
 		if err != nil {
 			logutil.Errorf("executing template: %v", err)
 			return
@@ -447,4 +436,85 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 	}))
 
 	return nil
+}
+
+// Zero value = show all.
+type filter struct {
+	HideExpenses bool
+	HideMissions bool
+	HideVisits   bool
+}
+
+func fetchFromDB(ctx context.Context, sqlDB *sql.DB, f filter) ([]MissionOrExpense, error) {
+	var missions []db.MissionDB
+	var err error
+
+	if !f.HideMissions {
+		missions, err = db.GetMissionsDB(ctx, sqlDB)
+		if err != nil {
+			return nil, fmt.Errorf("while listing missions: %w", err)
+		}
+	}
+
+	var expenses []db.ExpenseDocumentDB
+	if !f.HideExpenses {
+		expenses, err = db.GetExpensesDB(ctx, sqlDB)
+		if err != nil {
+			return nil, fmt.Errorf("while listing expenses: %w", err)
+		}
+	}
+
+	var accDocs []db.AccountDocumentDB
+	if !f.HideVisits {
+		accDocs, err = db.GetAccountDocumentsDB(ctx, sqlDB)
+		if err != nil {
+			return nil, fmt.Errorf("while listing account documents: %w", err)
+		}
+	}
+
+	combined := combineAndSort(missions, expenses, accDocs)
+	return combined, nil
+}
+
+func combineAndSort(missions []db.MissionDB, expenses []db.ExpenseDocumentDB, accDocs []db.AccountDocumentDB) []MissionOrExpense {
+	// Combine them.
+	var combined []MissionOrExpense
+	for _, m := range missions {
+		m := m
+		combined = append(combined, MissionOrExpense{Mission: &m})
+	}
+	for _, e := range expenses {
+		e := e
+		combined = append(combined, MissionOrExpense{Expense: &e})
+	}
+	for _, a := range accDocs {
+		a := a
+		combined = append(combined, MissionOrExpense{AccountDocument: &a})
+	}
+
+	sort.Slice(combined, func(i, j int) bool {
+		di, dj := time.Time{}, time.Time{}
+		if combined[i].Mission != nil {
+			di = combined[i].Mission.StartedAt
+		}
+		if combined[i].Expense != nil {
+			di = combined[i].Expense.Date
+		}
+		if combined[i].AccountDocument != nil {
+			di = combined[i].AccountDocument.CreatedAt
+		}
+
+		if combined[j].Mission != nil {
+			dj = combined[j].Mission.StartedAt
+		}
+		if combined[j].Expense != nil {
+			dj = combined[j].Expense.Date
+		}
+		if combined[j].AccountDocument != nil {
+			dj = combined[j].AccountDocument.CreatedAt
+		}
+		return di.After(dj)
+	})
+
+	return combined
 }
