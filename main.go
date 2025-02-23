@@ -23,6 +23,10 @@ import (
 	"github.com/maelvls/foncia/undent"
 )
 
+const (
+	graphqlURL = "https://myfoncia-gateway.prod.fonciamillenium.net/graphql"
+)
+
 var (
 	// EnableDebug enables debugFlag logs.
 	debugFlag = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
@@ -143,7 +147,7 @@ func main() {
 			client = api.AuthenticatedClientToken(api.Token(token))
 		} else {
 			username, password := getCreds()
-			client, err = api.AuthenticatedClient(&http.Client{}, username, password)
+			client, err = api.AuthenticatedClient(&http.Client{}, graphqlURL, username, password)
 			if err != nil {
 				logutil.Errorf("while authenticating client: %v", err)
 				os.Exit(1)
@@ -404,7 +408,7 @@ func main() {
 		username, password := getCreds()
 		client := &http.Client{}
 		api.EnableDebugCurlLogs(client)
-		token, err := api.GetToken(client, username, password)
+		token, err := api.GetToken(client, graphqlURL, username, password)
 		if err != nil {
 			logutil.Errorf("while authenticating: %v", err)
 			os.Exit(1)
@@ -455,19 +459,19 @@ func missionToNtfyBody(m db.MissionDB) string {
 func authFetchSave(client *http.Client, db *sql.DB, uuid, invoicesDir string) ([]db.MissionDB, []db.ExpenseDocumentDB, error) {
 	ctx := context.Background()
 
-	err := syncAccountDocumentsWithDB(ctx, client, db, uuid, invoicesDir)
+	err := syncAccountDocumentsWithDB(ctx, client, db, graphqlURL, uuid, invoicesDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}
-	newMissions, err := syncLiveMissionsWithDB(ctx, client, db, uuid)
+	newMissions, err := syncLiveMissionsWithDB(ctx, client, db, graphqlURL, uuid)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}
-	newExpenses, err := syncExpensesWithDB(ctx, client, db, uuid, invoicesDir)
+	newExpenses, err := syncExpensesWithDB(ctx, client, db, graphqlURL, uuid, invoicesDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}
-	err = syncSuppliersWithDB(ctx, client, db, uuid, invoicesDir)
+	err = syncSuppliersWithDB(ctx, client, db, graphqlURL, uuid, invoicesDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 func ListCmd(username string, password api.Password) {
-	client, err := api.AuthenticatedClient(&http.Client{}, username, password)
+	client, err := api.AuthenticatedClient(&http.Client{}, graphqlURL, username, password)
 	if err != nil {
 		logutil.Errorf("while authenticating: %v", err)
 		os.Exit(1)
@@ -22,7 +22,7 @@ func ListCmd(username string, password api.Password) {
 		os.Exit(1)
 	}
 
-	missions, _, err := api.GetMissionsAPI(client, accUUID, "")
+	missions, _, err := api.GetMissionsAPI(client, graphqlURL, accUUID, "")
 	if err != nil {
 		logutil.Errorf("getting interventions: %v", err)
 		os.Exit(1)

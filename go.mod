@@ -1,6 +1,6 @@
 module github.com/maelvls/foncia
 
-go 1.21.1
+go 1.24.0
 
 require (
 	github.com/mgutz/ansi v0.0.0-20200706080929-d51e80ef957d
@@ -10,6 +10,7 @@ require (
 
 require (
 	github.com/cloudmailin/cloudmailin-go v0.2.0 // indirect
+	github.com/dnaeon/go-vcr v1.2.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/emersion/go-sasl v0.0.0-20200509203442-7bfe0ed36a21 // indirect
 	github.com/emersion/go-smtp v0.21.3 // indirect
@@ -24,6 +25,7 @@ require (
 	golang.org/x/net v0.15.0 // indirect
 	google.golang.org/appengine v1.6.7 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
+	gopkg.in/yaml.v2 v2.2.8 // indirect
 	gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c // indirect
 	modernc.org/libc v1.22.5 // indirect
 	modernc.org/mathutil v1.5.0 // indirect

@@ -15,30 +15,9 @@ import (
 	"github.com/maelvls/foncia/logutil"
 )
 
-func syncRepairExpenses(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid string, invoicesDir string) error {
-	// Unauthenticated client just used for downloading files from AWS.
-	downloadClient := &http.Client{}
-	api.EnableDebugCurlLogs(downloadClient)
-
-	// Create dir if missing.
-	err := os.MkdirAll(invoicesDir, 0755)
-	if err != nil {
-		return fmt.Errorf("while creating directory: %v", err)
-	}
-
-	var docs []db.ExpenseDocumentDB
-
-	err = db.UpsertExpensesWithDB(ctx, sqlDB, docs...)
-	if err != nil {
-		return fmt.Errorf("while saving repair expenses: %v", err)
-	}
-
-	return nil
-}
-
 // Returns the new items.
-func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid string) ([]db.MissionDB, error) {
-	missions, _, err := api.GetMissionsAPI(client, uuid, "")
+func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid string) ([]db.MissionDB, error) {
+	missions, _, err := api.GetMissionsAPI(client, graphqlURL, uuid, "")
 	if err != nil {
 		return nil, fmt.Errorf("while getting interventions: %v", err)
 	}
@@ -74,7 +53,7 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql
 
 		// Let's update each mission with its work orders.
 		for i, mission := range batchMissions {
-			orders, err := api.GetWorkOrdersAPI(client, uuid, mission.ID)
+			orders, err := api.GetWorkOrdersAPI(client, graphqlURL, uuid, mission.ID)
 			if err != nil {
 				return fmt.Errorf("while getting work orders from API: %v", err)
 			}
@@ -111,7 +90,7 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql
 }
 
 // Returns new expenses.
-func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid, invoicesDir string) ([]db.ExpenseDocumentDB, error) {
+func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) ([]db.ExpenseDocumentDB, error) {
 	// Unauthenticated client just used for downloading files from AWS.
 	downloadClient := &http.Client{}
 	api.EnableDebugCurlLogs(downloadClient)
@@ -125,19 +104,19 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	// For now, the fetched expenses won't contain the FilePath field. It will
 	// be set later on.
 	var expensesLive []db.ExpenseDocumentDB
-	expensesFromAPI, err := api.GetBuildingAccountingCurrent(client, uuid)
+	expensesFromAPI, err := api.GetBuildingAccountingCurrent(client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting expenses: %v", err)
 	}
 	for _, e := range expensesFromAPI {
 		expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e, db.SourceAccounting))
 	}
-	periods, err := api.GetAccountingPeriodsLive(client, uuid)
+	periods, err := api.GetAccountingPeriodsLive(client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting accounting periods: %v", err)
 	}
 	for _, period := range periods {
-		cur, err := api.GetBuildingAccountingRGDDLive(client, uuid, period.ID)
+		cur, err := api.GetBuildingAccountingRGDDLive(client, graphqlURL, uuid, period.ID)
 		if err != nil {
 			return nil, fmt.Errorf("while getting building accounting RGDD: %v", err)
 		}
@@ -146,12 +125,12 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		}
 	}
 
-	ids, err := api.GetRepairBudgets(client, uuid)
+	ids, err := api.GetRepairBudgets(client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting repair IDs: %v", err)
 	}
 	for _, id := range ids {
-		got, err := api.GetRepairBudgetDetailsAPI(client, uuid, id)
+		got, err := api.GetRepairBudgetDetailsAPI(client, graphqlURL, uuid, id)
 		if err != nil {
 			return nil, fmt.Errorf("while getting repair budget details: %v", err)
 		}
@@ -192,7 +171,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 			// First try using the HashFile, then the InvoiceID.
 			var fileURL, filename string
 			if e.HashFile != "" {
-				filename, fileURL, err = api.GetDocumentURL(client, e.HashFile)
+				filename, fileURL, err = api.GetDocumentURL(client, graphqlURL, e.HashFile)
 				switch {
 				case errors.Is(err, api.ErrEmptyURL):
 					logutil.Debugf("no document URL found for hash file '%s', skipping download. Expense: %+v", e.HashFile, e)
@@ -203,7 +182,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 			} else if e.InvoiceID != "" {
 				// I found that the graphql query 'getInvoiceURL' returns an empty
 				// URL if the invoiceID exists but the hashFile is empty.
-				filename, fileURL, err = api.GetInvoiceURL(client, e.InvoiceID)
+				filename, fileURL, err = api.GetInvoiceURL(client, graphqlURL, e.InvoiceID)
 				switch {
 				case errors.Is(err, api.ErrEmptyURL):
 					logutil.Debugf("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
@@ -269,12 +248,12 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	return newExpensesDB, nil
 }
 
-func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid, invoicesDir string) error {
+func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) error {
 	// Unauthenticated client just used for downloading files from AWS.
 	downloadClient := &http.Client{}
 	api.EnableDebugCurlLogs(downloadClient)
 
-	supplierContractsLive, err := api.GetCouncilMissionSuppliersAPI(client, uuid)
+	supplierContractsLive, err := api.GetCouncilMissionSuppliersAPI(client, graphqlURL, uuid)
 	if err != nil {
 		return fmt.Errorf("while getting suppliers: %v", err)
 	}
@@ -325,7 +304,7 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 			continue
 		}
 
-		filename, fileURL, err := api.GetDocumentURL(client, doc.HashFile)
+		filename, fileURL, err := api.GetDocumentURL(client, graphqlURL, doc.HashFile)
 		if err != nil {
 			return fmt.Errorf("while getting document URL: %v", err)
 		}
@@ -357,12 +336,12 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 	return nil
 }
 
-func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid, invoicesDir string) error {
+func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) error {
 	// Unauthenticated client just used for downloading files from AWS.
 	downloadClient := &http.Client{}
 	api.EnableDebugCurlLogs(downloadClient)
 
-	accountDocumentsLive, err := api.GetAccountDocuments(client, uuid, db.DocumentCategoryReportVisit)
+	accountDocumentsLive, err := api.GetAccountDocuments(client, graphqlURL, uuid, db.DocumentCategoryReportVisit)
 	if err != nil {
 		return fmt.Errorf("while getting account documents: %v", err)
 	}
@@ -402,7 +381,7 @@ func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB 
 			continue
 		}
 
-		filename, fileURL, err := api.GetDocumentURL(client, doc.HashFile)
+		filename, fileURL, err := api.GetDocumentURL(client, graphqlURL, doc.HashFile)
 		if err != nil {
 			return fmt.Errorf("while getting document URL: %v", err)
 		}

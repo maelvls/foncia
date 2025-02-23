@@ -57,10 +57,10 @@ var (
 
 // The `authClient` given as input is only used to authenticate and is not used
 // after that. A fresh client is returned.
-func AuthenticatedClient(authClient *http.Client, username string, password Password) (*http.Client, error) {
+func AuthenticatedClient(authClient *http.Client, graphqlURL, username string, password Password) (*http.Client, error) {
 	EnableDebugCurlLogs(authClient)
 
-	token, err := GetToken(authClient, username, password)
+	token, err := GetToken(authClient, graphqlURL, username, password)
 	if err != nil {
 		logutil.Errorf("while authenticating: %v", err)
 		os.Exit(1)
@@ -120,7 +120,7 @@ func IsTooManyRequests(body []byte) bool {
 //	  -H 'sec-fetch-site: same-site' \
 //	  -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0' \
 //	  --data-raw $'{"query":"mutation login($request: LoginRequest\u0021) {\\n  login(request: $request) {\\n    token\\n    __typename\\n  }\\n}","variables":{"request":{"username":"","password":"","appId":"myfoncia"}},"operationName":"login"}'
-func GetToken(client *http.Client, username string, password Password) (Token, error) {
+func GetToken(client *http.Client, graphqlURL, username string, password Password) (Token, error) {
 	// Redirects don't make sense for HTML pages. For example, a 302 redirect
 	// might actually indicate an error.
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
@@ -156,7 +156,7 @@ func GetToken(client *http.Client, username string, password Password) (Token, e
 		} `json:"errors"`
 	}
 
-	err = DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", query, map[string]interface{}{
+	err = DoGraphQL(client, graphqlURL, query, map[string]interface{}{
 		"request": LoginRequest{
 			Username: username,
 			Password: password.Raw(),
@@ -246,7 +246,7 @@ func GetAccountUUID(client *http.Client) (string, error) {
 
 // Repairs and Incidents. Use GetAccountUUID to get the accountUUID.
 // `fromCursor` allows you to skip missions that you already have.
-func GetMissionsAPI(client *http.Client, accountUUID string, fromCursor string) (_ []MissionAPI, lastCursor string, _ error) {
+func GetMissionsAPI(client *http.Client, graphqlURL, accountUUID string, fromCursor string) (_ []MissionAPI, lastCursor string, _ error) {
 	var interventions []MissionAPI
 
 	type PageInfo struct {
@@ -339,7 +339,7 @@ func GetMissionsAPI(client *http.Client, accountUUID string, fromCursor string) 
 				}
 			} `json:"data"`
 		}
-		err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getIncidentsQuery, map[string]interface{}{
+		err := DoGraphQL(client, graphqlURL, getIncidentsQuery, map[string]interface{}{
 			"accountUuid": accountUUID,
 			"first":       perPage,
 			"after":       cursor,
@@ -431,7 +431,7 @@ func GetMissionsAPI(client *http.Client, accountUUID string, fromCursor string) 
 				}
 			} `json:"data"`
 		}
-		err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getRepairsQuery, map[string]interface{}{
+		err := DoGraphQL(client, graphqlURL, getRepairsQuery, map[string]interface{}{
 			"accountUuid": accountUUID,
 			"first":       perPage,
 			"after":       cursor,
@@ -481,7 +481,7 @@ func GetMissionsAPI(client *http.Client, accountUUID string, fromCursor string) 
 	return interventions, *cursor, nil
 }
 
-func GetWorkOrdersAPI(client *http.Client, accountUUID, missionID string) (_ []WorkOrderAPI, _ error) {
+func GetWorkOrdersAPI(client *http.Client, graphqlURL, accountUUID, missionID string) (_ []WorkOrderAPI, _ error) {
 	const getWorkOrders = `
 		query getWorkOrders($accountUuid: EncodedID!, $missionId: ID!, $first: Int, $before: Cursor, $after: Cursor) {
 			workOrders(accountUuid: $accountUuid, missionId: $missionId, first: $first, before: $before, after: $after) {
@@ -529,7 +529,7 @@ func GetWorkOrdersAPI(client *http.Client, accountUUID, missionID string) (_ []W
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getWorkOrders, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getWorkOrders, map[string]interface{}{
 		"accountUuid": accountUUID,
 		"missionId":   missionID,
 		"first":       100,
@@ -692,7 +692,7 @@ type DocumentAPI struct {
 	CreatedAt        time.Time   // Example: "2023-03-09T22:00:00.000Z"
 }
 
-func GetCouncilMissionSuppliersAPI(client *http.Client, accountUUID string) ([]SupplierContractAPI, error) {
+func GetCouncilMissionSuppliersAPI(client *http.Client, graphqlURL, accountUUID string) ([]SupplierContractAPI, error) {
 	const getSuppliersQuery = `
 		query getCouncilMissionSuppliers(
 		  $accountUuid: EncodedID!
@@ -784,7 +784,7 @@ func GetCouncilMissionSuppliersAPI(client *http.Client, accountUUID string) ([]S
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getSuppliersQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getSuppliersQuery, map[string]interface{}{
 		"accountUuid":      accountUUID,
 		"description":      "",
 		"supplierFullname": "",
@@ -863,7 +863,7 @@ var ErrEmptyURL = fmt.Errorf("empty URL")
 // will return an empty URL. To know if the URL returned was empty:
 //
 //	errors.Is(err, api.ErrEmptyURL)
-func GetInvoiceURL(client *http.Client, invoiceID string) (filename, fileURL string, _ error) {
+func GetInvoiceURL(client *http.Client, graphqlURL, invoiceID string) (filename, fileURL string, _ error) {
 	const getInvoiceURLQuery = `query getInvoiceURL($invoiceId: String!) {invoiceURL(invoiceId: $invoiceId)}`
 	var getInvoiceURLResp struct {
 		Data struct {
@@ -871,7 +871,7 @@ func GetInvoiceURL(client *http.Client, invoiceID string) (filename, fileURL str
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getInvoiceURLQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getInvoiceURLQuery, map[string]interface{}{
 		"invoiceId": invoiceID,
 	}, &getInvoiceURLResp)
 	if err != nil {
@@ -893,7 +893,7 @@ func GetInvoiceURL(client *http.Client, invoiceID string) (filename, fileURL str
 // To know if the URL returned was empty:
 //
 //	errors.Is(err, api.ErrEmptyURL)
-func GetDocumentURL(client *http.Client, hash db.HashFile) (filename, fileURL string, _ error) {
+func GetDocumentURL(client *http.Client, graphqlURL string, hash db.HashFile) (filename, fileURL string, _ error) {
 	const getDocumentURLQuery = `query getDocumentURL($hash: String!) {documentURL(hash: $hash)}`
 	var getDocumentURLResp struct {
 		Data struct {
@@ -901,7 +901,7 @@ func GetDocumentURL(client *http.Client, hash db.HashFile) (filename, fileURL st
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getDocumentURLQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getDocumentURLQuery, map[string]interface{}{
 		"hash": hash,
 	}, &getDocumentURLResp)
 	if err != nil {
@@ -976,7 +976,7 @@ func getFilenameFromURL(fileURL string) (string, error) {
 }
 
 // This query is light and doesn't need to be paginated.
-func GetBuildingAccountingCurrent(client *http.Client, accountUUID string) ([]ExpenseDocumentAPI, error) {
+func GetBuildingAccountingCurrent(client *http.Client, graphqlURL, accountUUID string) ([]ExpenseDocumentAPI, error) {
 	const getBuildingAccountingCurrentQuery = `
 		query getBuildingAccountingCurrent($uuid: EncodedID!) {
 		  coownerAccount(uuid: $uuid) {
@@ -1134,7 +1134,7 @@ func GetBuildingAccountingCurrent(client *http.Client, accountUUID string) ([]Ex
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getBuildingAccountingCurrentQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getBuildingAccountingCurrentQuery, map[string]interface{}{
 		"uuid": accountUUID,
 	}, &getBuildingAccountingCurrentResp)
 	if err != nil {
@@ -1188,7 +1188,7 @@ type AccountingPeriodAPI struct {
 
 // This query is light and doesn't need to be paginated. No need to remember the
 // last cursor.
-func GetAccountingPeriodsLive(client *http.Client, accountUUID string) ([]AccountingPeriodAPI, error) {
+func GetAccountingPeriodsLive(client *http.Client, graphqlURL, accountUUID string) ([]AccountingPeriodAPI, error) {
 	const getAccountingPeriodsQuery = `
 		query getAccountingPeriods($accountUuid: EncodedID!, $sortBy: [SortByType!], $status: [AccountingPeriodStatusEnum!], $closingDateTo: String, $first: Int, $before: Cursor, $after: Cursor) {
 		  coownerAccount(uuid: $accountUuid) {
@@ -1249,7 +1249,7 @@ func GetAccountingPeriodsLive(client *http.Client, accountUUID string) ([]Accoun
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getAccountingPeriodsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getAccountingPeriodsQuery, map[string]interface{}{
 		"accountUuid": accountUUID,
 	}, &getAccountingPeriodsResp)
 	if err != nil {
@@ -1288,7 +1288,7 @@ func GetAccountingPeriodsLive(client *http.Client, accountUUID string) ([]Accoun
 //
 // This query is light and doesn't need to be paginated. No need to remember the
 // last cursor.
-func GetBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingPeriodID string) ([]ExpenseDocumentAPI, error) {
+func GetBuildingAccountingRGDDLive(client *http.Client, graphqlURL, accountUUID, accountingPeriodID string) ([]ExpenseDocumentAPI, error) {
 	const getBuildingAccountingRGDDQuery = `
 		query getBuildingAccountingRGDD($uuid: EncodedID!, $accountingPeriodId: String) {
 		  coownerAccount(uuid: $uuid) {
@@ -1449,7 +1449,7 @@ func GetBuildingAccountingRGDDLive(client *http.Client, accountUUID, accountingP
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getBuildingAccountingRGDDQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getBuildingAccountingRGDDQuery, map[string]interface{}{
 		"uuid":               accountUUID,
 		"accountingPeriodId": accountingPeriodID,
 	}, &getBuildingAccountingRGDDResp)
@@ -1565,7 +1565,7 @@ type AccountDocumentAPI struct {
 	CreatedAt        time.Time
 }
 
-func GetAccountDocuments(client *http.Client, accountUUID string, category db.DocumentCategory) ([]AccountDocumentAPI, error) {
+func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, category db.DocumentCategory) ([]AccountDocumentAPI, error) {
 	const getAccountDocumentsQuery = `
 		query getAccountDocuments($accountUuid: EncodedID!, $first: Int, $after: Cursor, $documentCategory: MyFonciaFileCategoryEnum!, $originalFilename: String, $subCategories: [String!], $fromDate: String, $toDate: String, $missionGeneralAssemblyIds: [String!]) {
 		  account(uuid: $accountUuid) {
@@ -1635,7 +1635,7 @@ func GetAccountDocuments(client *http.Client, accountUUID string, category db.Do
 	}
 
 	var cursor *string
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getAccountDocumentsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getAccountDocumentsQuery, map[string]interface{}{
 		"accountUuid":      accountUUID,
 		"originalFilename": "",
 		"subCategories":    []string{},
@@ -1669,7 +1669,7 @@ func GetAccountDocuments(client *http.Client, accountUUID string, category db.Do
 // Annual General Meeting (AGM) of Co-Owners ("Assemblée Générale"). The `after`
 // parameter is the cursor to use to get the next page of results. Leave it
 // empty to get the first page.
-func GetCouncilProjectDocumentsAPI(client *http.Client, accountUUID, after string) ([]AccountDocumentAPI, error) {
+func GetCouncilProjectDocumentsAPI(client *http.Client, graphqlURL, accountUUID, after string) ([]AccountDocumentAPI, error) {
 	const getCouncilProjectDocumentsQuery = `
     query getCouncilProjectDocuments($accountUuid: EncodedID!, $sortBy: [SortByType!], $first: Int, $after: Cursor, $skipNotPaginatedData: Boolean! = false) {
         coownerAccount(uuid: $accountUuid) {
@@ -1766,7 +1766,7 @@ func GetCouncilProjectDocumentsAPI(client *http.Client, accountUUID, after strin
 	if after != "" {
 		cursor = &after
 	}
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getCouncilProjectDocumentsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getCouncilProjectDocumentsQuery, map[string]interface{}{
 		"accountUuid":          accountUUID,
 		"first":                100, // I found that it is the maximum accepted value.
 		"after":                cursor,
@@ -1797,7 +1797,7 @@ func GetCouncilProjectDocumentsAPI(client *http.Client, accountUUID, after strin
 	return docs, nil
 }
 
-func GetRepairBudgets(client *http.Client, accountUUID string) ([]string, error) {
+func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]string, error) {
 	const getRepairBudgetsQuery = `
         query getRepairBudgets($accountUuid: EncodedID!) {
           repairBudgets(accountUuid: $accountUuid) {
@@ -1817,7 +1817,7 @@ func GetRepairBudgets(client *http.Client, accountUUID string) ([]string, error)
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getRepairBudgetsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getRepairBudgetsQuery, map[string]interface{}{
 		"accountUuid": accountUUID,
 	}, &listRepairIDsResp)
 	if err != nil {
@@ -1831,7 +1831,7 @@ func GetRepairBudgets(client *http.Client, accountUUID string) ([]string, error)
 	return repairIDs, nil
 }
 
-func GetRepairBudgetDetailsAPI(client *http.Client, accountUUID, budgetID string) ([]ExpenseDocumentAPI, error) {
+func GetRepairBudgetDetailsAPI(client *http.Client, graphqlURL, accountUUID, budgetID string) ([]ExpenseDocumentAPI, error) {
 	if accountUUID == "" {
 		return nil, errors.New("accountUUID is empty")
 	}
@@ -2000,7 +2000,7 @@ func GetRepairBudgetDetailsAPI(client *http.Client, accountUUID, budgetID string
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", getRepairBudgetDetailsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getRepairBudgetDetailsQuery, map[string]interface{}{
 		"accountUuid": accountUUID,
 		"budgetId":    budgetID,
 	}, &getRepairBudgetDetailsResp)
