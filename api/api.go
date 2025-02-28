@@ -1152,7 +1152,7 @@ func GetBuildingAccountingCurrent(client *http.Client, graphqlURL, accountUUID s
 				case "Debit":
 					amount = expense.Amount.Value
 				default:
-					return nil, fmt.Errorf("unexpected typename %q for expense %+v", expense.Amount.Typename, expense)
+					return nil, fmt.Errorf("was expecting typename 'Credit' or 'Debit', but got %q for expense %+v", expense.Amount.Typename, expense)
 				}
 				var date time.Time
 				if expense.Date != "" {
@@ -1188,7 +1188,7 @@ type AccountingPeriodAPI struct {
 
 // This query is light and doesn't need to be paginated. No need to remember the
 // last cursor.
-func GetAccountingPeriodsLive(client *http.Client, graphqlURL, accountUUID string) ([]AccountingPeriodAPI, error) {
+func GetAccountingPeriods(client *http.Client, graphqlURL, accountUUID string) ([]AccountingPeriodAPI, error) {
 	const getAccountingPeriodsQuery = `
 		query getAccountingPeriods($accountUuid: EncodedID!, $sortBy: [SortByType!], $status: [AccountingPeriodStatusEnum!], $closingDateTo: String, $first: Int, $before: Cursor, $after: Cursor) {
 		  coownerAccount(uuid: $accountUuid) {
@@ -1284,11 +1284,9 @@ func GetAccountingPeriodsLive(client *http.Client, graphqlURL, accountUUID strin
 	return periods, nil
 }
 
-// query getBuildingAccountingRGDD($uuid: EncodedID!, $accountingPeriodId: String) {\n  coownerAccount(uuid: $uuid) {\n    uuid\n    trusteeCouncil {\n      pastAccountingRGDD(accountingPeriodId: $accountingPeriodId) {\n        totalToAllocate {\n          ...amount\n          __typename\n        }\n        totalVat {\n          ...amount\n          __typename\n        }\n        totalRecoverable {\n          ...amount\n          __typename\n        }\n        allocations {\n          ...allocation\n          __typename\n        }\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}\n\nfragment amount on Amount {\n  value\n  currency\n  __typename\n}\n\nfragment allocation on Allocation {\n  id\n  name\n  code\n  toAllocate {\n    ...amount\n    __typename\n  }\n  vat {\n    ...amount\n    __typename\n  }\n  recoverable {\n    ...amount\n    __typename\n  }\n  expenseTypes {\n    ...expenseType\n    __typename\n  }\n  __typename\n}\n\nfragment expenseType on ExpenseType {\n  id\n  allocationId\n  name\n  code\n  toAllocate {\n    ...amount\n    __typename\n  }\n  vat {\n    ...amount\n    __typename\n  }\n  recoverable {\n    ...amount\n    __typename\n  }\n  expenses {\n    ...expense\n    __typename\n  }\n  __typename\n}\n\nfragment expense on Expense {\n  id\n  label\n  date\n  invoiceId\n  piece {\n    hashFile\n    category\n    id\n    __typename\n  }\n  toAllocate {\n    ...amount\n    __typename\n  }\n  vat {\n    ...amount\n    __typename\n  }\n  recoverable {\n    ...amount\n    __typename\n  }\n  __typename\n}
-//
 // This query is light and doesn't need to be paginated. No need to remember the
 // last cursor.
-func GetBuildingAccountingRGDDLive(client *http.Client, graphqlURL, accountUUID, accountingPeriodID string) ([]ExpenseDocumentAPI, error) {
+func GetBuildingAccountingRGDD(client *http.Client, graphqlURL, accountUUID, accountingPeriodID string) ([]ExpenseDocumentAPI, error) {
 	const getBuildingAccountingRGDDQuery = `
 		query getBuildingAccountingRGDD($uuid: EncodedID!, $accountingPeriodId: String) {
 		  coownerAccount(uuid: $uuid) {
@@ -1831,7 +1829,7 @@ func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]st
 	return repairIDs, nil
 }
 
-func GetRepairBudgetDetailsAPI(client *http.Client, graphqlURL, accountUUID, budgetID string) ([]ExpenseDocumentAPI, error) {
+func GetRepairBudgetDetails(client *http.Client, graphqlURL, accountUUID, budgetID string) ([]ExpenseDocumentAPI, error) {
 	if accountUUID == "" {
 		return nil, errors.New("accountUUID is empty")
 	}

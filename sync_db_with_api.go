@@ -111,12 +111,12 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	for _, e := range expensesFromAPI {
 		expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e, db.SourceAccounting))
 	}
-	periods, err := api.GetAccountingPeriodsLive(client, graphqlURL, uuid)
+	periods, err := api.GetAccountingPeriods(client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting accounting periods: %v", err)
 	}
 	for _, period := range periods {
-		cur, err := api.GetBuildingAccountingRGDDLive(client, graphqlURL, uuid, period.ID)
+		cur, err := api.GetBuildingAccountingRGDD(client, graphqlURL, uuid, period.ID)
 		if err != nil {
 			return nil, fmt.Errorf("while getting building accounting RGDD: %v", err)
 		}
@@ -130,7 +130,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		return nil, fmt.Errorf("while getting repair IDs: %v", err)
 	}
 	for _, id := range ids {
-		got, err := api.GetRepairBudgetDetailsAPI(client, graphqlURL, uuid, id)
+		got, err := api.GetRepairBudgetDetails(client, graphqlURL, uuid, id)
 		if err != nil {
 			return nil, fmt.Errorf("while getting repair budget details: %v", err)
 		}
@@ -138,6 +138,11 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 			expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e, db.SourceRepairs))
 		}
 	}
+
+	// Let's remove duplicates. This is because the last period returned by
+	// GetBuildingAccountingRGDD overlaps with the contents of
+	// GetBuildingAccountingCurrent.
+	expensesLive = deduplicate(&expensesLive)
 
 	expensesInDB, err := db.GetExpensesDB(ctx, sqlDB)
 	if err != nil {
@@ -246,6 +251,19 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	}
 
 	return newExpensesDB, nil
+}
+
+func deduplicate(expenses *[]db.ExpenseDocumentDB) []db.ExpenseDocumentDB {
+	seen := make(map[db.ExpenseDocumentDB]struct{})
+	var deduped []db.ExpenseDocumentDB
+	for _, e := range *expenses {
+		if _, found := seen[e]; found {
+			continue
+		}
+		seen[e] = struct{}{}
+		deduped = append(deduped, e)
+	}
+	return deduped
 }
 
 func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) error {

@@ -551,7 +551,7 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 
 	for _, e := range expense {
 		req := "UPDATE expenses SET file_path = ?, source = ? WHERE label = ? AND date = ? AND amount = ? AND accounting_allocation = ? AND accounting_expense_type = ? AND hash_file = ?;"
-		args := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile}
+		args := []any{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile}
 		res, err := tx.ExecContext(ctx, req, args...)
 		if err != nil {
 			return fmt.Errorf("while updating expenses: %w", err)
@@ -566,7 +566,7 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 			logutil.Debugf("db: updated expense %q: %+v", e.Date, e)
 		} else {
 			req := "INSERT INTO expenses (invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);"
-			args := []interface{}{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType}
+			args := []any{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType}
 			_, err := tx.ExecContext(ctx, req, args...)
 			if err != nil {
 				return fmt.Errorf("while inserting expenses: %w", err)
@@ -1187,7 +1187,7 @@ func UpsertAccountDocumentsWithDB(ctx context.Context, db *sql.DB, documents []A
 func SaveWorkOrdersToDB(ctx context.Context, db *sql.DB, workOrders []WorkOrderDB) error {
 	req := "INSERT INTO work_orders (id, mission_id, number, label, repair_date_start, repair_date_end, supplier_id, supplier_name, supplier_activity) VALUES "
 
-	var values []interface{}
+	var values []any
 	for _, w := range workOrders {
 		req += "(?, ?, ?, ?, ?, ?, ?, ?, ?),"
 		values = append(values, w.ID, w.MissionID, w.Number, w.Label, w.RepairDateStart.Format(time.RFC3339Nano), w.RepairDateEnd.Format(time.RFC3339Nano), w.Supplier.ID, w.Supplier.Name, w.Supplier.Activity)
@@ -1221,7 +1221,7 @@ func SaveWorkOrdersToDB(ctx context.Context, db *sql.DB, workOrders []WorkOrderD
 // 2, baz, qux
 // 3, quux, corge
 // 4, grault, garply
-func fprintfValues(values []interface{}, sep, entrySep string, valuesPerEntry int) string {
+func fprintfValues(values []any, sep, entrySep string, valuesPerEntry int) string {
 	var b strings.Builder
 	for i, v := range values {
 		if i%valuesPerEntry == 0 {
@@ -1234,7 +1234,7 @@ func fprintfValues(values []interface{}, sep, entrySep string, valuesPerEntry in
 
 func SaveMissionsToDB(ctx context.Context, db *sql.DB, missions ...MissionDB) error {
 	req := "INSERT INTO missions (id, number, kind, label, status, started_at, description) VALUES "
-	var values []interface{}
+	var values []any
 	for _, e := range missions {
 		req += "(?, ?, ?, ?, ?, ?, ?),"
 		values = append(values, e.ID, e.Number, e.Kind, e.Label, e.Status, e.StartedAt.Format(time.RFC3339Nano), e.Description)
@@ -1303,7 +1303,7 @@ func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map
 			LEFT JOIN suppliers s ON s.id = w.supplier_id
 			LEFT JOIN contract_documents d ON d.supplier_id = w.supplier_id
 			WHERE w.mission_id in (`
-	var values []interface{}
+	var values []any
 	for _, id := range missionIDs {
 		req += "?,"
 		values = append(values, id)
