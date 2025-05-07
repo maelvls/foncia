@@ -704,6 +704,14 @@ type ExpenseDocumentDB struct {
 	Source Source
 
 	AccountingKey AccountingKey
+
+	RowID int64 // SQLite's. Used by Bleve.
+}
+
+func (e ExpenseDocumentDB) ID() string {
+	// This is a unique ID for the expense. It is not a primary key, but it is
+	// unique enough to identify an expense.
+	return fmt.Sprintf("%s-%s-%s-%s", e.Label, e.Date.Format("2006-01-02"), e.Amount, e.HashFile, e.InvoiceID)
 }
 
 // Expenses can come from two different sources:

@@ -9,10 +9,12 @@ import (
 	"os"
 	"path"
 
+	"github.com/blevesearch/bleve/v2"
 	"github.com/google/go-cmp/cmp"
 	"github.com/maelvls/foncia/api"
 	"github.com/maelvls/foncia/db"
 	"github.com/maelvls/foncia/logutil"
+	"github.com/maelvls/foncia/search"
 )
 
 // Returns the new items.
@@ -90,7 +92,7 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql
 }
 
 // Returns new expenses.
-func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) ([]db.ExpenseDocumentDB, error) {
+func syncExpensesWithDB(ctx context.Context, bleveIdx bleve.Index, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) ([]db.ExpenseDocumentDB, error) {
 	// Unauthenticated client just used for downloading files from AWS.
 	downloadClient := &http.Client{}
 	api.EnableDebugCurlLogs(downloadClient)
@@ -242,6 +244,13 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		err = db.UpsertExpensesWithDB(ctx, sqlDB, newOrChanged...)
 		if err != nil {
 			return fmt.Errorf("while saving expenses: %v", err)
+		}
+
+		for _, e := range newOrChanged {
+			err := search.IndexExpense(bleveIdx, e)
+			if err != nil {
+				return fmt.Errorf("while indexing expense: %w", err)
+			}
 		}
 
 		return nil
