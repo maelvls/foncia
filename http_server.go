@@ -220,7 +220,7 @@ func logRequest(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc 
 // the context. The `basePath` should always start with a slash and not end with
 // a slash. If you want to given an empty base path, don't give "/". Instead,
 // give "".
-func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, basePath string, lastSync func() (time.Time, error), htmlHeader string) error {
+func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client *http.Client, uuid, basePath string, lastSync func() (time.Time, error), htmlHeader string) error {
 	if basePath != "" && !strings.HasPrefix(basePath, "/") {
 		return fmt.Errorf("base path must start with a slash or be an empty string")
 	}
@@ -245,7 +245,7 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, basePat
 		_ = s.Close()
 	}()
 
-	err = addHandlers(mux, db, basePath, lastSync)
+	err = addHandlers(mux, db, client, uuid, basePath, lastSync)
 	if err != nil {
 		return fmt.Errorf("while adding handlers: %w", err)
 	}
@@ -261,7 +261,7 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, basePat
 	return nil
 }
 
-func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync func() (time.Time, error)) error {
+func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, basePath string, lastSync func() (time.Time, error)) error {
 	// Download a PDF. The /invoice endpoint historically relies on hash files,
 	// that's why a second endpoint /invoiceid was added to support invoice IDs.
 	//
@@ -407,6 +407,8 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, basePath string, lastSync fu
 			return
 		}
 	}))
+
+	mux.HandleFunc("/coowners", coownersEndpoint(client, uuid))
 
 	mux.HandleFunc("/cloudmailingwebhook", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {

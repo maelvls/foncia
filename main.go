@@ -297,7 +297,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			defer cancel(nil)
-			err := ServeHTTP(ctx, sqlDB, httpListen, *serveBasePath, readLastSync, htmlHeader)
+			err := ServeHTTP(ctx, sqlDB, httpListen, client, uuid, *serveBasePath, readLastSync, htmlHeader)
 			if err != nil {
 				cancel(err)
 			}

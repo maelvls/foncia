@@ -16,6 +16,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -156,7 +157,7 @@ func GetToken(client *http.Client, graphqlURL, username string, password Passwor
 		} `json:"errors"`
 	}
 
-	err = DoGraphQL(client, graphqlURL, query, map[string]interface{}{
+	err = DoGraphQL(client, graphqlURL, query, map[string]any{
 		"request": LoginRequest{
 			Username: username,
 			Password: password.Raw(),
@@ -194,7 +195,7 @@ func parseJWTExp(token string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, fmt.Errorf("while decoding JWT payload: %w", err)
 	}
-	var payloadMap map[string]interface{}
+	var payloadMap map[string]any
 	err = json.Unmarshal(payload, &payloadMap)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("while unmarshaling JWT payload: %w", err)
@@ -339,7 +340,7 @@ func GetMissionsAPI(client *http.Client, graphqlURL, accountUUID string, fromCur
 				}
 			} `json:"data"`
 		}
-		err := DoGraphQL(client, graphqlURL, getIncidentsQuery, map[string]interface{}{
+		err := DoGraphQL(client, graphqlURL, getIncidentsQuery, map[string]any{
 			"accountUuid": accountUUID,
 			"first":       perPage,
 			"after":       cursor,
@@ -431,7 +432,7 @@ func GetMissionsAPI(client *http.Client, graphqlURL, accountUUID string, fromCur
 				}
 			} `json:"data"`
 		}
-		err := DoGraphQL(client, graphqlURL, getRepairsQuery, map[string]interface{}{
+		err := DoGraphQL(client, graphqlURL, getRepairsQuery, map[string]any{
 			"accountUuid": accountUUID,
 			"first":       perPage,
 			"after":       cursor,
@@ -529,7 +530,7 @@ func GetWorkOrdersAPI(client *http.Client, graphqlURL, accountUUID, missionID st
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getWorkOrders, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getWorkOrders, map[string]any{
 		"accountUuid": accountUUID,
 		"missionId":   missionID,
 		"first":       100,
@@ -603,15 +604,15 @@ func (tr transportCurlLogs) RoundTrip(r *http.Request) (*http.Response, error) {
 // The reason (3) isn't related to ShurcooL/graphql, but (1) and (2) is... This
 // library seems to be the mostly used one, which says a lot about GraphQL's
 // maturity!
-func DoGraphQL[T any](client *http.Client, url, query string, variables map[string]interface{}, resp T) error {
+func DoGraphQL[T any](client *http.Client, url, query string, variables map[string]any, resp T) error {
 	// Minify the query.
 	query = strings.ReplaceAll(query, "\n", " ")
 	query = strings.ReplaceAll(query, "\t", " ")
 	query = regexp.MustCompile(`\s+`).ReplaceAllString(query, " ")
 
 	req := struct {
-		Query     string                 `json:"query"`
-		Variables map[string]interface{} `json:"variables"`
+		Query     string         `json:"query"`
+		Variables map[string]any `json:"variables"`
 	}{
 		Query:     query,
 		Variables: variables,
@@ -784,7 +785,7 @@ func GetCouncilMissionSuppliersAPI(client *http.Client, graphqlURL, accountUUID 
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getSuppliersQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getSuppliersQuery, map[string]any{
 		"accountUuid":      accountUUID,
 		"description":      "",
 		"supplierFullname": "",
@@ -871,7 +872,7 @@ func GetInvoiceURL(client *http.Client, graphqlURL, invoiceID string) (filename,
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getInvoiceURLQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getInvoiceURLQuery, map[string]any{
 		"invoiceId": invoiceID,
 	}, &getInvoiceURLResp)
 	if err != nil {
@@ -901,7 +902,7 @@ func GetDocumentURL(client *http.Client, graphqlURL string, hash db.HashFile) (f
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getDocumentURLQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getDocumentURLQuery, map[string]any{
 		"hash": hash,
 	}, &getDocumentURLResp)
 	if err != nil {
@@ -1134,7 +1135,7 @@ func GetBuildingAccountingCurrent(client *http.Client, graphqlURL, accountUUID s
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getBuildingAccountingCurrentQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getBuildingAccountingCurrentQuery, map[string]any{
 		"uuid": accountUUID,
 	}, &getBuildingAccountingCurrentResp)
 	if err != nil {
@@ -1249,7 +1250,7 @@ func GetAccountingPeriods(client *http.Client, graphqlURL, accountUUID string) (
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getAccountingPeriodsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getAccountingPeriodsQuery, map[string]any{
 		"accountUuid": accountUUID,
 	}, &getAccountingPeriodsResp)
 	if err != nil {
@@ -1447,7 +1448,7 @@ func GetBuildingAccountingRGDD(client *http.Client, graphqlURL, accountUUID, acc
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getBuildingAccountingRGDDQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getBuildingAccountingRGDDQuery, map[string]any{
 		"uuid":               accountUUID,
 		"accountingPeriodId": accountingPeriodID,
 	}, &getBuildingAccountingRGDDResp)
@@ -1633,7 +1634,7 @@ func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, ca
 	}
 
 	var cursor *string
-	err := DoGraphQL(client, graphqlURL, getAccountDocumentsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getAccountDocumentsQuery, map[string]any{
 		"accountUuid":      accountUUID,
 		"originalFilename": "",
 		"subCategories":    []string{},
@@ -1764,7 +1765,7 @@ func GetCouncilProjectDocumentsAPI(client *http.Client, graphqlURL, accountUUID,
 	if after != "" {
 		cursor = &after
 	}
-	err := DoGraphQL(client, graphqlURL, getCouncilProjectDocumentsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getCouncilProjectDocumentsQuery, map[string]any{
 		"accountUuid":          accountUUID,
 		"first":                100, // I found that it is the maximum accepted value.
 		"after":                cursor,
@@ -1815,7 +1816,7 @@ func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]st
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getRepairBudgetsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getRepairBudgetsQuery, map[string]any{
 		"accountUuid": accountUUID,
 	}, &listRepairIDsResp)
 	if err != nil {
@@ -1998,7 +1999,7 @@ func GetRepairBudgetDetails(client *http.Client, graphqlURL, accountUUID, budget
 		} `json:"data"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getRepairBudgetDetailsQuery, map[string]interface{}{
+	err := DoGraphQL(client, graphqlURL, getRepairBudgetDetailsQuery, map[string]any{
 		"accountUuid": accountUUID,
 		"budgetId":    budgetID,
 	}, &getRepairBudgetDetailsResp)
@@ -2081,4 +2082,199 @@ func Do(client *http.Client, method string, url string, body []byte) (*http.Resp
 		return resp, nil
 	}
 	return nil, fmt.Errorf("retried multiple times, giving up")
+}
+
+type Coowner struct {
+	Civility    string
+	FirstName   string
+	LastName    string
+	DisplayName string
+	Address1    string
+	Address2    string
+	City        string
+	ZipCode     string
+	Units       []int // Lots.
+}
+
+func GetCouncilCoowners(client *http.Client, accountUuid string) ([]Coowner, error) {
+	getCouncilCoownersQuery := `
+      query getCouncilCoowners(
+        $accountUuid: EncodedID!,
+        $first: Int,
+        $after: Cursor,
+        $customerName: String!,
+        $fullAddress: String!,
+        $sortBy: [SortByType!],
+        $units: [String!],
+        $holderProperties: [String!]
+      ) {
+        coownerAccount(uuid: $accountUuid) {
+          uuid
+          trusteeCouncil {
+            coowners(
+              first: $first
+              after: $after
+              customerName: $customerName
+              fullAddress: $fullAddress
+              sortBy: $sortBy
+              units: $units
+              holderProperties: $holderProperties
+            ) {
+              totalCount
+              pageInfo {
+                startCursor
+                endCursor
+                hasPreviousPage
+                hasNextPage
+                pageNumber
+                itemsPerPage
+                totalDisplayPages
+                totalPages
+              }
+              edges {
+                node {
+                  id
+                  units {
+                    id
+                    number
+                    coOwnershipByLawsId
+                  }
+                  mainHolder {
+                    propertyType
+                    customer {
+                      id
+                      civility
+                      firstName
+                      lastName
+                      displayName
+                      address {
+                        address1
+                        city
+                        zipCode
+                      }
+                    }
+                  }
+                  balance {
+                    value
+                    currency
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+	`
+	var cursor *string
+	variables := map[string]any{
+		"accountUuid":      accountUuid,
+		"first":            100,
+		"after":            cursor,
+		"customerName":     "",
+		"fullAddress":      "",
+		"sortBy":           map[string]string{"key": "customerName", "direction": "ASC"},
+		"units":            []string(nil),
+		"holderProperties": []string(nil),
+	}
+	body, err := json.Marshal(map[string]any{
+		"query":     getCouncilCoownersQuery,
+		"variables": variables,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("while marshalling request body: %w", err)
+	}
+	resp, err := Do(client, http.MethodPost, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", body)
+	if err != nil {
+		return nil, fmt.Errorf("while doing request: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, respBody)
+	}
+
+	var getCouncilCoownersResp struct {
+		Data struct {
+			CoownerAccount struct {
+				TrusteeCouncil struct {
+					Coowners struct {
+						TotalCount int `json:"totalCount"`
+						PageInfo   struct {
+							StartCursor       string `json:"startCursor"`
+							EndCursor         string `json:"endCursor"`
+							HasPreviousPage   bool   `json:"hasPreviousPage"`
+							HasNextPage       bool   `json:"hasNextPage"`
+							PageNumber        int    `json:"pageNumber"`
+							ItemsPerPage      int    `json:"itemsPerPage"`
+							TotalDisplayPages int    `json:"totalDisplayPages"`
+							TotalPages        int    `json:"totalPages"`
+						} `json:"pageInfo"`
+						Edges []struct {
+							Node struct {
+								ID    string `json:"id"`
+								Units []struct {
+									ID                  string `json:"id"`
+									Number              string `json:"number"`
+									CoOwnershipByLawsID string `json:"coOwnershipByLawsId"`
+								} `json:"units"`
+								MainHolder struct {
+									PropertyType string `json:"propertyType"`
+									Customer     struct {
+										ID          string `json:"id"`
+										Civility    string `json:"civility"`
+										FirstName   string `json:"firstName"`
+										LastName    string `json:"lastName"`
+										DisplayName string `json:"displayName"`
+										Address     struct {
+											Address1 string `json:"address1"`
+											Address2 string `json:"address2"`
+											City     string `json:"city"`
+											ZipCode  string `json:"zipCode"`
+										} `json:"address"`
+									} `json:"customer"`
+								} `json:"mainHolder"`
+							} `json:"node"`
+						}
+					}
+				}
+			}
+		}
+	}
+
+	bytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("while reading response body: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := json.Unmarshal(bytes, &getCouncilCoownersResp); err != nil {
+		return nil, fmt.Errorf("while unmarshalling response body: %w", err)
+	}
+
+	var coowners []Coowner
+	for _, edge := range getCouncilCoownersResp.Data.CoownerAccount.TrusteeCouncil.Coowners.Edges {
+		var units []int
+		for _, unit := range edge.Node.Units {
+			// Parse front string.
+			unitNumber, err := strconv.Atoi(unit.CoOwnershipByLawsID)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing unit number %s: %w", unit.CoOwnershipByLawsID, err)
+			}
+			units = append(units, unitNumber)
+		}
+
+		coowners = append(coowners, Coowner{
+			Civility:    edge.Node.MainHolder.Customer.Civility,
+			FirstName:   edge.Node.MainHolder.Customer.FirstName,
+			LastName:    edge.Node.MainHolder.Customer.LastName,
+			DisplayName: edge.Node.MainHolder.Customer.DisplayName,
+			Address1:    edge.Node.MainHolder.Customer.Address.Address1,
+			Address2:    edge.Node.MainHolder.Customer.Address.Address2,
+			City:        edge.Node.MainHolder.Customer.Address.City,
+			ZipCode:     edge.Node.MainHolder.Customer.Address.ZipCode,
+			Units:       units,
+		})
+	}
+
+	return coowners, nil
 }
