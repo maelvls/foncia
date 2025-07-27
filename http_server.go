@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -266,41 +267,63 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 	// that's why a second endpoint /invoiceid was added to support invoice IDs.
 	//
 	//  GET /dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
-	//                  <----------------------> <--------->
-	//                         <hash_file>        <filename>
+	//                  <----------------------><---------->
+	//                         <hash_file>        <filename> (optional)
 	//
 	//  GET /dl/contract/660d79500178f21ab3ffc357/contract.pdf
-	//                   <----------------------> <---------->
-	//                          <hash_file>        <filename>
+	//                   <----------------------><----------->
+	//                          <hash_file>        <filename> (optional)
 	//
 	//  GET /dl/invoiceid/660d79500178f21ab3ffc357/invoice.pdf
-	//                    <----------------------> <---------->
-	//                          <invoice_id>        <filename>
+	//                    <----------------------><----------->
+	//                          <invoice_id>        <filename> (optional)
 	//
 	//  GET /dl/doc/660d79500178f21ab3ffc357/invoice.pdf
 	//              <----------------------> <---------->
-	//              <account_document's id>    <filename>
+	//              <account_document's id>    <filename> (optional)
+	//
+	// The 'optional' above means that we return a 302 Redirect if <filename>
+	// hasn't been given or is incorrect. That's super useful when the user only
+	// has the hash file, then they can get the filename by following the
+	// redirect. For example, if the user has the hash file:
+	//
+	//  GET /dl/invoice/660d79500178f21ab3ffc357     (ending / is optional)
+	//
+	// the user will redirected to:
+	//
+	//  GET /dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
 	mux.HandleFunc("/dl/", logRequest(func(w http.ResponseWriter, r *http.Request) {
+		logutil.Debugf("download request: %s %s", r.Method, r.URL.Path)
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		// Get filename and hash file.
-		path, found := strings.CutPrefix(r.URL.Path, "/dl/")
+		urlPath, found := strings.CutPrefix(r.URL.Path, "/dl/")
 		if !found {
 			logutil.Errorf("was expecting a path like /dl/(invoice|contract)/<hash_file>/<filename> but got %q", r.URL.Path)
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 
-		parts := strings.SplitN(path, "/", 3)
-		if len(parts) != 3 {
-			http.Error(w, "not found", http.StatusNotFound)
+		parts := strings.Split(urlPath, "/")
+		var typ, hashFile, fileNameInURL string
+		switch len(parts) {
+		case 2:
+			typ = parts[0]
+			hashFile = parts[1]
+		case 3:
+			typ = parts[0]
+			hashFile = parts[1]
+			fileNameInURL = parts[2]
+		default:
+			logutil.Errorf("invalid path %q, must be of: /dl/invoice/<hash_file>, /dl/invoiceid/<hash_file>, /dl/contract/<invoice_id> or /dl/doc/<account_document_id>. It may be followed by /<filename>", r.URL.Path)
+			http.Error(w, "not found, URL must be of: /dl/invoice/<hash_file>, /dl/invoiceid/<hash_file>, /dl/contract/<invoice_id> or /dl/doc/<account_document_id>. It may be followed by /<filename>", http.StatusNotFound)
 			return
 		}
-		typ, hashFile, _ := parts[0], parts[1], parts[2]
 
+		var filePathReal string
 		switch typ {
 		case "invoice":
 			expenses, err := db.GetExpensesByHashFileDB(context.Background(), sqlDB, hashFile)
@@ -309,7 +332,7 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			http.ServeFile(w, r, expenses[0].FilePath)
+			filePathReal = expenses[0].FilePath
 		case "invoiceid":
 			expenses, err := db.GetExpensesByInvoiceID(context.Background(), sqlDB, hashFile)
 			if err != nil || expenses == nil {
@@ -317,7 +340,7 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			http.ServeFile(w, r, expenses[0].FilePath)
+			filePathReal = expenses[0].FilePath
 		case "contract":
 			doc, err := db.GetSupplierContractByHashFileDB(context.Background(), sqlDB, hashFile)
 			if err != nil {
@@ -325,7 +348,7 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			http.ServeFile(w, r, doc.FilePath)
+			filePathReal = doc.FilePath
 		case "doc":
 			doc, err := db.GetAccountDocumentByHashFileDB(context.Background(), sqlDB, hashFile)
 			if err != nil {
@@ -333,10 +356,25 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			http.ServeFile(w, r, doc.FilePath)
+			filePathReal = doc.FilePath
 		default:
-			http.Error(w, "not found", http.StatusNotFound)
+			http.Error(w, "not found, URL must start with either /dl/invoice/, /dl/invoiceid/, /dl/contract/ or /dl/doc/", http.StatusNotFound)
+			logutil.Errorf("invalid path %q, must start with /dl/invoice/, /dl/invoiceid/, /dl/contract/ or /dl/doc/", r.URL.Path)
+			return
 		}
+
+		// Let's redirect if the file path in the URL is not the same as the
+		// real file path. The filePath may contain a relative path, so we only
+		// keep the filename and remove the directory part.
+		fileNameReal := path.Base(filePathReal)
+		if fileNameInURL != fileNameReal {
+			http.Redirect(w, r, "/dl/"+typ+"/"+hashFile+"/"+fileNameReal, http.StatusFound)
+			return
+		}
+
+		// Otherwise, let's serve the file.
+		logutil.Infof("serving file %q for %s", filePathReal, r.RemoteAddr)
+		http.ServeFile(w, r, filePathReal)
 	}))
 
 	mux.HandleFunc("/", logRequest(func(w http.ResponseWriter, r *http.Request) {
