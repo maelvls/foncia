@@ -179,13 +179,14 @@ func main() {
 			serveBaseURL = "http://" + *serveAddr
 		}
 
-		uuid, err := api.GetAccountUUID(client)
-		if err != nil {
-			logutil.Errorf("while getting account UUID: %v", err)
-			os.Exit(1)
-		}
-
+		var uuid string
 		if !*readOnly {
+			uuid, err := api.GetAccountUUID(client)
+			if err != nil {
+				logutil.Errorf("while getting account UUID: %v", err)
+				os.Exit(1)
+			}
+
 			go func() {
 				// When the database is empty, we do an initial fetch to populate
 				// it; since it most likely means that these items aren't new, we
