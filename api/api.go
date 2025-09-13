@@ -1566,11 +1566,11 @@ type AccountDocumentAPI struct {
 
 func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, category db.DocumentCategory) ([]AccountDocumentAPI, error) {
 	const getAccountDocumentsQuery = `
-		query getAccountDocuments($accountUuid: EncodedID!, $first: Int, $after: Cursor, $documentCategory: MyFonciaFileCategoryEnum!, $originalFilename: String, $subCategories: [String!], $fromDate: String, $toDate: String, $missionGeneralAssemblyIds: [String!]) {
+		query getAccountDocuments($accountUuid: EncodedID!, $first: Int, $after: Cursor, $customerPortalCategory: CustomerPortalFileCategoryEnum!, $originalFilename: String, $subCategories: [String!], $fromDate: String, $toDate: String, $missionGeneralAssemblyIds: [String!]) {
 		  account(uuid: $accountUuid) {
 		    uuid
 		    documents(
-		      documentCategory: $documentCategory
+		      customerPortalCategory: $customerPortalCategory
 		      first: $first
 		      after: $after
 		      originalFilename: $originalFilename
@@ -1638,7 +1638,7 @@ func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, ca
 		"accountUuid":      accountUUID,
 		"originalFilename": "",
 		"subCategories":    []string{},
-		"documentCategory": category,
+		"customerPortalCategory": category,
 		"after":            cursor,
 	}, &getAccountDocumentsResp)
 	if err != nil {
