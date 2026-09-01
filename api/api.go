@@ -14,6 +14,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -586,7 +587,25 @@ type transportCurlLogs struct {
 }
 
 func (tr transportCurlLogs) RoundTrip(r *http.Request) (*http.Response, error) {
-	logutil.Debugf("%s", gencurl.FromRequest(r))
+	// Clone request to redact sensitive headers from debug logs.
+	r2 := r.Clone(r.Context())
+	if r.GetBody != nil {
+		body, err := r.GetBody()
+		if err != nil {
+			return nil, fmt.Errorf("while cloning request body for debug log: %w", err)
+		}
+		r2.Body = body
+	} else {
+		r2.Body = nil
+	}
+	if r2.Header != nil {
+		r2.Header = r2.Header.Clone()
+		r2.Header.Del("Authorization")
+		r2.Header.Del("authorization")
+		r2.Header.Del("Cookie")
+		r2.Header.Del("cookie")
+	}
+	logutil.Debugf("%s", gencurl.FromRequest(r2))
 	return tr.trWrapped.RoundTrip(r)
 }
 
@@ -1492,33 +1511,29 @@ func Download(client *http.Client, fileURL string, filePath string) error {
 		return fmt.Errorf("while downloading invoice: %v", err)
 	}
 	defer resp.Body.Close()
-	// Example:
-	//  x-amz-id-2: LYkuTg0aWoXYJfRSsy2CF+BBAFZJB7Fmt6pLoGb34Yta62/CDmp63ank88BDQQ2itWWHAWwGRAA=
-	//  x-amz-request-id: 1YW04QB3HZTWXHSN
-	//  Date: Fri, 05 Apr 2024 18:31:17 GMT
-	//  x-amz-replication-status: COMPLETED
-	//  Last-Modified: Tue, 02 Apr 2024 06:42:18 GMT
-	//  ETag: "3ce4db0dc63cd2ef935f316181b0fed5"
-	//  x-amz-server-side-encryption: AES256
-	//  x-amz-version-id: k628Oenqp4qoDYl3cNHu59gBK2PIBqpK
-	//  Content-Disposition: filename="ALPES%20CONTROLES%20-%20OSMIL802674431%20-%202024-02-16%20-%202431007J.pdf"
-	//  Accept-Ranges: bytes
-	//  Content-Type: application/pdf
-	//  Server: AmazonS3
-	//  Content-Length: 370642
 
-	var buf bytes.Buffer
-
-	_, err = io.Copy(&buf, resp.Body)
-	if err != nil {
-		return fmt.Errorf("while reading file: %v", err)
+	// Ensure destination directory exists.
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		return fmt.Errorf("while ensuring destination directory: %v", err)
 	}
 
-	err = os.WriteFile(filePath, buf.Bytes(), 0644)
+	// Write to a temporary file and then atomically rename.
+	tmpPath := filePath + ".part"
+	f, err := os.Create(tmpPath)
 	if err != nil {
-		return fmt.Errorf("while saving file to disk: %v", err)
+		return fmt.Errorf("while creating temp file: %v", err)
 	}
-
+	_, copyErr := io.Copy(f, resp.Body)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return fmt.Errorf("while streaming download to disk: %v", copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("while closing temp file: %v", closeErr)
+	}
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		return fmt.Errorf("while renaming temp file: %v", err)
+	}
 	return nil
 }
 
@@ -1635,11 +1650,11 @@ func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, ca
 
 	var cursor *string
 	err := DoGraphQL(client, graphqlURL, getAccountDocumentsQuery, map[string]any{
-		"accountUuid":      accountUUID,
-		"originalFilename": "",
-		"subCategories":    []string{},
+		"accountUuid":            accountUUID,
+		"originalFilename":       "",
+		"subCategories":          []string{},
 		"customerPortalCategory": category,
-		"after":            cursor,
+		"after":                  cursor,
 	}, &getAccountDocumentsResp)
 	if err != nil {
 		return nil, fmt.Errorf("error while querying getAccountDocumentsResp: %w", err)

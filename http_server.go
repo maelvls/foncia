@@ -83,7 +83,7 @@ var tmpl = template.Must(template.New("base").Parse(`
 
 	{{ template "header" . }}
 
-	<form action="/" method="GET">
+    <form action="{{.BasePath}}/" method="GET">
 		<input type="radio" id="all" name="filter" value="" {{if eq .Filter ""}}checked{{end}}>
 		<label for="all">Tous</label>
 
@@ -238,23 +238,41 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 		return fmt.Errorf("while parsing HTML header file %s: %w", *htmlHeaderFile, err)
 	}
 
-	// HTTP server to serve the list of missions and expenses.
-	mux := http.NewServeMux()
-	s := http.Server{Handler: mux}
+    // HTTP server to serve the list of missions and expenses.
+    // We mount all handlers under basePath using StripPrefix so they work behind a subpath.
+    rootMux := http.NewServeMux()
+    subMux := http.NewServeMux()
+    s := http.Server{
+        Handler:           rootMux,
+        ReadHeaderTimeout: 10 * time.Second,
+        ReadTimeout:       30 * time.Second,
+        WriteTimeout:      60 * time.Second,
+        IdleTimeout:       60 * time.Second,
+    }
 	go func() {
 		<-ctx.Done()
 		_ = s.Close()
 	}()
 
-	err = addHandlers(mux, db, client, uuid, basePath, lastSync)
-	if err != nil {
-		return fmt.Errorf("while adding handlers: %w", err)
-	}
+    err = addHandlers(subMux, db, client, uuid, basePath, lastSync)
+    if err != nil {
+        return fmt.Errorf("while adding handlers: %w", err)
+    }
+
+    mountPath := basePath
+    if mountPath == "" {
+        mountPath = "/"
+    }
+    // Ensure mount path ends with slash for proper subtree handling.
+    if !strings.HasSuffix(mountPath, "/") {
+        mountPath += "/"
+    }
+    rootMux.Handle(mountPath, http.StripPrefix(strings.TrimRight(mountPath, "/"), subMux))
 
 	logutil.Infof("listening on %v", httpListen.Addr())
 	logutil.Infof("url: http://%s%s", httpListen.Addr(), basePath)
 
-	err = s.Serve(httpListen)
+    err = s.Serve(httpListen)
 	if err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("while serving HTTP: %w", err)
 	}
@@ -367,10 +385,15 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 		// real file path. The filePath may contain a relative path, so we only
 		// keep the filename and remove the directory part.
 		fileNameReal := path.Base(filePathReal)
-		if fileNameInURL != fileNameReal {
-			http.Redirect(w, r, "/dl/"+typ+"/"+hashFile+"/"+fileNameReal, http.StatusFound)
-			return
-		}
+        if fileNameInURL != fileNameReal {
+            // Redirect to canonical path, including basePath if any.
+            target := basePath + "/dl/" + typ + "/" + hashFile + "/" + fileNameReal
+            if target == "" { // safety, though basePath may be empty.
+                target = "/dl/" + typ + "/" + hashFile + "/" + fileNameReal
+            }
+            http.Redirect(w, r, target, http.StatusFound)
+            return
+        }
 
 		// Otherwise, let's serve the file.
 		logutil.Infof("serving file %q for %s", filePathReal, r.RemoteAddr)

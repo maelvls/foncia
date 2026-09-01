@@ -262,16 +262,16 @@ func main() {
 			}
 		}
 
-		httpListen, err := net.Listen("tcp", *serveAddr)
-		if err != nil {
-			logutil.Errorf("while starting listener for the SMTP server: %v", err)
-			return
-		}
-		smtpListen, err := net.Listen("tcp", *smtpAddr)
-		if err != nil {
-			logutil.Errorf("while starting listener for the HTTP server: %v", err)
-			return
-		}
+        httpListen, err := net.Listen("tcp", *serveAddr)
+        if err != nil {
+            logutil.Errorf("while starting listener for the HTTP server: %v", err)
+            return
+        }
+        smtpListen, err := net.Listen("tcp", *smtpAddr)
+        if err != nil {
+            logutil.Errorf("while starting listener for the SMTP server: %v", err)
+            return
+        }
 
 		wg := sync.WaitGroup{}
 
@@ -438,21 +438,21 @@ type ntfyMsg struct {
 }
 
 func missionToNtfyBody(m db.MissionDB) string {
-	msg := m.Label
-	if m.Description != "" {
-		msg += ": " + m.Description
-	}
+    msg := m.Label
+    if m.Description != "" {
+        msg += ": " + m.Description
+    }
 
-	// Add the work orders.
-	wos := make([]string, len(m.WorkOrders))
-	for _, wo := range m.WorkOrders {
-		wos = append(wos, fmt.Sprintf("%s %s", wo.Supplier.Activity, wo.Label))
-	}
-	if len(wos) > 0 {
-		msg += " (" + strings.Join(wos, ", ") + ")"
-	}
+    // Add the work orders.
+    wos := make([]string, 0, len(m.WorkOrders))
+    for _, wo := range m.WorkOrders {
+        wos = append(wos, fmt.Sprintf("%s %s", wo.Supplier.Activity, wo.Label))
+    }
+    if len(wos) > 0 {
+        msg += " (" + strings.Join(wos, ", ") + ")"
+    }
 
-	return msg
+    return msg
 }
 
 // Returns the new entries found.

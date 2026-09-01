@@ -549,10 +549,10 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 		}
 	}()
 
-	for _, e := range expense {
-		req := "UPDATE expenses SET file_path = ?, source = ? WHERE label = ? AND date = ? AND amount = ? AND accounting_allocation = ? AND accounting_expense_type = ? AND hash_file = ?;"
-		args := []any{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile}
-		res, err := tx.ExecContext(ctx, req, args...)
+    for _, e := range expense {
+        req := "UPDATE expenses SET file_path = ?, source = ? WHERE label = ? AND date = ? AND amount = ? AND accounting_allocation = ? AND accounting_expense_type = ? AND hash_file = ?;"
+        args := []any{e.FilePath, e.Source, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile}
+        res, err := tx.ExecContext(ctx, req, args...)
 		if err != nil {
 			return fmt.Errorf("while updating expenses: %w", err)
 		}
