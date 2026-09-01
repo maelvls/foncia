@@ -1633,34 +1633,50 @@ func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, ca
 		} `json:"data"`
 	}
 
-	var cursor *string
-	err := DoGraphQL(client, graphqlURL, getAccountDocumentsQuery, map[string]any{
-		"accountUuid":            accountUUID,
-		"originalFilename":       "",
-		"subCategories":          []string{},
-		"customerPortalCategory": category,
-		"after":                  cursor,
-	}, &getAccountDocumentsResp)
-	if err != nil {
-		return nil, fmt.Errorf("error while querying getAccountDocumentsResp: %w", err)
-	}
-
 	var docs []AccountDocumentAPI
-	for _, edge := range getAccountDocumentsResp.Data.Account.Documents.Edges {
-		createdAt, err := time.Parse(time.RFC3339Nano, edge.Node.CreatedAt)
+	var cursor *string
+	// The "generalAssembly" category has more documents than fit in a single
+	// page, so we have to follow the cursor. 100 is the maximum page size the
+	// API accepts.
+	for {
+		err := DoGraphQL(client, graphqlURL, getAccountDocumentsQuery, map[string]any{
+			"accountUuid":            accountUUID,
+			"originalFilename":       "",
+			"subCategories":          []string{},
+			"customerPortalCategory": category,
+			"first":                  100,
+			"after":                  cursor,
+		}, &getAccountDocumentsResp)
 		if err != nil {
-			logutil.Debugf("error parsing time: %v", err)
-			return nil, err
+			return nil, fmt.Errorf("error while querying getAccountDocumentsResp: %w", err)
 		}
 
-		docs = append(docs, AccountDocumentAPI{
-			ID:               edge.Node.ID,
-			HashFile:         db.HashFile(edge.Node.HashFile),
-			MimeType:         edge.Node.MimeType,
-			OriginalFilename: edge.Node.OriginalFilename,
-			Category:         db.DocumentCategory(edge.Node.Category),
-			CreatedAt:        createdAt,
-		})
+		documents := getAccountDocumentsResp.Data.Account.Documents
+		for _, edge := range documents.Edges {
+			createdAt, err := time.Parse(time.RFC3339Nano, edge.Node.CreatedAt)
+			if err != nil {
+				logutil.Debugf("error parsing time: %v", err)
+				return nil, err
+			}
+
+			docs = append(docs, AccountDocumentAPI{
+				ID:               edge.Node.ID,
+				HashFile:         db.HashFile(edge.Node.HashFile),
+				MimeType:         edge.Node.MimeType,
+				OriginalFilename: edge.Node.OriginalFilename,
+				Category:         db.DocumentCategory(edge.Node.Category),
+				CreatedAt:        createdAt,
+			})
+		}
+
+		// Guard against a server that keeps saying "there is a next page" while
+		// handing us the same cursor over and over.
+		if !documents.PageInfo.HasNextPage || documents.PageInfo.EndCursor == "" ||
+			(cursor != nil && documents.PageInfo.EndCursor == *cursor) {
+			break
+		}
+		endCursor := documents.PageInfo.EndCursor
+		cursor = &endCursor
 	}
 	return docs, nil
 }

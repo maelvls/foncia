@@ -52,6 +52,12 @@ var (
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
 
+	// The general assembly documents are always indexed so that they show up in
+	// the UI, but they aren't downloaded by default: some of the convocations
+	// weigh tens of megabytes, and there are more than a hundred of them. When
+	// they aren't on disk, /dl/doc/<hash> redirects to the Foncia URL instead.
+	downloadAGDocs = flag.Bool("download-ag-documents", false, "Download the general assembly documents (convocations, procès-verbaux, annexes) to --invoices-dir during the sync. They can weigh several hundred megabytes; when this is off, the UI links to Foncia instead.")
+
 	jsonFlag   = flag.Bool("json", false, "For the 'comptes-travaux' command: print the result as JSON instead of a human-readable table.")
 	totalsFlag = flag.Bool("totals", false, "For the 'comptes-travaux' command: also show the balance of each 'compte travaux'. Slower, since it does one extra API call per 'compte travaux'.")
 )
@@ -103,7 +109,7 @@ func main() {
 			"  %s [flags] <command>\n"+
 			"\n"+
 			"Commands:\n"+
-			"  serve, serve-smtp, list, comptes-travaux, rm-last-expense, rm-last-mission, token\n"+
+			"  serve, serve-smtp, list, comptes-travaux, convocations, rm-last-expense, rm-last-mission, token\n"+
 			"\n"+
 			"Flags:\n", os.Args[0])
 		flag.CommandLine.PrintDefaults()
@@ -398,6 +404,23 @@ func main() {
 
 		username, password := getCreds()
 		ComptesTravauxCmd(username, password, search, *asJSON, *withTotals)
+	case "convocations", "ag":
+		fs := flag.NewFlagSet(flag.Arg(0), flag.ExitOnError)
+		asJSON := fs.Bool("json", *jsonFlag, "Print the result as JSON instead of a human-readable table.")
+		withAll := fs.Bool("all", false, "Also list the procès-verbaux and the annexes of the general assemblies, not just the convocations.")
+		outDir := fs.String("download", "", "Download the PDFs to this directory instead of listing them. The directory is created if needed.")
+		args := parseInterspersed(fs, flag.Args()[1:])
+		if len(args) > 1 {
+			logutil.Errorf("expected at most one file name to look for, got %d: %s", len(args), strings.Join(args, ", "))
+			os.Exit(1)
+		}
+		var search string
+		if len(args) == 1 {
+			search = args[0]
+		}
+
+		username, password := getCreds()
+		ConvocationsCmd(username, password, search, *outDir, *withAll, *asJSON)
 	case "rm-last-expense":
 		path := *dbPath
 		logutil.Debugf("using sqlite3 database file %q", path)
@@ -437,7 +460,7 @@ func main() {
 		}
 		fmt.Println(token.StringOnPurpose())
 	case "":
-		logutil.Errorf("no command given. Use one of: serve, list, comptes-travaux, rm-last-expense, rm-last-mission, token")
+		logutil.Errorf("no command given. Use one of: serve, list, comptes-travaux, convocations, rm-last-expense, rm-last-mission, token")
 	default:
 		logutil.Errorf("unknown command %q", flag.Arg(0))
 		os.Exit(1)
@@ -481,7 +504,7 @@ func missionToNtfyBody(m db.MissionDB) string {
 func authFetchSave(client *http.Client, db *sql.DB, uuid, invoicesDir string) ([]db.MissionDB, []db.ExpenseDocumentDB, error) {
 	ctx := context.Background()
 
-	err := syncAccountDocumentsWithDB(ctx, client, db, graphqlURL, uuid, invoicesDir)
+	err := syncAccountDocumentsWithDB(ctx, client, db, graphqlURL, uuid, invoicesDir, *downloadAGDocs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("while saving to database: %v", err)
 	}

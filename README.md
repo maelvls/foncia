@@ -65,6 +65,44 @@ balance is money that has been called but not spent yet.
 
 Use `--json` to get the raw data instead of the table. Amounts are in cents.
 
+## Convocations d'assemblée générale
+
+The documents attached to the general assemblies — the convocations, the signed
+procès-verbaux, and the annexes (accounts, water meter readings, etc.) — show up
+in the web UI under the filter "Assemblées générales".
+
+They are indexed by the sync but **not downloaded** by default: there are more
+than a hundred of them, and some convocations weigh tens of megabytes. When a
+document isn't on disk, the UI shows a "Télécharger depuis Foncia" link, and
+`/dl/doc/<hash_file>` redirects to the pre-signed URL that Foncia hands out. Pass
+`--download-ag-documents` to `serve` if you would rather keep them all in
+`--invoices-dir`.
+
+From the CLI, to list the convocations:
+
+```bash
+foncia convocations
+```
+
+```text
+17 Nov 2025  Convocation      Convocation.AGO.10.12.2025.pdf
+17 Dec 2024  Convocation      Convocation.AGO.15.01.2025.pdf
+06 Mar 2024  Convocation      Convocation.AGO.17.04.2024.pdf
+```
+
+Add `--all` to also list the procès-verbaux and the annexes. A positional
+argument filters on the file name, and `--download <dir>` downloads the PDFs
+instead of listing them:
+
+```bash
+foncia convocations 2025 --download ~/Downloads/ag
+```
+
+```text
+téléchargé: /Users/me/Downloads/ag/Convocation.AGO.10.12.2025.pdf
+téléchargé: /Users/me/Downloads/ag/Convocation.AGO.15.01.2025.pdf
+```
+
 ## Deploy
 
 ```bash
