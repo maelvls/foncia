@@ -1635,11 +1635,11 @@ func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, ca
 
 	var cursor *string
 	err := DoGraphQL(client, graphqlURL, getAccountDocumentsQuery, map[string]any{
-		"accountUuid":      accountUUID,
-		"originalFilename": "",
-		"subCategories":    []string{},
+		"accountUuid":            accountUUID,
+		"originalFilename":       "",
+		"subCategories":          []string{},
 		"customerPortalCategory": category,
-		"after":            cursor,
+		"after":                  cursor,
 	}, &getAccountDocumentsResp)
 	if err != nil {
 		return nil, fmt.Errorf("error while querying getAccountDocumentsResp: %w", err)
@@ -1796,7 +1796,66 @@ func GetCouncilProjectDocumentsAPI(client *http.Client, graphqlURL, accountUUID,
 	return docs, nil
 }
 
-func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]string, error) {
+// RepairBudgetAPI is one "compte travaux". In the Foncia GraphQL API, they are
+// called "repair budgets". Each of them tracks the expenses of a single works
+// project voted at a general assembly, e.g. "REFECTION ASCENSEURS".
+type RepairBudgetAPI struct {
+	ID              string    // Example: "6939a432a558318b60013568".
+	Label           string    // Example: "GSM BAT C".
+	ValidatedAmount db.Amount // Amount voted at the general assembly. Example: 100371, i.e. "1003,71 €".
+}
+
+// RepairBudgetDetailsAPI is the breakdown of a single "compte travaux". The
+// expenses are grouped by accounting allocation ("clé de répartition"), and
+// then by expense type.
+type RepairBudgetDetailsAPI struct {
+	BudgetID string
+
+	// TotalToAllocate is the balance of the "compte travaux": the sum of the
+	// expenses charged to it (positive) and of the funds mobilized to pay for
+	// them (negative). A negative total means the works have been over-funded.
+	TotalToAllocate  db.Amount
+	TotalVat         db.Amount
+	TotalRecoverable db.Amount
+
+	Allocations []RepairAllocationAPI
+}
+
+type RepairAllocationAPI struct {
+	ID           string
+	Name         string // Example: "CHARGES ASCENSEUR C".
+	Code         string // Example: "600".
+	ToAllocate   db.Amount
+	Vat          db.Amount
+	Recoverable  db.Amount
+	ExpenseTypes []RepairExpenseTypeAPI
+}
+
+type RepairExpenseTypeAPI struct {
+	ID          string
+	Name        string // Example: "HCC HONORAIRES TRAVAUX".
+	Code        string // Example: "1703".
+	ToAllocate  db.Amount
+	Vat         db.Amount
+	Recoverable db.Amount
+	Expenses    []RepairExpenseAPI
+}
+
+type RepairExpenseAPI struct {
+	ID          string
+	InvoiceID   string      // Empty when no invoice PDF is attached.
+	HashFile    db.HashFile // Empty when no invoice PDF is attached.
+	Label       string
+	Date        time.Time
+	ToAllocate  db.Amount
+	Vat         db.Amount
+	Recoverable db.Amount
+}
+
+// GetRepairBudgets returns the "comptes travaux" of the building. Use
+// GetRepairBudgetDetails or GetRepairBudgetDetailsFull to get the expenses
+// charged to one of them.
+func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]RepairBudgetAPI, error) {
 	const getRepairBudgetsQuery = `
         query getRepairBudgets($accountUuid: EncodedID!) {
           repairBudgets(accountUuid: $accountUuid) {
@@ -1811,7 +1870,12 @@ func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]st
 	var listRepairIDsResp struct {
 		Data struct {
 			RepairBudgets []struct {
-				ID string `json:"id"`
+				ID              string `json:"id"`
+				Label           string `json:"label"`
+				ValidatedAmount struct {
+					Value    int    `json:"value"`
+					Currency string `json:"currency"`
+				} `json:"validatedAmount"`
 			} `json:"repairBudgets"`
 		} `json:"data"`
 	}
@@ -1823,19 +1887,54 @@ func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]st
 		return nil, fmt.Errorf("error while querying listRepairIDsResp: %w", err)
 	}
 
-	var repairIDs []string
+	var budgets []RepairBudgetAPI
 	for _, repair := range listRepairIDsResp.Data.RepairBudgets {
-		repairIDs = append(repairIDs, repair.ID)
+		budgets = append(budgets, RepairBudgetAPI{
+			ID:              repair.ID,
+			Label:           repair.Label,
+			ValidatedAmount: db.Amount(repair.ValidatedAmount.Value),
+		})
 	}
-	return repairIDs, nil
+	return budgets, nil
 }
 
+// GetRepairBudgetDetails returns the expenses charged to a single "compte
+// travaux", flattened. Use GetRepairBudgetDetailsFull if you also need the
+// allocation and expense-type totals.
 func GetRepairBudgetDetails(client *http.Client, graphqlURL, accountUUID, budgetID string) ([]ExpenseDocumentAPI, error) {
+	details, err := GetRepairBudgetDetailsFull(client, graphqlURL, accountUUID, budgetID)
+	if err != nil {
+		return nil, err
+	}
+
+	var expenses []ExpenseDocumentAPI
+	for _, allocation := range details.Allocations {
+		for _, expenseType := range allocation.ExpenseTypes {
+			for _, expense := range expenseType.Expenses {
+				expenses = append(expenses, ExpenseDocumentAPI{
+					InvoiceID:             expense.InvoiceID, // May be empty.
+					HashFile:              expense.HashFile,
+					Label:                 expense.Label,
+					Date:                  expense.Date,
+					Amount:                expense.ToAllocate,
+					AccountingAllocation:  allocation.Name,
+					AccountingExpenseType: expenseType.Name,
+				})
+			}
+		}
+	}
+
+	return expenses, nil
+}
+
+// GetRepairBudgetDetailsFull returns the full breakdown of a single "compte
+// travaux": totals, allocations, expense types, and expenses.
+func GetRepairBudgetDetailsFull(client *http.Client, graphqlURL, accountUUID, budgetID string) (RepairBudgetDetailsAPI, error) {
 	if accountUUID == "" {
-		return nil, errors.New("accountUUID is empty")
+		return RepairBudgetDetailsAPI{}, errors.New("accountUUID is empty")
 	}
 	if budgetID == "" {
-		return nil, errors.New("budgetID is empty")
+		return RepairBudgetDetailsAPI{}, errors.New("budgetID is empty")
 	}
 	const getRepairBudgetDetailsQuery = `
 		query getRepairBudgetDetails($accountUuid: EncodedID!, $budgetId: ID!) {
@@ -1918,57 +2017,35 @@ func GetRepairBudgetDetails(client *http.Client, graphqlURL, accountUUID, budget
 		    }
 		  }
 		}`
+	type amount struct {
+		Value    int    `json:"value"`
+		Currency string `json:"currency"`
+	}
 	var getRepairBudgetDetailsResp struct {
 		Data struct {
 			CoownerAccount struct {
 				TrusteeCouncil struct {
 					RepairBudgets struct {
-						TotalToAllocate struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"totalToAllocate"`
-						TotalVat struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"totalVat"`
-						TotalRecoverable struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"totalRecoverable"`
-						Allocations []struct {
-							ID         string `json:"id"`
-							Name       string `json:"name"`
-							Code       string `json:"code"`
-							ToAllocate struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"toAllocate"`
-							Vat struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"vat"`
-							Recoverable struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"recoverable"`
+						BudgetID         string `json:"budgetId"`
+						TotalToAllocate  amount `json:"totalToAllocate"`
+						TotalVat         amount `json:"totalVat"`
+						TotalRecoverable amount `json:"totalRecoverable"`
+						Allocations      []struct {
+							ID           string `json:"id"`
+							Name         string `json:"name"`
+							Code         string `json:"code"`
+							ToAllocate   amount `json:"toAllocate"`
+							Vat          amount `json:"vat"`
+							Recoverable  amount `json:"recoverable"`
 							ExpenseTypes []struct {
 								ID           string `json:"id"`
 								AllocationID string `json:"allocationId"`
 								Name         string `json:"name"`
 								Code         string `json:"code"`
-								ToAllocate   struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"toAllocate"`
-								Vat struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"vat"`
-								Recoverable struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"recoverable"`
-								Expenses []struct {
+								ToAllocate   amount `json:"toAllocate"`
+								Vat          amount `json:"vat"`
+								Recoverable  amount `json:"recoverable"`
+								Expenses     []struct {
 									ID        string `json:"id"`
 									InvoiceID string `json:"invoiceId"`
 									Label     string `json:"label"`
@@ -1978,18 +2055,9 @@ func GetRepairBudgetDetails(client *http.Client, graphqlURL, accountUUID, budget
 										Category string `json:"category"`
 										ID       string `json:"id"`
 									} `json:"piece"`
-									ToAllocate struct {
-										Value    int    `json:"value"`
-										Currency string `json:"currency"`
-									} `json:"toAllocate"`
-									Vat struct {
-										Value    int    `json:"value"`
-										Currency string `json:"currency"`
-									} `json:"vat"`
-									Recoverable struct {
-										Value    int    `json:"value"`
-										Currency string `json:"currency"`
-									} `json:"recoverable"`
+									ToAllocate  amount `json:"toAllocate"`
+									Vat         amount `json:"vat"`
+									Recoverable amount `json:"recoverable"`
 								} `json:"expenses"`
 							} `json:"expenseTypes"`
 						} `json:"allocations"`
@@ -2004,35 +2072,60 @@ func GetRepairBudgetDetails(client *http.Client, graphqlURL, accountUUID, budget
 		"budgetId":    budgetID,
 	}, &getRepairBudgetDetailsResp)
 	if err != nil {
-		return nil, fmt.Errorf("error while querying getRepairBudgetDetailsResp: %w", err)
+		return RepairBudgetDetailsAPI{}, fmt.Errorf("error while querying getRepairBudgetDetailsResp: %w", err)
 	}
 
-	var expenses []ExpenseDocumentAPI
-	for _, allocation := range getRepairBudgetDetailsResp.Data.CoownerAccount.TrusteeCouncil.RepairBudgets.Allocations {
+	raw := getRepairBudgetDetailsResp.Data.CoownerAccount.TrusteeCouncil.RepairBudgets
+	details := RepairBudgetDetailsAPI{
+		BudgetID:         raw.BudgetID,
+		TotalToAllocate:  db.Amount(raw.TotalToAllocate.Value),
+		TotalVat:         db.Amount(raw.TotalVat.Value),
+		TotalRecoverable: db.Amount(raw.TotalRecoverable.Value),
+	}
+	for _, allocation := range raw.Allocations {
+		a := RepairAllocationAPI{
+			ID:          allocation.ID,
+			Name:        allocation.Name,
+			Code:        allocation.Code,
+			ToAllocate:  db.Amount(allocation.ToAllocate.Value),
+			Vat:         db.Amount(allocation.Vat.Value),
+			Recoverable: db.Amount(allocation.Recoverable.Value),
+		}
 		for _, expenseType := range allocation.ExpenseTypes {
+			t := RepairExpenseTypeAPI{
+				ID:          expenseType.ID,
+				Name:        expenseType.Name,
+				Code:        expenseType.Code,
+				ToAllocate:  db.Amount(expenseType.ToAllocate.Value),
+				Vat:         db.Amount(expenseType.Vat.Value),
+				Recoverable: db.Amount(expenseType.Recoverable.Value),
+			}
 			for _, expense := range expenseType.Expenses {
 				var date time.Time
 				if expense.Date != "" {
 					var err error
 					date, err = time.Parse(time.RFC3339Nano, expense.Date)
 					if err != nil {
-						return nil, fmt.Errorf("error parsing time: %w", err)
+						return RepairBudgetDetailsAPI{}, fmt.Errorf("error parsing time: %w", err)
 					}
 				}
-				expenses = append(expenses, ExpenseDocumentAPI{
-					InvoiceID:             expense.InvoiceID, // May be empty.
-					HashFile:              db.HashFile(expense.Piece.HashFile),
-					Label:                 expense.Label,
-					Date:                  date,
-					Amount:                db.Amount(expense.ToAllocate.Value),
-					AccountingAllocation:  allocation.Name,
-					AccountingExpenseType: expenseType.Name,
+				t.Expenses = append(t.Expenses, RepairExpenseAPI{
+					ID:          expense.ID,
+					InvoiceID:   expense.InvoiceID, // May be empty.
+					HashFile:    db.HashFile(expense.Piece.HashFile),
+					Label:       expense.Label,
+					Date:        date,
+					ToAllocate:  db.Amount(expense.ToAllocate.Value),
+					Vat:         db.Amount(expense.Vat.Value),
+					Recoverable: db.Amount(expense.Recoverable.Value),
 				})
 			}
+			a.ExpenseTypes = append(a.ExpenseTypes, t)
 		}
+		details.Allocations = append(details.Allocations, a)
 	}
 
-	return expenses, nil
+	return details, nil
 }
 
 // I found that after many calls, the server starts returning:

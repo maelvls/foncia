@@ -125,12 +125,12 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		}
 	}
 
-	ids, err := api.GetRepairBudgets(client, graphqlURL, uuid)
+	budgets, err := api.GetRepairBudgets(client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting repair IDs: %v", err)
 	}
-	for _, id := range ids {
-		got, err := api.GetRepairBudgetDetails(client, graphqlURL, uuid, id)
+	for _, budget := range budgets {
+		got, err := api.GetRepairBudgetDetails(client, graphqlURL, uuid, budget.ID)
 		if err != nil {
 			return nil, fmt.Errorf("while getting repair budget details: %v", err)
 		}

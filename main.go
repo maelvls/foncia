@@ -51,6 +51,9 @@ var (
 	readOnly   = flag.Bool("read-only", false, "Disable synchronization with the live API.")
 
 	versionFlag = flag.Bool("version", false, "Print the version and exit.")
+
+	jsonFlag   = flag.Bool("json", false, "For the 'comptes-travaux' command: print the result as JSON instead of a human-readable table.")
+	totalsFlag = flag.Bool("totals", false, "For the 'comptes-travaux' command: also show the balance of each 'compte travaux'. Slower, since it does one extra API call per 'compte travaux'.")
 )
 
 var (
@@ -100,7 +103,7 @@ func main() {
 			"  %s [flags] <command>\n"+
 			"\n"+
 			"Commands:\n"+
-			"  serve, serve-smtp, list, rm-last-expense, rm-last-mission, token\n"+
+			"  serve, serve-smtp, list, comptes-travaux, rm-last-expense, rm-last-mission, token\n"+
 			"\n"+
 			"Flags:\n", os.Args[0])
 		flag.CommandLine.PrintDefaults()
@@ -376,6 +379,25 @@ func main() {
 	case "list":
 		username, password := getCreds()
 		ListCmd(username, password)
+	case "comptes-travaux", "repair-budgets":
+		// The --json and --totals flags are also declared globally so that they
+		// show up in --help and can be given before the command name, as in
+		// `foncia --totals comptes-travaux`.
+		fs := flag.NewFlagSet(flag.Arg(0), flag.ExitOnError)
+		asJSON := fs.Bool("json", *jsonFlag, "Print the result as JSON instead of a human-readable table.")
+		withTotals := fs.Bool("totals", *totalsFlag, "Also show the balance of each 'compte travaux'. Slower, since it does one extra API call per 'compte travaux'.")
+		args := parseInterspersed(fs, flag.Args()[1:])
+		if len(args) > 1 {
+			logutil.Errorf("expected at most one 'compte travaux' to look for, got %d: %s", len(args), strings.Join(args, ", "))
+			os.Exit(1)
+		}
+		var search string
+		if len(args) == 1 {
+			search = args[0]
+		}
+
+		username, password := getCreds()
+		ComptesTravauxCmd(username, password, search, *asJSON, *withTotals)
 	case "rm-last-expense":
 		path := *dbPath
 		logutil.Debugf("using sqlite3 database file %q", path)
@@ -415,7 +437,7 @@ func main() {
 		}
 		fmt.Println(token.StringOnPurpose())
 	case "":
-		logutil.Errorf("no command given. Use one of: serve, list, rm-last-expense, rm-last-mission, token")
+		logutil.Errorf("no command given. Use one of: serve, list, comptes-travaux, rm-last-expense, rm-last-mission, token")
 	default:
 		logutil.Errorf("unknown command %q", flag.Arg(0))
 		os.Exit(1)
@@ -477,6 +499,26 @@ func authFetchSave(client *http.Client, db *sql.DB, uuid, invoicesDir string) ([
 	}
 
 	return newMissions, newExpenses, nil
+}
+
+// The flag package stops parsing as soon as it hits a non-flag argument, which
+// means `comptes-travaux ascenseur --totals` would leave --totals unparsed.
+// This helper keeps parsing after each positional argument so that flags can
+// appear anywhere. It returns the positional arguments.
+func parseInterspersed(fs *flag.FlagSet, args []string) []string {
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			// Unreachable with flag.ExitOnError, but let's not rely on it.
+			logutil.Errorf("while parsing flags: %v", err)
+			os.Exit(1)
+		}
+		if fs.NArg() == 0 {
+			return positional
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
 }
 
 func getCreds() (string, api.Password) {
