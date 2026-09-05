@@ -3,3 +3,5 @@ foncia.db
 *.sqlite
 wordlist
 /invoices
+/convocations-ag
+.claude/worktrees/
