@@ -43,8 +43,8 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql
 	// Since HTTP request per new mission is made, and there may be 200-300
 	// missions, let's do them in batches of 20 so that we can save to DB in
 	// regularly so we don't lose all the work if the program crashes (takes a
-	// lot of time partly because Synology's disk is slow, partly because there
-	// are 200-300 HTTP calls to be made).
+	// lot of time partly because the Raspberry Pi's disk is slow, partly because
+	// there are 200-300 HTTP calls to be made).
 	batchSize := 1
 	i := 0
 	err = DoInBatches(batchSize, newMissions, func(batchMissions []db.MissionDB) error {

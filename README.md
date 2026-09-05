@@ -113,13 +113,6 @@ téléchargé: /Users/me/Downloads/ag/Convocation.AGO.15.01.2025.pdf
 
 ```bash
 KO_DOCKER_REPO=ghcr.io/maelvls/foncia KO_DEFAULTBASEIMAGE=alpine \
-  ko build . --bare --tarball /tmp/out.tar --push=false
-ssh synology /usr/local/bin/docker load </tmp/out.tar
-ssh synology sh -lc bin/deploy-foncia
-```
-
-```sh
-KO_DOCKER_REPO=ghcr.io/maelvls/foncia KO_DEFAULTBASEIMAGE=alpine \
   ko build . --bare --tarball /tmp/out.tar --push=false --platform linux/arm64
 ssh pi docker load </tmp/out.tar
 ssh pi bash -lc vls.dev/foncia/deploy
@@ -149,7 +142,7 @@ docker run -d --restart=always --name foncia -p 8080:8080 \
 ### Who?
 
 ```sh
-ssh synology /usr/local/bin/docker logs caddy 2>&1 | grep '^{' | jq --slurp '.[]|select(.logger=="security")|"\(.ts|strftime("%Y-%m-%d %H:%M:%S"))\t\(.msg)\t\(.user.email)"' -r | grep -vE 'successfully configured OAuth 2.0|provisioned app instance|provisioning app instance' | uniq
-ssh synology /usr/local/bin/docker logs caddy 2>&1 >/dev/null --follow | grep '"logger":"security"'
+ssh pi docker logs caddy 2>&1 | grep '^{' | jq --slurp '.[]|select(.logger=="security")|"\(.ts|strftime("%Y-%m-%d %H:%M:%S"))\t\(.msg)\t\(.user.email)"' -r | grep -vE 'successfully configured OAuth 2.0|provisioned app instance|provisioning app instance' | uniq
+ssh pi docker logs caddy 2>&1 >/dev/null --follow | grep '"logger":"security"'
 docker logs caddy --follow 2>&1 | grep '^{' | jq 'select(.logger == "security")'
 ```
