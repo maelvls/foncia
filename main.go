@@ -56,7 +56,7 @@ var (
 	// the UI, but they aren't downloaded by default: some of the convocations
 	// weigh tens of megabytes, and there are more than a hundred of them. When
 	// they aren't on disk, /dl/doc/<hash> redirects to the Foncia URL instead.
-	downloadAGDocs = flag.Bool("download-ag-documents", false, "Download the general assembly documents (convocations, procès-verbaux, annexes) to --invoices-dir during the sync. They can weigh several hundred megabytes; when this is off, the UI links to Foncia instead.")
+	downloadAGDocs = flag.Bool("download-ag-documents", false, "Download the general assembly documents (convocations, procès-verbaux, annexes) to --invoices-dir during the sync. They can weigh several hundred megabytes; when this is off, they are downloaded on the first click on their link instead.")
 
 	jsonFlag   = flag.Bool("json", false, "For the 'comptes-travaux' command: print the result as JSON instead of a human-readable table.")
 	totalsFlag = flag.Bool("totals", false, "For the 'comptes-travaux' command: also show the balance of each 'compte travaux'. Slower, since it does one extra API call per 'compte travaux'.")
@@ -271,16 +271,16 @@ func main() {
 			}
 		}
 
-        httpListen, err := net.Listen("tcp", *serveAddr)
-        if err != nil {
-            logutil.Errorf("while starting listener for the HTTP server: %v", err)
-            return
-        }
-        smtpListen, err := net.Listen("tcp", *smtpAddr)
-        if err != nil {
-            logutil.Errorf("while starting listener for the SMTP server: %v", err)
-            return
-        }
+		httpListen, err := net.Listen("tcp", *serveAddr)
+		if err != nil {
+			logutil.Errorf("while starting listener for the HTTP server: %v", err)
+			return
+		}
+		smtpListen, err := net.Listen("tcp", *smtpAddr)
+		if err != nil {
+			logutil.Errorf("while starting listener for the SMTP server: %v", err)
+			return
+		}
 
 		wg := sync.WaitGroup{}
 
@@ -306,7 +306,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			defer cancel(nil)
-			err := ServeHTTP(ctx, sqlDB, httpListen, client, uuid, *serveBasePath, readLastSync, htmlHeader)
+			err := ServeHTTP(ctx, sqlDB, httpListen, client, uuid, *serveBasePath, *invoicesDir, readLastSync, htmlHeader)
 			if err != nil {
 				cancel(err)
 			}
@@ -483,21 +483,21 @@ type ntfyMsg struct {
 }
 
 func missionToNtfyBody(m db.MissionDB) string {
-    msg := m.Label
-    if m.Description != "" {
-        msg += ": " + m.Description
-    }
+	msg := m.Label
+	if m.Description != "" {
+		msg += ": " + m.Description
+	}
 
-    // Add the work orders.
-    wos := make([]string, 0, len(m.WorkOrders))
-    for _, wo := range m.WorkOrders {
-        wos = append(wos, fmt.Sprintf("%s %s", wo.Supplier.Activity, wo.Label))
-    }
-    if len(wos) > 0 {
-        msg += " (" + strings.Join(wos, ", ") + ")"
-    }
+	// Add the work orders.
+	wos := make([]string, 0, len(m.WorkOrders))
+	for _, wo := range m.WorkOrders {
+		wos = append(wos, fmt.Sprintf("%s %s", wo.Supplier.Activity, wo.Label))
+	}
+	if len(wos) > 0 {
+		msg += " (" + strings.Join(wos, ", ") + ")"
+	}
 
-    return msg
+	return msg
 }
 
 // Returns the new entries found.

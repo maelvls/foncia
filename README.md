@@ -73,10 +73,16 @@ in the web UI under the filter "Assemblées générales".
 
 They are indexed by the sync but **not downloaded** by default: there are more
 than a hundred of them, and some convocations weigh tens of megabytes. When a
-document isn't on disk, the UI shows a "Télécharger depuis Foncia" link, and
-`/dl/doc/<hash_file>` redirects to the pre-signed URL that Foncia hands out. Pass
-`--download-ag-documents` to `serve` if you would rather keep them all in
-`--invoices-dir`.
+document isn't on disk, the UI shows a "Télécharger depuis Foncia" link;
+`/dl/doc/<hash_file>` then downloads the PDF into `--invoices-dir`, remembers
+where it put it, and serves it. The next hits are served straight from disk.
+Pass `--download-ag-documents` to `serve` if you would rather download them all
+upfront during the sync instead of on the first click.
+
+`/dl/doc/<hash_file>` used to redirect to the pre-signed URL that Foncia hands
+out, which meant the link only worked as long as the API was reachable and our
+token was still valid. Since the token lives for 30 days and `serve` stays up
+for months, those links eventually all answered "not found".
 
 From the CLI, to list the convocations:
 

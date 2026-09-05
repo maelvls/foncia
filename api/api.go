@@ -59,18 +59,64 @@ var (
 
 // The `authClient` given as input is only used to authenticate and is not used
 // after that. A fresh client is returned.
+// AuthenticatedClient returns a client that logs in again when the token
+// expires. The tokens handed out by Foncia are valid for 30 days, which is
+// plenty for the one-shot commands, but the `serve` command stays up for
+// months. It used to keep using the very first token forever, which meant that
+// after 30 days every call to the API failed; the sync stopped, and the
+// "Télécharger depuis Foncia" links started answering "not found".
 func AuthenticatedClient(authClient *http.Client, graphqlURL, username string, password Password) (*http.Client, error) {
 	EnableDebugCurlLogs(authClient)
 
-	token, err := GetToken(authClient, graphqlURL, username, password)
-	if err != nil {
-		logutil.Errorf("while authenticating: %v", err)
-		os.Exit(1)
+	src := &loginTokenSource{
+		authClient: authClient,
+		graphqlURL: graphqlURL,
+		username:   username,
+		password:   password,
 	}
 
-	return AuthenticatedClientToken(token), nil
+	// Let's log in once right away so that wrong credentials are reported when
+	// the command starts rather than on the first call to the API.
+	token, err := src.Token()
+	if err != nil {
+		return nil, fmt.Errorf("while authenticating: %w", err)
+	}
+
+	// ReuseTokenSource hands out the token it has until it is about to expire,
+	// and calls src.Token() again after that.
+	client := oauth2.NewClient(context.Background(), oauth2.ReuseTokenSource(token, src))
+	EnableDebugCurlLogs(client)
+	return client, nil
 }
 
+// loginTokenSource logs in with the username and password every time oauth2
+// needs a fresh token.
+type loginTokenSource struct {
+	authClient *http.Client
+	graphqlURL string
+	username   string
+	password   Password
+}
+
+func (s *loginTokenSource) Token() (*oauth2.Token, error) {
+	token, err := GetToken(s.authClient, s.graphqlURL, s.username, s.password)
+	if err != nil {
+		return nil, err
+	}
+
+	// oauth2 needs to know when the token expires, otherwise it never asks for
+	// a new one.
+	expiry, err := parseJWTExp(string(token))
+	if err != nil {
+		return nil, fmt.Errorf("while parsing the JWT that was just issued: %w", err)
+	}
+
+	return &oauth2.Token{AccessToken: string(token), TokenType: "Bearer", Expiry: expiry}, nil
+}
+
+// AuthenticatedClientToken is used when the token is given directly with
+// FONCIA_TOKEN. Contrary to AuthenticatedClient, this client has no way to log
+// in again, so it stops working when the token expires.
 func AuthenticatedClientToken(token Token) *http.Client {
 	client := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: string(token)},

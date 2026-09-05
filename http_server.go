@@ -179,7 +179,7 @@ var tmpl = template.Must(template.New("base").Parse(`
 					{{if .FilePath}}
 						<td><small><a href="{{$.BasePath}}/dl/doc/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
 					{{else if .HashFile}}
-						{{/* Not on disk: /dl/doc/<hash> redirects to the Foncia URL. */}}
+						{{/* Not on disk yet: /dl/doc/<hash> downloads it from Foncia, saves it, and serves it. */}}
 						<td><small><a href="{{$.BasePath}}/dl/doc/{{.HashFile}}">Télécharger depuis Foncia</a></small></td>
 					{{else}}
 						<td><small>Pas de PDF</small></td>
@@ -228,7 +228,7 @@ func logRequest(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc 
 // the context. The `basePath` should always start with a slash and not end with
 // a slash. If you want to given an empty base path, don't give "/". Instead,
 // give "".
-func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client *http.Client, uuid, basePath string, lastSync func() (time.Time, error), htmlHeader string) error {
+func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client *http.Client, uuid, basePath, invoicesDir string, lastSync func() (time.Time, error), htmlHeader string) error {
 	if basePath != "" && !strings.HasPrefix(basePath, "/") {
 		return fmt.Errorf("base path must start with a slash or be an empty string")
 	}
@@ -245,41 +245,41 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 		return fmt.Errorf("while parsing HTML header file %s: %w", *htmlHeaderFile, err)
 	}
 
-    // HTTP server to serve the list of missions and expenses.
-    // We mount all handlers under basePath using StripPrefix so they work behind a subpath.
-    rootMux := http.NewServeMux()
-    subMux := http.NewServeMux()
-    s := http.Server{
-        Handler:           rootMux,
-        ReadHeaderTimeout: 10 * time.Second,
-        ReadTimeout:       30 * time.Second,
-        WriteTimeout:      60 * time.Second,
-        IdleTimeout:       60 * time.Second,
-    }
+	// HTTP server to serve the list of missions and expenses.
+	// We mount all handlers under basePath using StripPrefix so they work behind a subpath.
+	rootMux := http.NewServeMux()
+	subMux := http.NewServeMux()
+	s := http.Server{
+		Handler:           rootMux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		_ = s.Close()
 	}()
 
-    err = addHandlers(subMux, db, client, uuid, basePath, lastSync)
-    if err != nil {
-        return fmt.Errorf("while adding handlers: %w", err)
-    }
+	err = addHandlers(subMux, db, client, uuid, basePath, invoicesDir, lastSync)
+	if err != nil {
+		return fmt.Errorf("while adding handlers: %w", err)
+	}
 
-    mountPath := basePath
-    if mountPath == "" {
-        mountPath = "/"
-    }
-    // Ensure mount path ends with slash for proper subtree handling.
-    if !strings.HasSuffix(mountPath, "/") {
-        mountPath += "/"
-    }
-    rootMux.Handle(mountPath, http.StripPrefix(strings.TrimRight(mountPath, "/"), subMux))
+	mountPath := basePath
+	if mountPath == "" {
+		mountPath = "/"
+	}
+	// Ensure mount path ends with slash for proper subtree handling.
+	if !strings.HasSuffix(mountPath, "/") {
+		mountPath += "/"
+	}
+	rootMux.Handle(mountPath, http.StripPrefix(strings.TrimRight(mountPath, "/"), subMux))
 
 	logutil.Infof("listening on %v", httpListen.Addr())
 	logutil.Infof("url: http://%s%s", httpListen.Addr(), basePath)
 
-    err = s.Serve(httpListen)
+	err = s.Serve(httpListen)
 	if err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("while serving HTTP: %w", err)
 	}
@@ -287,7 +287,7 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	return nil
 }
 
-func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, basePath string, lastSync func() (time.Time, error)) error {
+func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, basePath, invoicesDir string, lastSync func() (time.Time, error)) error {
 	// Download a PDF. The /invoice endpoint historically relies on hash files,
 	// that's why a second endpoint /invoiceid was added to support invoice IDs.
 	//
@@ -386,18 +386,19 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 			// The PDF isn't necessarily on disk: unless --download-ag-documents
 			// is set, the general assembly documents are only indexed, not
 			// downloaded, since some of the convocations weigh tens of
-			// megabytes. In that case, we send the browser to the pre-signed
-			// URL that Foncia hands out.
-			if filePathReal == "" {
-				_, fileURL, err := api.GetDocumentURL(client, graphqlURL, db.HashFile(hashFile))
-				if err != nil || fileURL == "" {
-					logutil.Errorf("while getting the URL of the document %s: %v", hashFile, err)
+			// megabytes. We used to send the browser to the pre-signed URL that
+			// Foncia hands out, but that makes the link depend on the API being
+			// reachable and on our token still being valid; when the token had
+			// expired, the link simply answered "not found". Let's download the
+			// PDF instead, remember where we put it, and serve it from disk
+			// from now on.
+			if filePathReal == "" || !fileExists(filePathReal) {
+				filePathReal, err = downloadAccountDocument(r.Context(), sqlDB, client, invoicesDir, doc)
+				if err != nil {
+					logutil.Errorf("while downloading the document %s: %v", hashFile, err)
 					http.Error(w, "not found", http.StatusNotFound)
 					return
 				}
-				logutil.Infof("redirecting %s to the Foncia URL of the document %s", r.RemoteAddr, hashFile)
-				http.Redirect(w, r, fileURL, http.StatusFound)
-				return
 			}
 		default:
 			http.Error(w, "not found, URL must start with either /dl/invoice/, /dl/invoiceid/, /dl/contract/ or /dl/doc/", http.StatusNotFound)
@@ -405,19 +406,29 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 			return
 		}
 
+		// path.Base("") returns ".", and http.Redirect cleans that away, which
+		// means an empty file path used to make us redirect to the very URL
+		// that was requested: an infinite redirect loop. Let's tell the truth
+		// instead.
+		if filePathReal == "" {
+			logutil.Errorf("no file on disk for %q", r.URL.Path)
+			http.Error(w, "not found: this file hasn't been downloaded yet", http.StatusNotFound)
+			return
+		}
+
 		// Let's redirect if the file path in the URL is not the same as the
 		// real file path. The filePath may contain a relative path, so we only
 		// keep the filename and remove the directory part.
 		fileNameReal := path.Base(filePathReal)
-        if fileNameInURL != fileNameReal {
-            // Redirect to canonical path, including basePath if any.
-            target := basePath + "/dl/" + typ + "/" + hashFile + "/" + fileNameReal
-            if target == "" { // safety, though basePath may be empty.
-                target = "/dl/" + typ + "/" + hashFile + "/" + fileNameReal
-            }
-            http.Redirect(w, r, target, http.StatusFound)
-            return
-        }
+		if fileNameInURL != fileNameReal {
+			// Redirect to canonical path, including basePath if any.
+			target := basePath + "/dl/" + typ + "/" + hashFile + "/" + fileNameReal
+			if target == "" { // safety, though basePath may be empty.
+				target = "/dl/" + typ + "/" + hashFile + "/" + fileNameReal
+			}
+			http.Redirect(w, r, target, http.StatusFound)
+			return
+		}
 
 		// Otherwise, let's serve the file.
 		logutil.Infof("serving file %q for %s", filePathReal, r.RemoteAddr)
@@ -575,6 +586,44 @@ func fetchFromDB(ctx context.Context, sqlDB *sql.DB, f filter) ([]MissionOrExpen
 
 // keepCategories keeps the documents whose category is in `categories`. An
 // empty `categories` means "keep everything".
+// downloadAccountDocument downloads the PDF of an account document to
+// invoicesDir and records where it landed in the database, so that the next
+// requests are served straight from disk without touching the Foncia API. It
+// returns the path of the file on disk.
+func downloadAccountDocument(ctx context.Context, sqlDB *sql.DB, client *http.Client, invoicesDir string, doc db.AccountDocumentDB) (string, error) {
+	// I found that the graphql query 'getDocumentURL' returns an empty URL if
+	// the hashFile is empty.
+	if doc.HashFile == "" {
+		return "", fmt.Errorf("the document %s has no hash file, so it can't be downloaded", doc.ID)
+	}
+
+	filename, fileURL, err := api.GetDocumentURL(client, graphqlURL, doc.HashFile)
+	if err != nil {
+		return "", fmt.Errorf("while getting the URL of the document: %w", err)
+	}
+	filePath := path.Join(invoicesDir, filename)
+
+	if !fileExists(filePath) {
+		// The pre-signed URL is authenticated with one of its query parameters,
+		// so an unauthenticated client is enough to download it.
+		err = api.Download(&http.Client{}, fileURL, filePath)
+		if err != nil {
+			return "", fmt.Errorf("while downloading the document: %w", err)
+		}
+		logutil.Infof("downloaded the document %s to %q", doc.ID, filePath)
+	}
+
+	doc.FilePath = filePath
+	err = db.UpsertAccountDocumentsWithDB(ctx, sqlDB, []db.AccountDocumentDB{doc})
+	if err != nil {
+		// The PDF is on disk, so let's still serve it; we will just have to
+		// look its URL up again on the next request.
+		logutil.Errorf("while remembering the path of the document %s: %v", doc.ID, err)
+	}
+
+	return filePath, nil
+}
+
 func keepCategories(docs []db.AccountDocumentDB, categories []db.DocumentCategory) []db.AccountDocumentDB {
 	if len(categories) == 0 {
 		return docs
