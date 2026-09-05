@@ -125,12 +125,12 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		}
 	}
 
-	ids, err := api.GetRepairBudgets(client, graphqlURL, uuid)
+	budgets, err := api.GetRepairBudgets(client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting repair IDs: %v", err)
 	}
-	for _, id := range ids {
-		got, err := api.GetRepairBudgetDetails(client, graphqlURL, uuid, id)
+	for _, budget := range budgets {
+		got, err := api.GetRepairBudgetDetails(client, graphqlURL, uuid, budget.ID)
 		if err != nil {
 			return nil, fmt.Errorf("while getting repair budget details: %v", err)
 		}
@@ -354,19 +354,32 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 	return nil
 }
 
-func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) error {
+// The general assembly documents are always indexed so that they show up in the
+// UI, but they are only downloaded when `downloadAGDocs` is set: there are more
+// than a hundred of them, and some of the convocations weigh tens of megabytes.
+// When they aren't on disk, the HTTP server redirects to the Foncia URL.
+func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string, downloadAGDocs bool) error {
 	// Unauthenticated client just used for downloading files from AWS.
 	downloadClient := &http.Client{}
 	api.EnableDebugCurlLogs(downloadClient)
 
-	accountDocumentsLive, err := api.GetAccountDocuments(client, graphqlURL, uuid, db.DocumentCategoryReportVisit)
-	if err != nil {
-		return fmt.Errorf("while getting account documents: %v", err)
+	// The general assembly documents (convocations, procès-verbaux, and the
+	// annexes) are fetched under a single "portal category"; each document then
+	// carries its own finer-grained category.
+	portalCategories := []db.DocumentCategory{
+		db.DocumentCategoryReportVisit,
+		db.DocumentCategoryGeneralAssembly,
 	}
 
 	var docsLive []db.AccountDocumentDB
-	for _, d := range accountDocumentsLive {
-		docsLive = append(docsLive, AccountDocumentAPIToDB(d))
+	for _, portalCategory := range portalCategories {
+		accountDocumentsLive, err := api.GetAccountDocuments(client, graphqlURL, uuid, portalCategory)
+		if err != nil {
+			return fmt.Errorf("while getting the %q account documents: %v", portalCategory, err)
+		}
+		for _, d := range accountDocumentsLive {
+			docsLive = append(docsLive, AccountDocumentAPIToDB(d))
+		}
 	}
 
 	docsInDB, err := db.GetAccountDocumentsDB(ctx, sqlDB)
@@ -389,6 +402,13 @@ func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB 
 
 		// No need to download if it is already present on disk.
 		if fileExists(doc.FilePath) {
+			continue
+		}
+
+		// The general assembly documents are only indexed, not downloaded,
+		// unless asked otherwise. The HTTP server redirects to the Foncia URL
+		// for the ones that aren't on disk.
+		if doc.IsGeneralAssembly() && !downloadAGDocs {
 			continue
 		}
 

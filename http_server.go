@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudmailin/cloudmailin-go"
+	"github.com/maelvls/foncia/api"
 	"github.com/maelvls/foncia/db"
 	"github.com/maelvls/foncia/logutil"
 )
@@ -96,6 +97,9 @@ var tmpl = template.Must(template.New("base").Parse(`
 		<input type="radio" id="visits" name="filter" value="visits" {{if eq .Filter "visits"}}checked{{end}}>
 		<label for="visits">Rapports de visite</label>
 
+		<input type="radio" id="ag" name="filter" value="ag" {{if eq .Filter "ag"}}checked{{end}}>
+		<label for="ag">Assemblées générales (convocations et procès-verbaux)</label>
+
 		<input type="submit" value="Filtrer">
 	</form>
 
@@ -174,8 +178,11 @@ var tmpl = template.Must(template.New("base").Parse(`
 					<td><small>{{.MimeType}}</small></td>
 					{{if .FilePath}}
 						<td><small><a href="{{$.BasePath}}/dl/doc/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
+					{{else if .HashFile}}
+						{{/* Not on disk: /dl/doc/<hash> redirects to the Foncia URL. */}}
+						<td><small><a href="{{$.BasePath}}/dl/doc/{{.HashFile}}">Télécharger depuis Foncia</a></small></td>
 					{{else}}
-						<td><small>PDF en attente de téléchargement</small></td>
+						<td><small>Pas de PDF</small></td>
 					{{end}}
 				</tr>
 				{{end}}
@@ -375,6 +382,23 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 				return
 			}
 			filePathReal = doc.FilePath
+
+			// The PDF isn't necessarily on disk: unless --download-ag-documents
+			// is set, the general assembly documents are only indexed, not
+			// downloaded, since some of the convocations weigh tens of
+			// megabytes. In that case, we send the browser to the pre-signed
+			// URL that Foncia hands out.
+			if filePathReal == "" {
+				_, fileURL, err := api.GetDocumentURL(client, graphqlURL, db.HashFile(hashFile))
+				if err != nil || fileURL == "" {
+					logutil.Errorf("while getting the URL of the document %s: %v", hashFile, err)
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				logutil.Infof("redirecting %s to the Foncia URL of the document %s", r.RemoteAddr, hashFile)
+				http.Redirect(w, r, fileURL, http.StatusFound)
+				return
+			}
 		default:
 			http.Error(w, "not found, URL must start with either /dl/invoice/, /dl/invoiceid/, /dl/contract/ or /dl/doc/", http.StatusNotFound)
 			logutil.Errorf("invalid path %q, must start with /dl/invoice/, /dl/invoiceid/, /dl/contract/ or /dl/doc/", r.URL.Path)
@@ -414,6 +438,7 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 			filterExpenses = "expenses"
 			filterMissions = "missions"
 			filterVisits   = "visits" // Account documents with the category "reportVisit"
+			filterAG       = "ag"     // Account documents attached to a general assembly.
 		)
 
 		var f filter
@@ -421,11 +446,15 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 		case filterShowAll:
 			f = filter{} // Zero value = show all.
 		case filterExpenses:
-			f = filter{HideExpenses: false, HideMissions: true, HideVisits: true}
+			f = filter{HideExpenses: false, HideMissions: true, HideDocs: true}
 		case filterMissions:
-			f = filter{HideExpenses: true, HideMissions: false, HideVisits: true}
+			f = filter{HideExpenses: true, HideMissions: false, HideDocs: true}
 		case filterVisits:
-			f = filter{HideExpenses: true, HideMissions: true, HideVisits: false}
+			f = filter{HideExpenses: true, HideMissions: true, HideDocs: false,
+				DocCategories: []db.DocumentCategory{db.DocumentCategoryReportVisit}}
+		case filterAG:
+			f = filter{HideExpenses: true, HideMissions: true, HideDocs: false,
+				DocCategories: db.GeneralAssemblyCategories}
 		default:
 			w.WriteHeader(http.StatusInternalServerError)
 			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Invalid filter: %q", filterParam), Version: version})
@@ -505,7 +534,11 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 type filter struct {
 	HideExpenses bool
 	HideMissions bool
-	HideVisits   bool
+	HideDocs     bool
+
+	// When non-empty, only the account documents having one of these categories
+	// are shown. Empty means "all categories".
+	DocCategories []db.DocumentCategory
 }
 
 func fetchFromDB(ctx context.Context, sqlDB *sql.DB, f filter) ([]MissionOrExpense, error) {
@@ -528,15 +561,35 @@ func fetchFromDB(ctx context.Context, sqlDB *sql.DB, f filter) ([]MissionOrExpen
 	}
 
 	var accDocs []db.AccountDocumentDB
-	if !f.HideVisits {
+	if !f.HideDocs {
 		accDocs, err = db.GetAccountDocumentsDB(ctx, sqlDB)
 		if err != nil {
 			return nil, fmt.Errorf("while listing account documents: %w", err)
 		}
+		accDocs = keepCategories(accDocs, f.DocCategories)
 	}
 
 	combined := combineAndSort(missions, expenses, accDocs)
 	return combined, nil
+}
+
+// keepCategories keeps the documents whose category is in `categories`. An
+// empty `categories` means "keep everything".
+func keepCategories(docs []db.AccountDocumentDB, categories []db.DocumentCategory) []db.AccountDocumentDB {
+	if len(categories) == 0 {
+		return docs
+	}
+	keep := make(map[db.DocumentCategory]struct{}, len(categories))
+	for _, c := range categories {
+		keep[c] = struct{}{}
+	}
+	var kept []db.AccountDocumentDB
+	for _, d := range docs {
+		if _, found := keep[d.Category]; found {
+			kept = append(kept, d)
+		}
+	}
+	return kept
 }
 
 func combineAndSort(missions []db.MissionDB, expenses []db.ExpenseDocumentDB, accDocs []db.AccountDocumentDB) []MissionOrExpense {

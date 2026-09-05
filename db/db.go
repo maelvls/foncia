@@ -1060,8 +1060,26 @@ func (e AccountDocumentDB) CategoryFrench() string {
 		return "Rapport de visite"
 	case DocumentCategoryInvoice:
 		return "Facture"
+	case DocumentCategoryConvocation:
+		return "Convocation d'assemblée générale"
+	case DocumentCategoryMinutesSigned:
+		return "Procès-verbal d'assemblée générale"
+	case DocumentCategoryGeneralAssembly:
+		return "Document d'assemblée générale"
 	default:
 		return "Inconnu"
+	}
+}
+
+// IsGeneralAssembly tells whether the document is one of the documents attached
+// to a general assembly ("assemblée générale"): the convocation, the signed
+// minutes, or one of the annexes (accounts, water meter readings, etc.).
+func (e AccountDocumentDB) IsGeneralAssembly() bool {
+	switch e.Category {
+	case DocumentCategoryConvocation, DocumentCategoryMinutesSigned, DocumentCategoryGeneralAssembly:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1071,7 +1089,28 @@ const (
 	DocumentCategoryUnknown     DocumentCategory = "unknown" // Default.
 	DocumentCategoryReportVisit DocumentCategory = "reportVisit"
 	DocumentCategoryInvoice     DocumentCategory = "invoice"
+
+	// The three categories below are the ones returned by the API for the
+	// documents of a general assembly. They are all fetched at once by passing
+	// the "portal category" DocumentCategoryGeneralAssembly to
+	// api.GetAccountDocuments; each document then carries the finer-grained
+	// category below.
+	//
+	//  DocumentCategoryConvocation:     "Convocation.AGO.10.12.2025.pdf"
+	//  DocumentCategoryMinutesSigned:   "PV.AGO.10.12.2025.pdf"
+	//  DocumentCategoryGeneralAssembly: "CC_20210701_Annexe_6-2022.pdf"
+	DocumentCategoryGeneralAssembly DocumentCategory = "generalAssembly"
+	DocumentCategoryConvocation     DocumentCategory = "convocation"
+	DocumentCategoryMinutesSigned   DocumentCategory = "minutesSigned"
 )
+
+// GeneralAssemblyCategories are the categories of the documents attached to a
+// general assembly.
+var GeneralAssemblyCategories = []DocumentCategory{
+	DocumentCategoryConvocation,
+	DocumentCategoryMinutesSigned,
+	DocumentCategoryGeneralAssembly,
+}
 
 func GetAccountDocumentByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) (AccountDocumentDB, error) {
 	var d AccountDocumentDB
