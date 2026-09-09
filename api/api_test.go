@@ -58,9 +58,12 @@ func TestGetFilenameFromURL(t *testing.T) {
 // retry path don't take seconds.
 func fastBackoff(t *testing.T) {
 	t.Helper()
-	old := firstBackoff
+	oldFirst, oldThrottle := firstBackoff, throttleBackoff
 	firstBackoff = time.Millisecond
-	t.Cleanup(func() { firstBackoff = old })
+	throttleBackoff = time.Millisecond
+	t.Cleanup(func() {
+		firstBackoff, throttleBackoff = oldFirst, oldThrottle
+	})
 }
 
 // roundTripFunc turns a func into an http.RoundTripper.
@@ -108,14 +111,43 @@ func TestDo_givesUpAfterAFewAttempts(t *testing.T) {
 
 	_, err := Do(context.Background(), client, http.MethodPost, "http://example.com", []byte(`{}`))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "giving up after 4 attempts")
-	assert.Equal(t, 4, calls)
+	assert.Contains(t, err.Error(), "giving up after 5 attempts")
+	assert.Equal(t, 5, calls)
 }
 
-// A 403 is what an expired or revoked token looks like; it used to be retried
-// ten times with 30 seconds in between, i.e. five minutes of a stuck HTTP
-// handler.
-func TestDo_doesNotRetry403Forever(t *testing.T) {
+// This API answers `403 {"message":"Forbidden"}` when it is rate-limiting, not
+// when something is actually forbidden, so a 403 has to be waited out rather
+// than handed straight back. Treating it as a permission error made the expenses
+// stop downloading and made getCouncilMissionSuppliers fail every cycle.
+func TestDo_retries403BecauseItMeansRateLimited(t *testing.T) {
+	fastBackoff(t)
+
+	calls := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls < 3 {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Body:       io.NopCloser(strings.NewReader(`{"message":"Forbidden"}`)),
+				Header:     http.Header{},
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"data":{}}`)),
+			Header:     http.Header{},
+		}, nil
+	})}
+
+	resp, err := Do(context.Background(), client, http.MethodPost, "http://example.com", []byte(`{}`))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, 3, calls, "the 403s should have been waited out, not handed back")
+}
+
+// A 403 that never clears still has to end, rather than retrying forever.
+func TestDo_givesUpOnAPersistent403(t *testing.T) {
 	fastBackoff(t)
 
 	calls := 0
@@ -128,11 +160,34 @@ func TestDo_doesNotRetry403Forever(t *testing.T) {
 		}, nil
 	})}
 
-	resp, err := Do(context.Background(), client, http.MethodPost, "http://example.com", []byte(`{}`))
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-	assert.Equal(t, 2, calls, "a 403 is retried at most once, then handed back to the caller")
+	_, err := Do(context.Background(), client, http.MethodPost, "http://example.com", []byte(`{}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "giving up")
+	assert.Equal(t, 5, calls, "should stop at maxAttempts")
+}
+
+// The waiting must be interruptible: a rate-limited request reached from an HTTP
+// handler has to unblock as soon as the caller goes away.
+func TestDo_403WaitStopsOnContextCancellation(t *testing.T) {
+	oldThrottle := throttleBackoff
+	throttleBackoff = 10 * time.Second
+	t.Cleanup(func() { throttleBackoff = oldThrottle })
+
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Body:       io.NopCloser(strings.NewReader(`{"message":"Forbidden"}`)),
+			Header:     http.Header{},
+		}, nil
+	})}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := Do(ctx, client, http.MethodPost, "http://example.com", []byte(`{}`))
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second, "should not have waited out the full backoff")
 }
 
 func TestDo_stopsWaitingWhenTheContextIsCancelled(t *testing.T) {
