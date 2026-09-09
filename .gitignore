@@ -1,7 +1,32 @@
-foncia
+# Build output.
+/foncia
+__debug_*
+
+# Secrets: .envrc holds a real password.
+.envrc
+
+# Local databases.
 foncia.db
 *.sqlite
-wordlist
+
+# Downloaded or generated data.
 /invoices
+invoices2
 /convocations-ag
+/rapports
+/mine
+
+# Test fixtures and scratch files recorded locally.
+403.yaml
+sync_expenses_vcr.yaml
+*.gql
+wordlist
+
+# Logs.
+*.log
+logs
+
+# Editor, OS and tooling.
+/.vscode
+.DS_Store
 .claude/worktrees/

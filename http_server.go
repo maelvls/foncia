@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudmailin/cloudmailin-go"
 	"github.com/maelvls/foncia/api"
 	"github.com/maelvls/foncia/db"
 	"github.com/maelvls/foncia/logutil"
@@ -33,195 +33,22 @@ type tmlpData struct {
 	Filter     string
 }
 
-var defaultHeaderTmpl = `
-<p>
-	Notifications: <a href="https://ntfy.sh/{{.NtfyTopic}}">https://ntfy.sh/{{.NtfyTopic}}</a>.
-	<small>Statut : {{.SyncStatus}}</small>
-</p>
-`
-
-var tmpl = template.Must(template.New("base").Parse(`
-<!DOCTYPE html>
-<html>
-<head>
-<title>Suivi des factures et ordres de service de la copro TERRA NOSTRA 2</title>
-<meta charset="utf-8">
-	<style>
-		table {
-			border-collapse: collapse;
-			width: 100%;
-			font-family: Arial, sans-serif;
-			color: #444;
-			font-size: 0.9em;
-			border: 1px solid #f2f2f2;
-		}
-
-		table th {
-			background: #f2f2f2;
-			padding: 10px;
-			font-weight: bold;
-			text-align: left;
-			border-top: 1px solid #e6e6e6;
-		}
-
-		table td {
-			padding: 10px;
-			border-top: 1px solid #e6e6e6;
-			text-align: left;
-		}
-
-		table tr:nth-child(even) {
-			background: #f8f8f8;
-		}
-
-		table tr:hover {
-			background: #f2f2f2;
-		}
-	</style>
-</head>
-<body>
-	<h1>Suivi des factures et ordres de service de la copro TERRA NOSTRA 2</h1>
-
-	{{ template "header" . }}
-
-    <form action="{{.BasePath}}/" method="GET">
-		<input type="radio" id="all" name="filter" value="" {{if eq .Filter ""}}checked{{end}}>
-		<label for="all">Tous</label>
-
-		<input type="radio" id="expenses" name="filter" value="expenses" {{if eq .Filter "expenses"}}checked{{end}}>
-		<label for="expenses">Factures (compte courant et compte travaux)</label>
-
-		<input type="radio" id="missions" name="filter" value="missions" {{if eq .Filter "missions"}}checked{{end}}>
-		<label for="missions">Ordres de mission et ordres de réparation</label>
-
-		<input type="radio" id="visits" name="filter" value="visits" {{if eq .Filter "visits"}}checked{{end}}>
-		<label for="visits">Rapports de visite</label>
-
-		<input type="radio" id="ag" name="filter" value="ag" {{if eq .Filter "ag"}}checked{{end}}>
-		<label for="ag">Assemblées générales (convocations et procès-verbaux)</label>
-
-		<input type="submit" value="Filtrer">
-	</form>
-
-	<table>
-		<thead>
-			<tr>
-				<th>Date</th>
-				<th>Type et statut</th>
-				<th>Label</th>
-				<th>Description</th>
-				<th>Facture ou ordre de service</th>
-			</tr>
-		</thead>
-		<tbody>
-			{{range .Items}}
-				{{with .Mission}}
-				<tr id="{{ .ID }}">
-					<td><a href="{{$.BasePath}}#{{ .ID }}">{{.StartedAt.Format "02 Jan 2006"}}</a></td>
-					<td>{{ .KindFrench }} </br><small>{{ .StatusFrench }}</small></td>
-					<td>{{.Label}}</td>
-					<td><small>{{.Description}}</small></td>
-					<td>
-						<small>
-							{{range .WorkOrders}}
-								{{.Number}}
-								{{.Label}}
-								{{.RepairDateEnd.Format "02/01/2006"}}
-								{{.Supplier.Name}}
-								{{.Supplier.Activity}}</br>
-								{{range .Supplier.Documents}}
-									(<small><a href="{{$.BasePath}}/dl/contract/{{.HashFile}}/{{.FilePath}}">{{.FilePath}}</a></small>)
-								{{end}}
-							{{end}}
-						</small>
-					</td>
-				</tr>
-				{{end}}
-				{{with .Expense}}
-				<tr id="{{or .HashFile .InvoiceID}}">
-					<td><a href="{{$.BasePath}}#{{ or .HashFile .InvoiceID }}">{{.Date.Format "02 Jan 2006"}}</a></td>
-					<td>Facture
-						{{if eq .Source "repairs"}}
-							</br>
-							<small>(compte travaux)</small>
-						{{end}}
-						{{if .AccountingKey}}
-							</br>
-							<small><small>{{.AccountingKey.Allocation}},
-							{{.AccountingKey.ExpenseType}}</small></small>
-						{{end}}
-					</td>
-					<td>{{.Label}}</td>
-					<td><small>
-						{{.Amount}}
-					</small></td>
-					{{if .FilePath}}
-						<td><small>
-						{{if .HashFile}}
-							<a href="{{$.BasePath}}/dl/invoice/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a>
-						{{else if .InvoiceID}}
-							<a href="{{$.BasePath}}/dl/invoiceid/{{.InvoiceID}}/{{.Filename}}">{{.Filename}}</a>
-						{{end}}
-						</small></td>
-					{{else if .HashFile}}
-						<td><small>PDF en attente de téléchargement</small></td>
-					{{else}}
-						<td><small>Pas de PDF</small></td>
-					{{end}}
-				</tr>
-				{{end}}
-				{{with .AccountDocument}}
-				<tr id="{{.ID}}">
-					<td><a href="{{$.BasePath}}#{{.ID}}">{{.CreatedAt.Format "02 Jan 2006"}}</a></td>
-					<td>Document</td>
-					<td>{{.CategoryFrench}}</td>
-					<td><small>{{.MimeType}}</small></td>
-					{{if .FilePath}}
-						<td><small><a href="{{$.BasePath}}/dl/doc/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
-					{{else if .HashFile}}
-						{{/* Not on disk yet: /dl/doc/<hash> downloads it from Foncia, saves it, and serves it. */}}
-						<td><small><a href="{{$.BasePath}}/dl/doc/{{.HashFile}}">Télécharger depuis Foncia</a></small></td>
-					{{else}}
-						<td><small>Pas de PDF</small></td>
-					{{end}}
-				</tr>
-				{{end}}
-			{{end}}
-		</tbody>
-	</table>
-	<div>
-		<small>Version: {{.Version}}</small>
-	</div>
-</body>
-</html>
-`))
+var tmpl = template.Must(template.New("base").Parse(indexHTML))
 
 type tmlpErrData struct {
 	Error   string
 	Version string
 }
 
-var tmlpErr = template.Must(template.New("").Parse(`<!DOCTYPE html>
-<html>
-<head>
-<title>Error</title>
-<meta charset="utf-8">
-</head>
-<body>
-	<h1>Error</h1>
-	<p>{{.Error}}</p>
-	<div>
-		<small>Version: {{.Version}}</small>
-	</div>
-</body>
-</html>
-`))
+var tmlpErr = template.Must(template.New("").Parse(errorHTML))
 
-func logRequest(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+// logRequests logs every incoming request. It wraps the whole mux rather than
+// each handler individually.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		logutil.Debugf("%s %s %s", r.RemoteAddr, r.Method, r.URL)
-		next(w, r)
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Serve the HTTP UI. This func is blocking and can be unblocked by cancelling
@@ -236,7 +63,7 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 		return fmt.Errorf("base path must not end with a slash; if you want to give the base path /, give an empty string instead")
 	}
 
-	headerContents := defaultHeaderTmpl
+	headerContents := headerHTML
 	if htmlHeader != "" {
 		headerContents = htmlHeader
 	}
@@ -258,7 +85,11 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	}
 	go func() {
 		<-ctx.Done()
-		_ = s.Close()
+		// Close() would cut in-flight downloads off mid-file. Give them a
+		// moment to finish instead.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = s.Shutdown(shutdownCtx)
 	}()
 
 	err = addHandlers(subMux, db, client, uuid, basePath, invoicesDir, lastSync)
@@ -274,7 +105,7 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	if !strings.HasSuffix(mountPath, "/") {
 		mountPath += "/"
 	}
-	rootMux.Handle(mountPath, http.StripPrefix(strings.TrimRight(mountPath, "/"), subMux))
+	rootMux.Handle(mountPath, logRequests(onlyAllowedUsers(http.StripPrefix(strings.TrimRight(mountPath, "/"), subMux))))
 
 	logutil.Infof("listening on %v", httpListen.Addr())
 	logutil.Infof("url: http://%s%s", httpListen.Addr(), basePath)
@@ -317,82 +148,49 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 	// the user will redirected to:
 	//
 	//  GET /dl/invoice/660d79500178f21ab3ffc357/invoice.pdf
-	mux.HandleFunc("/dl/", logRequest(func(w http.ResponseWriter, r *http.Request) {
-		logutil.Debugf("download request: %s %s", r.Method, r.URL.Path)
-		if r.Method != "GET" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	dl := func(w http.ResponseWriter, r *http.Request) {
+		typ := r.PathValue("typ")
+		hashFile := r.PathValue("hash")
+		fileNameInURL := r.PathValue("filename")
+
+		lookup, known := documentLookups[typ]
+		if !known {
+			logutil.Errorf("invalid download type %q in %q", typ, r.URL.Path)
+			http.Error(w, "not found: URL must be of the form /dl/(invoice|invoiceid|contract|doc)/<id>[/<filename>]", http.StatusNotFound)
 			return
 		}
 
-		// Get filename and hash file.
-		urlPath, found := strings.CutPrefix(r.URL.Path, "/dl/")
-		if !found {
-			logutil.Errorf("was expecting a path like /dl/(invoice|contract)/<hash_file>/<filename> but got %q", r.URL.Path)
+		filePathReal, err := lookup(r.Context(), sqlDB, hashFile)
+		if err != nil {
+			logutil.Errorf("while looking up %s %q: %v", typ, hashFile, err)
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 
-		parts := strings.Split(urlPath, "/")
-		var typ, hashFile, fileNameInURL string
-		switch len(parts) {
-		case 2:
-			typ = parts[0]
-			hashFile = parts[1]
-		case 3:
-			typ = parts[0]
-			hashFile = parts[1]
-			fileNameInURL = parts[2]
-		default:
-			logutil.Errorf("invalid path %q, must be of: /dl/invoice/<hash_file>, /dl/invoiceid/<hash_file>, /dl/contract/<invoice_id> or /dl/doc/<account_document_id>. It may be followed by /<filename>", r.URL.Path)
-			http.Error(w, "not found, URL must be of: /dl/invoice/<hash_file>, /dl/invoiceid/<hash_file>, /dl/contract/<invoice_id> or /dl/doc/<account_document_id>. It may be followed by /<filename>", http.StatusNotFound)
-			return
-		}
+		// The PDF isn't necessarily on disk: unless --download-ag-documents is
+		// set, the general assembly documents are only indexed, not downloaded,
+		// since some of the convocations weigh tens of megabytes. We used to
+		// send the browser to the pre-signed URL that Foncia hands out, but
+		// that makes the link depend on the API being reachable and on our
+		// token still being valid; when the token had expired, the link simply
+		// answered "not found". Let's download the PDF instead, remember where
+		// we put it, and serve it from disk from now on.
+		if typ == "doc" && (filePathReal == "" || !fileExists(filePathReal)) {
+			// Two browsers clicking the same never-downloaded document at once
+			// would otherwise write the same .part file concurrently. Let the
+			// second one wait and then find the file already on disk.
+			unlock := downloadLocks.Lock(hashFile)
+			defer unlock()
 
-		var filePathReal string
-		switch typ {
-		case "invoice":
-			expenses, err := db.GetExpensesByHashFileDB(context.Background(), sqlDB, hashFile)
-			if err != nil || len(expenses) == 0 {
-				logutil.Errorf("while getting expense by hash file: %v", err)
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			filePathReal = expenses[0].FilePath
-		case "invoiceid":
-			expenses, err := db.GetExpensesByInvoiceID(context.Background(), sqlDB, hashFile)
-			if err != nil || expenses == nil {
-				logutil.Errorf("while getting expense by invoice ID: %v", err)
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			filePathReal = expenses[0].FilePath
-		case "contract":
-			doc, err := db.GetSupplierContractByHashFileDB(context.Background(), sqlDB, hashFile)
+			doc, err := db.GetAccountDocumentByHashFileDB(r.Context(), sqlDB, hashFile)
 			if err != nil {
-				logutil.Errorf("while getting document by hash file: %v", err)
+				logutil.Errorf("while getting account document %q: %v", hashFile, err)
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			filePathReal = doc.FilePath
-		case "doc":
-			doc, err := db.GetAccountDocumentByHashFileDB(context.Background(), sqlDB, hashFile)
-			if err != nil {
-				logutil.Errorf("while getting account document by hash file: %v", err)
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			filePathReal = doc.FilePath
-
-			// The PDF isn't necessarily on disk: unless --download-ag-documents
-			// is set, the general assembly documents are only indexed, not
-			// downloaded, since some of the convocations weigh tens of
-			// megabytes. We used to send the browser to the pre-signed URL that
-			// Foncia hands out, but that makes the link depend on the API being
-			// reachable and on our token still being valid; when the token had
-			// expired, the link simply answered "not found". Let's download the
-			// PDF instead, remember where we put it, and serve it from disk
-			// from now on.
-			if filePathReal == "" || !fileExists(filePathReal) {
+			if doc.FilePath != "" && fileExists(doc.FilePath) {
+				filePathReal = doc.FilePath
+			} else {
 				filePathReal, err = downloadAccountDocument(r.Context(), sqlDB, client, invoicesDir, doc)
 				if err != nil {
 					logutil.Errorf("while downloading the document %s: %v", hashFile, err)
@@ -400,10 +198,6 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 					return
 				}
 			}
-		default:
-			http.Error(w, "not found, URL must start with either /dl/invoice/, /dl/invoiceid/, /dl/contract/ or /dl/doc/", http.StatusNotFound)
-			logutil.Errorf("invalid path %q, must start with /dl/invoice/, /dl/invoiceid/, /dl/contract/ or /dl/doc/", r.URL.Path)
-			return
 		}
 
 		// path.Base("") returns ".", and http.Redirect cleans that away, which
@@ -421,27 +215,22 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 		// keep the filename and remove the directory part.
 		fileNameReal := path.Base(filePathReal)
 		if fileNameInURL != fileNameReal {
-			// Redirect to canonical path, including basePath if any.
-			target := basePath + "/dl/" + typ + "/" + hashFile + "/" + fileNameReal
-			if target == "" { // safety, though basePath may be empty.
-				target = "/dl/" + typ + "/" + hashFile + "/" + fileNameReal
-			}
-			http.Redirect(w, r, target, http.StatusFound)
+			http.Redirect(w, r, basePath+"/dl/"+typ+"/"+hashFile+"/"+fileNameReal, http.StatusFound)
 			return
 		}
 
-		// Otherwise, let's serve the file.
+		// These PDFs are private to the co-owners; make sure no shared proxy
+		// caches them on the way out.
+		w.Header().Set("Cache-Control", "private, max-age=300")
 		logutil.Infof("serving file %q for %s", filePathReal, r.RemoteAddr)
 		http.ServeFile(w, r, filePathReal)
-	}))
+	}
+	mux.HandleFunc("GET /dl/{typ}/{hash}", dl)
+	mux.HandleFunc("GET /dl/{typ}/{hash}/{filename...}", dl)
 
-	mux.HandleFunc("/", logRequest(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		if r.Method != "GET" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
 		filterParam := r.URL.Query().Get("filter")
 
 		const (
@@ -467,35 +256,37 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 			f = filter{HideExpenses: true, HideMissions: true, HideDocs: false,
 				DocCategories: db.GeneralAssemblyCategories}
 		default:
-			w.WriteHeader(http.StatusInternalServerError)
-			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Invalid filter: %q", filterParam), Version: version})
+			renderErr(w, http.StatusBadRequest, fmt.Sprintf("Invalid filter: %q", filterParam))
 			return
 		}
 
 		filteredItems, err := fetchFromDB(ctx, sqlDB, f)
 		if err != nil {
 			logutil.Errorf("while listing: %v", err)
-
-			w.WriteHeader(http.StatusInternalServerError)
-			tmlpErr.Execute(w, tmlpErrData{Error: fmt.Sprintf("Error while listing: %s", err), Version: version})
-
+			renderErr(w, http.StatusInternalServerError, "Erreur interne, voir les logs du serveur.")
 			return
 		}
-
-		w.Header().Set("Content-Type", "text/html")
 
 		var statusMsg string
 		when, err := lastSync()
 		switch {
-		case when.IsZero():
-			statusMsg = "Aucune synchro n'a été faite."
+		// A failed sync is worth reporting even when we have no timestamp for
+		// it; this used to be hidden behind the "never synced" case.
+		case err != nil && when.IsZero():
+			statusMsg = fmt.Sprintf("La dernière synchro a échoué. Erreur : %v", err)
 		case err != nil:
 			statusMsg = fmt.Sprintf("La dernière synchro a échoué il y a %s. Erreur : %v", time.Since(when).Truncate(time.Second), err)
+		case when.IsZero():
+			statusMsg = "Aucune synchro n'a été faite."
 		default:
 			statusMsg = fmt.Sprintf("La dernière synchro a réussi il y a %s.", time.Since(when).Truncate(time.Second))
 		}
 
-		err = tmpl.Execute(w, tmlpData{
+		// Render into a buffer first. Writing straight to the ResponseWriter
+		// commits a 200 as soon as the first byte goes out, so a template that
+		// failed halfway used to be served as a successful but truncated page.
+		var page bytes.Buffer
+		err = tmpl.Execute(&page, tmlpData{
 			BasePath:   basePath,
 			SyncStatus: statusMsg,
 			NtfyTopic:  *ntfyTopic,
@@ -505,38 +296,17 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 		})
 		if err != nil {
 			logutil.Errorf("executing template: %v", err)
-			return
-		}
-	}))
-
-	mux.HandleFunc("/coowners", coownersEndpoint(client, uuid))
-
-	mux.HandleFunc("/cloudmailingwebhook", logRequest(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			renderErr(w, http.StatusInternalServerError, "Erreur interne, voir les logs du serveur.")
 			return
 		}
 
-		message, err := cloudmailin.ParseIncoming(r.Body)
-		if err != nil {
-			http.Error(w, "while parsing message: "+err.Error(), http.StatusUnprocessableEntity)
-			return
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if _, err := page.WriteTo(w); err != nil {
+			logutil.Errorf("writing the page: %v", err)
 		}
+	})
 
-		// Output the first instance of the message-id in the headers to show
-		// that we correctly parsed the message. We could also use the helper
-		// message.Headers.MessageID().
-		logutil.Infof("received message: message-id %s, sub: %s", message.Headers.MessageID(), message.Headers.Subject())
-
-		tx, err := sqlDB.Begin()
-		if err != nil {
-			http.Error(w, "while starting transaction: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer tx.Rollback()
-
-		logutil.Infof("message: %#v", message)
-	}))
+	mux.HandleFunc("GET /coowners", coownersEndpoint(client, uuid))
 
 	return nil
 }
@@ -597,7 +367,7 @@ func downloadAccountDocument(ctx context.Context, sqlDB *sql.DB, client *http.Cl
 		return "", fmt.Errorf("the document %s has no hash file, so it can't be downloaded", doc.ID)
 	}
 
-	filename, fileURL, err := api.GetDocumentURL(client, graphqlURL, doc.HashFile)
+	filename, fileURL, err := api.GetDocumentURL(ctx, client, graphqlURL, doc.HashFile)
 	if err != nil {
 		return "", fmt.Errorf("while getting the URL of the document: %w", err)
 	}
@@ -606,7 +376,7 @@ func downloadAccountDocument(ctx context.Context, sqlDB *sql.DB, client *http.Cl
 	if !fileExists(filePath) {
 		// The pre-signed URL is authenticated with one of its query parameters,
 		// so an unauthenticated client is enough to download it.
-		err = api.Download(&http.Client{}, fileURL, filePath)
+		err = api.Download(ctx, &http.Client{Timeout: 5 * time.Minute}, fileURL, filePath)
 		if err != nil {
 			return "", fmt.Errorf("while downloading the document: %w", err)
 		}
@@ -682,4 +452,49 @@ func combineAndSort(missions []db.MissionDB, expenses []db.ExpenseDocumentDB, ac
 	})
 
 	return combined
+}
+
+// renderErr writes an error page. The status and the Content-Type have to be
+// set before the body is written, which the call sites used to get wrong. The
+// message is shown to the user, so keep internal error text out of it.
+func renderErr(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	if err := tmlpErr.Execute(w, tmlpErrData{Error: msg, Version: version}); err != nil {
+		logutil.Errorf("executing error template: %v", err)
+	}
+}
+
+// onlyAllowedUsers is defence in depth behind the OAuth-terminating reverse
+// proxy. The pages list the co-owners' names and postal addresses, and today
+// nothing in this process checks who is asking: if the proxy were ever
+// misconfigured or bypassed, everything would be served to anyone.
+//
+// It is off unless --allowed-users is given, so the default behaviour is
+// unchanged. Check what your proxy actually sets before turning it on, and set
+// --auth-header to match; the proxy MUST also strip that header from incoming
+// requests, otherwise a client can simply send it themselves.
+func onlyAllowedUsers(next http.Handler) http.Handler {
+	allowed := make(map[string]bool)
+	for _, u := range strings.Split(*allowedUsers, ",") {
+		u = strings.TrimSpace(strings.ToLower(u))
+		if u != "" {
+			allowed[u] = true
+		}
+	}
+	if len(allowed) == 0 {
+		return next
+	}
+
+	logutil.Infof("restricting access to %d user(s) based on the %s header", len(allowed), *authHeader)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := strings.TrimSpace(strings.ToLower(r.Header.Get(*authHeader)))
+		if user == "" || !allowed[user] {
+			logutil.Errorf("refusing request from %s: %s is %q", r.RemoteAddr, *authHeader, user)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

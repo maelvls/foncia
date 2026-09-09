@@ -146,3 +146,60 @@ ssh pi docker logs caddy 2>&1 | grep '^{' | jq --slurp '.[]|select(.logger=="sec
 ssh pi docker logs caddy 2>&1 >/dev/null --follow | grep '"logger":"security"'
 docker logs caddy --follow 2>&1 | grep '^{' | jq 'select(.logger == "security")'
 ```
+
+## Restricting who can see the pages
+
+The pages list the co-owners' names and postal addresses, and the process itself
+does not check who is asking: access control is done entirely by the
+OAuth-terminating reverse proxy in front of it. `--allowed-users` adds a second
+check inside the process, so that a misconfigured or bypassed proxy doesn't
+expose everything:
+
+```bash
+foncia --allowed-users "someone@example.com,someone-else@example.com" serve
+```
+
+The email is read from the header named by `--auth-header`, which defaults to
+`X-Forwarded-Email`. Check what your proxy actually sets before turning this on.
+The proxy **must** also strip that header from incoming requests, otherwise a
+client can just send it themselves. Leaving `--allowed-users` empty, which is the
+default, keeps the previous behaviour of trusting the proxy entirely.
+
+## Development
+
+```bash
+make build     # go build -o foncia .
+make test      # go test ./...
+make vet       # go vet ./...
+make lint      # staticcheck
+```
+
+The same four run in CI on every push, see `.github/workflows/ci.yml`.
+
+**The database is not a cache and must never be recreated.** It looks like one,
+but Foncia's API drops items over time, and once it does this database is the
+only remaining record of them. Those older items still have to show up in the
+UI, so every schema change ships as a migration that transforms the existing
+file in place and preserves every row.
+
+Migrations live in `db/migrations/`, are embedded in the binary, and are applied
+by `db.Open`, which is the only supported way to open the database. They are
+numbered and tracked with SQLite's `user_version`, so each one runs exactly
+once. `CREATE TABLE IF NOT EXISTS` on its own is not a schema strategy here: on
+an existing database it silently does nothing, so new columns never appear and
+the queries that reference them fail at runtime.
+
+`db.Open` also sets the pragmas the code depends on, in particular
+`foreign_keys=ON` (foreign keys are declared in the schema but SQLite ignores
+them unless asked) and `busy_timeout`, since the web handlers and the sync
+goroutine write concurrently.
+
+To add a schema change, add the next numbered migration; never edit one that has
+already been applied in production.
+
+The HTML lives in `templates/` and is embedded with `go:embed` rather than
+being held in Go string literals.
+
+Logs go to stderr through `logutil`, which is a thin `log/slog` handler that
+prints `level: message`. Colours turn themselves off when stderr is not a
+terminal or when `NO_COLOR` is set, so container logs stay readable.

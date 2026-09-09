@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,7 +21,6 @@ import (
 	"github.com/maelvls/foncia/api"
 	"github.com/maelvls/foncia/db"
 	"github.com/maelvls/foncia/logutil"
-	"github.com/maelvls/foncia/undent"
 )
 
 const (
@@ -34,13 +34,12 @@ var (
 	serveBasePath  = flag.String("basepath", "", "Base path, useful for reverse proxies. Must start with a slash or be empty.")
 	serveAddr      = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
 	serveBaseURL   = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications. If empty, --addr is used.")
-	dbOnly         = flag.Bool("db-only", false, "When set, no HTTP request is made, and everything is fetched from the DB.")
 	dbPath         = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
+	allowedUsers   = flag.String("allowed-users", "", "Comma-separated list of email addresses allowed to use the web UI, matched against --auth-header. Empty (the default) means no check is done in this process and access control is left entirely to the reverse proxy.")
+	authHeader     = flag.String("auth-header", "X-Forwarded-Email", "Header set by the authenticating reverse proxy, used by --allowed-users. The proxy must strip this header from incoming requests.")
 	ntfyTopic      = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/.")
 	invoicesDir    = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
 	htmlHeaderFile = flag.String("header-file", "", "File containing an HTML header to be added to the top of the page. Can contain Go template syntax. The template is executed with the following data: {BasePath, SyncStatus, NtfyTopic, Items, Version}.")
-
-	smtpAddr = flag.String("smtp-addr", "0.0.0.0:25", "SMTP server address. The SMTP server is used to forward 'mission' emails from Foncia")
 
 	// In order to test the Ntfy integration, you can use --sync-period=1m and
 	// manually remove the last item from the DB:
@@ -49,8 +48,6 @@ var (
 	//  go run . rm-last-mission
 	syncPeriod = flag.Duration("sync-period", 10*time.Minute, "Period at which to sync with the live API.")
 	readOnly   = flag.Bool("read-only", false, "Disable synchronization with the live API.")
-
-	versionFlag = flag.Bool("version", false, "Print the version and exit.")
 
 	// The general assembly documents are always indexed so that they show up in
 	// the UI, but they aren't downloaded by default: some of the convocations
@@ -84,13 +81,17 @@ func init() {
 	}
 }
 
-var signalOnce = make(chan struct{})
+var signalOnce sync.Once
 
 // Catch ctrl+c and SIGTERM to exit cleanly. Only the first call to this func
 // will be effective.
 func signalOnExit(f func(os.Signal)) {
-	close(signalOnce) // Prevents us from using this func again.
+	signalOnce.Do(func() {
+		installSignalHandler(f)
+	})
+}
 
+func installSignalHandler(f func(os.Signal)) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -109,7 +110,7 @@ func main() {
 			"  %s [flags] <command>\n"+
 			"\n"+
 			"Commands:\n"+
-			"  serve, serve-smtp, list, comptes-travaux, convocations, rm-last-expense, rm-last-mission, token\n"+
+			"  serve, list, comptes-travaux, convocations, rm-last-expense, rm-last-mission, token, version\n"+
 			"\n"+
 			"Flags:\n", os.Args[0])
 		flag.CommandLine.PrintDefaults()
@@ -121,34 +122,25 @@ func main() {
 		logutil.Debugf("debug output enabled")
 	}
 
+	// One context for the whole process, cancelled on SIGINT/SIGTERM, so that
+	// an in-flight sync or HTTP request is interrupted instead of the process
+	// being torn down mid-write.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	signalOnExit(func(s os.Signal) {
+		cancel(fmt.Errorf("received signal %q", s))
+	})
+
 	switch flag.Arg(0) {
 	case "version":
 		fmt.Println(version)
 	case "serve":
 		logutil.Infof("version: %s (%s)", version, date)
 
-		// The `--db` is the path to the SQLite database. Example:
-		// "/var/lib/foncia.db".
-		path := *dbPath
-		logutil.Debugf("using sqlite3 database file %q", path)
-		if path == "" {
-			logutil.Errorf("missing required value: path")
-			os.Exit(1)
-		}
-
-		sqlDB, err := sql.Open("sqlite", path)
-		if err != nil {
-			logutil.Errorf("failed to open database at %q: %w", path, err)
-			os.Exit(1)
-		}
+		sqlDB := openDB()
 		defer sqlDB.Close()
 
-		err = db.InitAndUpdateDB(context.Background(), sqlDB)
-		if err != nil {
-			logutil.Errorf("while creating schema: %v", err)
-			os.Exit(1)
-		}
-
+		var err error
 		token := os.Getenv("FONCIA_TOKEN")
 		var client *http.Client
 		if token != "" {
@@ -188,7 +180,7 @@ func main() {
 			serveBaseURL = "http://" + *serveAddr
 		}
 
-		uuid, err := api.GetAccountUUID(client)
+		uuid, err := api.GetAccountUUID(ctx, client, graphqlURL)
 		if err != nil {
 			logutil.Errorf("while getting account UUID: %v", err)
 			os.Exit(1)
@@ -199,19 +191,15 @@ func main() {
 				// When the database is empty, we do an initial fetch to populate
 				// it; since it most likely means that these items aren't new, we
 				// don't send Ntfy notifications.
-				var skipNotif bool
-				empty, err := db.IsEmptyDB(context.Background(), sqlDB)
+				skipNotif, err := db.IsEmptyDB(ctx, sqlDB)
 				if err != nil {
-					logutil.Errorf("while checking if database is empty: %v", err)
-					os.Exit(1)
-				}
-				if empty {
-					skipNotif = true
+					cancel(fmt.Errorf("while checking if database is empty: %w", err))
+					return
 				}
 
 				for {
 					logutil.Debugf("updating database by fetching from live")
-					newMissions, newExpenses, err := authFetchSave(client, sqlDB, uuid, *invoicesDir)
+					newMissions, newExpenses, err := authFetchSave(ctx, client, sqlDB, uuid, *invoicesDir)
 					writeLastSync(err)
 					if err != nil {
 						logutil.Errorf("while fetching and updating database: %v", err)
@@ -222,9 +210,16 @@ func main() {
 					} else {
 						logutil.Debugf("no new mission and no new expense")
 					}
+
 					if skipNotif {
-						skipNotif = false
-						continue
+						// Only stop skipping once a run has actually gone
+						// through. Clearing the flag after a run that failed
+						// halfway would make the next run announce the whole
+						// backlog one item at a time.
+						if err == nil {
+							skipNotif = false
+						}
+						goto sleep
 					}
 					for _, e := range newMissions {
 						logutil.Infof("new mission: %s", e.Label)
@@ -255,7 +250,12 @@ func main() {
 						}
 					}
 
-					time.Sleep(*syncPeriod)
+				sleep:
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(*syncPeriod):
+					}
 				}
 			}()
 		} else {
@@ -276,31 +276,8 @@ func main() {
 			logutil.Errorf("while starting listener for the HTTP server: %v", err)
 			return
 		}
-		smtpListen, err := net.Listen("tcp", *smtpAddr)
-		if err != nil {
-			logutil.Errorf("while starting listener for the SMTP server: %v", err)
-			return
-		}
 
 		wg := sync.WaitGroup{}
-
-		ctx := context.Background()
-		ctx, cancel := context.WithCancelCause(ctx)
-		defer cancel(nil)
-
-		signalOnExit(func(s os.Signal) {
-			cancel(fmt.Errorf("signal '%s'", s))
-		})
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer cancel(nil)
-			err := ServeSMTP(ctx, sqlDB, smtpListen)
-			if err != nil {
-				cancel(err)
-			}
-		}()
 
 		wg.Add(1)
 		go func() {
@@ -317,74 +294,9 @@ func main() {
 			logutil.Errorf("%v", context.Cause(ctx))
 			os.Exit(1)
 		}
-	case "serve-smtp":
-		// The `--db` is the path to the SQLite database. Example:
-		// "/var/lib/foncia.db".
-		path := *dbPath
-		logutil.Debugf("using sqlite3 database file %q", path)
-		if path == "" {
-			logutil.Errorf("missing required value: path")
-			os.Exit(1)
-		}
-
-		sqlDB, err := sql.Open("sqlite", path)
-		if err != nil {
-			logutil.Errorf("failed to open database at %q: %w", path, err)
-			os.Exit(1)
-		}
-		defer sqlDB.Close()
-
-		err = db.InitAndUpdateDB(context.Background(), sqlDB)
-		if err != nil {
-			logutil.Errorf("while creating schema: %v", err)
-			os.Exit(1)
-		}
-
-		smtpListen, err := net.Listen("unix", "/tmp/smtp.sock")
-		if err != nil {
-			logutil.Errorf("while starting listener for the HTTP server: %v", err)
-			return
-		}
-
-		logutil.Infof(undent.Undent(`
-			To test the SMTP server, run:
-
-			socat - UNIX-CONNECT:/tmp/smtp.sock <<EOF
-			EHLO localhost
-			AUTH PLAIN
-			AHVzZXJuYW1lAHBhc3N3b3Jk
-			MAIL FROM:<noreplay@foncia.fr>
-			RCPT TO:<foo@gmail.com>
-			DATA
-			$(cat email.mbox)
-			.
-			EOF
-		`))
-
-		wg := sync.WaitGroup{}
-		ctx, cancel := context.WithCancelCause(context.Background())
-		defer cancel(fmt.Errorf("main: cancelled for no reason"))
-		signalOnExit(func(s os.Signal) {
-			cancel(fmt.Errorf("main: cancelled by signal %s", s))
-		})
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := ServeSMTP(ctx, sqlDB, smtpListen)
-			if err != nil {
-				cancel(err)
-			}
-		}()
-
-		wg.Wait()
-		if ctx.Err() != nil {
-			logutil.Errorf("main: %v", ctx.Err())
-			os.Exit(1)
-		}
 	case "list":
 		username, password := getCreds()
-		ListCmd(username, password)
+		ListCmd(ctx, username, password)
 	case "comptes-travaux", "repair-budgets":
 		// The --json and --totals flags are also declared globally so that they
 		// show up in --help and can be given before the command name, as in
@@ -403,7 +315,7 @@ func main() {
 		}
 
 		username, password := getCreds()
-		ComptesTravauxCmd(username, password, search, *asJSON, *withTotals)
+		ComptesTravauxCmd(ctx, username, password, search, *asJSON, *withTotals)
 	case "convocations", "ag":
 		fs := flag.NewFlagSet(flag.Arg(0), flag.ExitOnError)
 		asJSON := fs.Bool("json", *jsonFlag, "Print the result as JSON instead of a human-readable table.")
@@ -420,47 +332,39 @@ func main() {
 		}
 
 		username, password := getCreds()
-		ConvocationsCmd(username, password, search, *outDir, *withAll, *asJSON)
+		ConvocationsCmd(ctx, username, password, search, *outDir, *withAll, *asJSON)
 	case "rm-last-expense":
-		path := *dbPath
-		logutil.Debugf("using sqlite3 database file %q", path)
+		sqlDB := openDB()
+		defer sqlDB.Close()
 
-		sqlDB, err := sql.Open("sqlite", path)
-		if err != nil {
-			logutil.Errorf("while opening database: %v", err)
-			os.Exit(1)
-		}
-		err = db.RmLastExpenseDB(sqlDB)
+		err := db.RmLastExpenseDB(sqlDB)
 		if err != nil {
 			logutil.Errorf("while removing last expense: %v", err)
 			os.Exit(1)
 		}
 	case "rm-last-mission":
-		path := *dbPath
-		logutil.Debugf("using sqlite3 database file %q", path)
+		sqlDB := openDB()
+		defer sqlDB.Close()
 
-		sqlDB, err := sql.Open("sqlite", path)
+		err := db.RmLastMissionDB(sqlDB)
 		if err != nil {
-			logutil.Errorf("while opening database: %v", err)
-			os.Exit(1)
-		}
-		err = db.RmLastMissionDB(sqlDB)
-		if err != nil {
-			logutil.Errorf("while removing last expense: %v", err)
+			logutil.Errorf("while removing last mission: %v", err)
 			os.Exit(1)
 		}
 	case "token":
 		username, password := getCreds()
 		client := &http.Client{}
 		api.EnableDebugCurlLogs(client)
-		token, err := api.GetToken(client, graphqlURL, username, password)
+		token, _, err := api.GetToken(ctx, client, graphqlURL, username, password)
 		if err != nil {
 			logutil.Errorf("while authenticating: %v", err)
 			os.Exit(1)
 		}
 		fmt.Println(token.StringOnPurpose())
 	case "":
-		logutil.Errorf("no command given. Use one of: serve, list, comptes-travaux, convocations, rm-last-expense, rm-last-mission, token")
+		logutil.Errorf("no command given")
+		flag.CommandLine.Usage()
+		os.Exit(1)
 	default:
 		logutil.Errorf("unknown command %q", flag.Arg(0))
 		os.Exit(1)
@@ -501,27 +405,36 @@ func missionToNtfyBody(m db.MissionDB) string {
 }
 
 // Returns the new entries found.
-func authFetchSave(client *http.Client, db *sql.DB, uuid, invoicesDir string) ([]db.MissionDB, []db.ExpenseDocumentDB, error) {
-	ctx := context.Background()
+// authFetchSave runs the four syncs and returns the missions and expenses that
+// were newly written.
+//
+// The four syncs are independent of each other, so one of them failing must not
+// stop the others: a single document download answering 403 used to abort the
+// whole run, and the rows the earlier steps had already written were then
+// dropped from the result, which meant they were never notified about either.
+// Every sync runs, and the errors are reported together.
+func authFetchSave(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid, invoicesDir string) ([]db.MissionDB, []db.ExpenseDocumentDB, error) {
+	var errs []error
 
-	err := syncAccountDocumentsWithDB(ctx, client, db, graphqlURL, uuid, invoicesDir, *downloadAGDocs)
-	if err != nil {
-		return nil, nil, fmt.Errorf("while saving to database: %v", err)
-	}
-	newMissions, err := syncLiveMissionsWithDB(ctx, client, db, graphqlURL, uuid)
-	if err != nil {
-		return nil, nil, fmt.Errorf("while saving to database: %v", err)
-	}
-	newExpenses, err := syncExpensesWithDB(ctx, client, db, graphqlURL, uuid, invoicesDir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("while saving to database: %v", err)
-	}
-	err = syncSuppliersWithDB(ctx, client, db, graphqlURL, uuid, invoicesDir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("while saving to database: %v", err)
+	if err := syncAccountDocumentsWithDB(ctx, client, sqlDB, graphqlURL, uuid, invoicesDir, *downloadAGDocs); err != nil {
+		errs = append(errs, fmt.Errorf("while syncing the account documents: %w", err))
 	}
 
-	return newMissions, newExpenses, nil
+	newMissions, err := syncLiveMissionsWithDB(ctx, client, sqlDB, graphqlURL, uuid)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("while syncing the missions: %w", err))
+	}
+
+	newExpenses, err := syncExpensesWithDB(ctx, client, sqlDB, graphqlURL, uuid, invoicesDir)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("while syncing the expenses: %w", err))
+	}
+
+	if err := syncSuppliersWithDB(ctx, client, sqlDB, graphqlURL, uuid, invoicesDir); err != nil {
+		errs = append(errs, fmt.Errorf("while syncing the suppliers: %w", err))
+	}
+
+	return newMissions, newExpenses, errors.Join(errs...)
 }
 
 // The flag package stops parsing as soon as it hits a non-flag argument, which
@@ -574,8 +487,14 @@ func readHeaderFile(filename string) (string, error) {
 
 // This function comes from an MIT-licensed project from github.com/SgtCoDFish.
 func ntfy(topic string, msg ntfyMsg) error {
+	// Without a topic, the URL would be https://ntfy.sh/ and every send would
+	// fail. Notifications are optional, so skip them silently instead.
+	if topic == "" {
+		logutil.Debugf("no --ntfy-topic configured, skipping notification %q", msg.HeaderTitle)
+		return nil
+	}
+
 	client := &http.Client{Timeout: 5 * time.Second}
-	// Create request without doing it.
 
 	req, err := http.NewRequest("POST", "https://ntfy.sh/"+topic, strings.NewReader(msg.Body))
 	if err != nil {
@@ -599,4 +518,22 @@ func ntfy(topic string, msg ntfyMsg) error {
 	}
 
 	return nil
+}
+
+// openDB opens the SQLite database given with --db and applies the schema. The
+// three commands that need a database used to each repeat this block.
+func openDB() *sql.DB {
+	path := *dbPath
+	if path == "" {
+		logutil.Errorf("missing required value: --db")
+		os.Exit(1)
+	}
+	logutil.Debugf("using sqlite3 database file %q", path)
+
+	sqlDB, err := db.Open(path)
+	if err != nil {
+		logutil.Errorf("%v", err)
+		os.Exit(1)
+	}
+	return sqlDB
 }

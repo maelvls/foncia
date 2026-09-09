@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/maelvls/foncia/api"
 	"github.com/maelvls/foncia/db"
@@ -21,14 +23,14 @@ import (
 //
 // `search` is an optional case-insensitive fragment of the file name, e.g.
 // "2025".
-func ConvocationsCmd(username string, password api.Password, search, outDir string, withAll, asJSON bool) {
+func ConvocationsCmd(ctx context.Context, username string, password api.Password, search, outDir string, withAll, asJSON bool) {
 	client, err := api.AuthenticatedClient(&http.Client{}, graphqlURL, username, password)
 	if err != nil {
 		logutil.Errorf("while authenticating: %v", err)
 		os.Exit(1)
 	}
 
-	accUUID, err := api.GetAccountUUID(client)
+	accUUID, err := api.GetAccountUUID(ctx, client, graphqlURL)
 	if err != nil {
 		logutil.Errorf("while getting account UUID: %v", err)
 		os.Exit(1)
@@ -37,7 +39,7 @@ func ConvocationsCmd(username string, password api.Password, search, outDir stri
 	// The convocations, the procès-verbaux, and the annexes all live under the
 	// "generalAssembly" portal category; each document then carries its own
 	// finer-grained category.
-	docs, err := api.GetAccountDocuments(client, graphqlURL, accUUID, db.DocumentCategoryGeneralAssembly)
+	docs, err := api.GetAccountDocuments(ctx, client, graphqlURL, accUUID, db.DocumentCategoryGeneralAssembly)
 	if err != nil {
 		logutil.Errorf("while getting the general assembly documents: %v", err)
 		os.Exit(1)
@@ -87,7 +89,8 @@ func ConvocationsCmd(username string, password api.Password, search, outDir stri
 
 	// The download URLs are pre-signed S3 URLs, so they must be fetched with a
 	// client that doesn't send the Foncia Authorization header.
-	downloadClient := &http.Client{}
+	// Convocation PDFs can weigh tens of megabytes, so the timeout is generous.
+	downloadClient := &http.Client{Timeout: 5 * time.Minute}
 	if *debugFlag {
 		api.EnableDebugCurlLogs(downloadClient)
 	}
@@ -98,7 +101,7 @@ func ConvocationsCmd(username string, password api.Password, search, outDir stri
 			continue
 		}
 
-		filename, fileURL, err := api.GetDocumentURL(client, graphqlURL, doc.HashFile)
+		filename, fileURL, err := api.GetDocumentURL(ctx, client, graphqlURL, doc.HashFile)
 		if errors.Is(err, api.ErrEmptyURL) {
 			logutil.Infof("no PDF available for %q, skipping", doc.OriginalFilename)
 			continue
@@ -114,7 +117,7 @@ func ConvocationsCmd(username string, password api.Password, search, outDir stri
 			continue
 		}
 
-		err = api.Download(downloadClient, fileURL, filePath)
+		err = api.Download(ctx, downloadClient, fileURL, filePath)
 		if err != nil {
 			logutil.Errorf("while downloading %q: %v", doc.OriginalFilename, err)
 			os.Exit(1)
