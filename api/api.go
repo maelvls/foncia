@@ -738,6 +738,11 @@ func (e *GraphQLErrors) Error() string {
 // body large enough to make us run out of memory.
 const maxBodySize = 64 << 20 // 64 MiB.
 
+// throttleBackoff is where the wait starts when the server rate-limits us with a
+// 403 or a 429. The original client slept a flat 30 seconds up to ten times, so
+// that is the order of magnitude the quota window needs.
+var throttleBackoff = 30 * time.Second
+
 // firstBackoff is how long Do waits before the first retry; it doubles at every
 // attempt after that. It is a var only so that the tests don't have to wait.
 var firstBackoff = time.Second
@@ -820,16 +825,23 @@ func DoGraphQL(ctx context.Context, client *http.Client, url, query string, vari
 //
 // Also, in some instances, it returns an error with `peer closed connection`.
 //
+// That 403 is how this API rate-limits: it is NOT a permission error and it does
+// NOT mean the token expired. It appears "after many calls", it clears on its
+// own, and the only thing that gets past it is waiting. So 403 is retried on the
+// same slow track as 429, starting at 30 seconds and doubling.
+//
+// Do not "simplify" this into a fast failure on the grounds that 403 usually
+// means forbidden. That was tried; the sync then never waits long enough for the
+// quota window to reopen, the expenses stop downloading entirely, and
+// getCouncilMissionSuppliers, which runs last and so is the first to be refused
+// once the quota is spent, fails on every single cycle.
+//
 // Do wraps client.Do and retries the transient failures with an exponential
-// backoff that stops as soon as the context is cancelled. Note that a 403 is
-// NOT treated as rate limiting anymore: an expired or revoked token also
-// answers 403, and retrying that for minutes only delays the error. It is
-// retried once, in case it really was a hiccup, and that's it.
+// backoff that stops as soon as the context is cancelled.
 func Do(ctx context.Context, client *http.Client, method string, url string, body []byte) (*http.Response, error) {
-	const maxAttempts = 4
+	const maxAttempts = 5
 
 	backoff := firstBackoff
-	forbiddenRetries := 1
 
 	for attempt := 1; ; attempt++ {
 		var reader io.Reader
@@ -857,15 +869,20 @@ func Do(ctx context.Context, client *http.Client, method string, url string, bod
 			reason = fmt.Sprintf("connection reset (%v)", err)
 		case err != nil:
 			return nil, fmt.Errorf("while doing request: %w", err)
-		case resp.StatusCode == http.StatusTooManyRequests,
-			resp.StatusCode == http.StatusBadGateway,
+		case resp.StatusCode == http.StatusForbidden,
+			resp.StatusCode == http.StatusTooManyRequests:
+			// Rate limiting, see the comment above Do. Waiting a second and
+			// trying again is useless here; the quota window is measured in
+			// tens of seconds, so jump straight to the slow track.
+			reason = fmt.Sprintf("status code %d, rate-limited", resp.StatusCode)
+			resp.Body.Close()
+			if backoff < throttleBackoff {
+				backoff = throttleBackoff
+			}
+		case resp.StatusCode == http.StatusBadGateway,
 			resp.StatusCode == http.StatusServiceUnavailable,
 			resp.StatusCode == http.StatusGatewayTimeout:
 			reason = fmt.Sprintf("status code %d", resp.StatusCode)
-			resp.Body.Close()
-		case resp.StatusCode == http.StatusForbidden && forbiddenRetries > 0:
-			forbiddenRetries--
-			reason = "status code 403"
 			resp.Body.Close()
 		default:
 			return resp, nil
