@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -12,18 +14,84 @@ import (
 	"github.com/maelvls/foncia/logutil"
 )
 
-const missionsTableSQL = `
-	CREATE TABLE IF NOT EXISTS missions (
-		id TEXT UNIQUE,
-		number TEXT,                 -- Foncia's ID for the intervention
-		kind TEXT,
-		label TEXT,
-		status TEXT,
-		started_at TEXT,             -- time.RFC3339Nano
-		description TEXT
-	);
-	create index IF NOT EXISTS idx_entries_started_at on missions (started_at);
-	`
+// -----------------------------------------------------------------------------
+// Small helpers shared by the queries below.
+// -----------------------------------------------------------------------------
+
+// querier is implemented by both *sql.DB and *sql.Tx.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// queryAll runs the query and turns every row into a T using scan. It takes
+// care of closing the rows and of checking rows.Err, which is easy to forget.
+func queryAll[T any](ctx context.Context, q querier, query string, scan func(*sql.Rows) (T, error), args ...any) ([]T, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("while querying database: %w", err)
+	}
+	defer rows.Close()
+
+	var out []T
+	for rows.Next() {
+		v, err := scan(rows)
+		if err != nil {
+			return nil, fmt.Errorf("while scanning row: %w", err)
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("while iterating over rows: %w", err)
+	}
+	return out, nil
+}
+
+// inTx runs f in a transaction and commits it. The transaction is rolled back
+// if f returns an error.
+func inTx(ctx context.Context, db *sql.DB, f func(tx *sql.Tx) error) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("while starting transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := f(tx); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("while committing transaction: %w", err)
+	}
+	return nil
+}
+
+// formatTime normalises the time to UTC before formatting it so that the
+// RFC3339Nano text sorts chronologically (a "+02:00" offset would not).
+func formatTime(t time.Time) string {
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func parseTime(field, s string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("while parsing %q: %w", field, err)
+	}
+	return t, nil
+}
+
+// placeholders returns "(?, ?, ?),(?, ?, ?)" for cols=3 and rows=2.
+func placeholders(cols, rows int) string {
+	one := "(" + strings.TrimSuffix(strings.Repeat("?, ", cols), ", ") + ")"
+	return strings.TrimSuffix(strings.Repeat(one+",", rows), ",")
+}
+
+// maxRowsPerInsert keeps the number of bound parameters well below SQLite's
+// limit (SQLITE_MAX_VARIABLE_NUMBER).
+const maxRowsPerInsert = 50
+
+// -----------------------------------------------------------------------------
+// Missions and work orders.
+// -----------------------------------------------------------------------------
 
 type MissionDB struct {
 	ID          string    // "64850e8019d5d64c415d13dd"
@@ -72,190 +140,194 @@ type WorkOrderDB struct {
 	Supplier        SupplierDB
 }
 
-func InitAndUpdateDB(ctx context.Context, db *sql.DB) error {
-	_, err := db.ExecContext(ctx, missionsTableSQL)
-	if err != nil {
-		return fmt.Errorf("failed to create table 'missions': %w", err)
-	}
-	_, err = db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS work_orders (
-			id TEXT UNIQUE,
-			mission_id TEXT NOT NULL,
-			number TEXT,
-			label TEXT,
-			repair_date_start TEXT,      -- time.RFC3339Nano
-			repair_date_end TEXT,        -- time.RFC3339Nano
-			supplier_id TEXT,
-			supplier_name TEXT,
-			supplier_activity TEXT,
-			FOREIGN KEY(mission_id) REFERENCES missions(id)
-		);`)
-	if err != nil {
-		return fmt.Errorf("failed to create table 'work_orders': %w", err)
-	}
-	_, err = db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS expenses (
-			invoice_id TEXT,       -- May be "" if no invoice file
-			label TEXT,
-			amount INTEGER,
-			date TEXT,            -- time.RFC3339Nano
-			file_path TEXT,        -- May be "" if no invoice file
-			hash_file TEXT         -- May be "" if no invoice file
-		);`)
-	if err != nil {
-		return fmt.Errorf("failed to create table 'expenses': %w", err)
-	}
-	// Add the source column to the expenses table if this column doesn't exist.
-	// First, check if the column exists. Values: "accounting" or "repairs".
-	err = addColumnToTable(ctx, db, "expenses", "source", string(SourceUnknown))
-	if err != nil {
-		return fmt.Errorf("failed to add column 'source' to table 'expenses': %w", err)
-	}
-	err = addColumnToTable(ctx, db, "expenses", "accounting_allocation", "unknown")
-	if err != nil {
-		return fmt.Errorf("failed to add column 'accounting_allocation' to table 'expenses': %w", err)
-	}
-	err = addColumnToTable(ctx, db, "expenses", "accounting_expense_type", "unknown")
-	if err != nil {
-		return fmt.Errorf("failed to add column 'accounting_expense_type' to table 'expenses': %w", err)
-	}
+const missionInsert = `INSERT INTO missions (id, number, kind, label, status, started_at, description) VALUES `
 
-	_, err = db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS suppliers (
-			id TEXT UNIQUE,
-			name TEXT,
-			activity TEXT
-		);
-		CREATE TABLE IF NOT EXISTS contract_documents (
-			id TEXT UNIQUE,
-			supplier_id TEXT NOT NULL,
-			file_path TEXT,
-			hash_file TEXT,
-			FOREIGN KEY(supplier_id) REFERENCES suppliers(id)
-		);
-		`)
-	if err != nil {
-		return fmt.Errorf("failed to create table 'contract_documents': %w", err)
-	}
+const missionOnConflict = ` ON CONFLICT(id) DO UPDATE SET
+	number = excluded.number,
+	kind = excluded.kind,
+	label = excluded.label,
+	status = excluded.status,
+	started_at = excluded.started_at,
+	description = excluded.description;`
 
-	// Create the table for the account documents.
-	_, err = db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS account_documents (
-			id TEXT UNIQUE,
-			file_path TEXT,
-			hash_file TEXT
-		);
-		`)
-	if err != nil {
-		return fmt.Errorf("failed to create table 'account_documents': %w", err)
-	}
-
-	// Add the category, mime_type, and created_at columns to the
-	// account_documents table if they don't exist.
-	err = addColumnToTable(ctx, db, "account_documents", "category", string(DocumentCategoryUnknown))
-	if err != nil {
-		return err
-	}
-	err = addColumnToTable(ctx, db, "account_documents", "mime_type", "application/pdf")
-	if err != nil {
-		return err
-	}
-	err = addColumnToTable(ctx, db, "account_documents", "created_at", time.Time{})
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func addColumnToTable(ctx context.Context, db *sql.DB, table, column string, defaultValue any) error {
-	var sqlType string
-	switch defaultValue.(type) {
-	case string:
-		sqlType = "TEXT"
-	case int:
-		sqlType = "INTEGER"
-	case time.Time:
-		sqlType = "TEXT" // time.RFC3339Nano
-	default:
-		return fmt.Errorf("unsupported type %T", defaultValue)
-	}
-
-	// Add the column to the table if it doesn't exist.
-	var columnExists bool
-	err := db.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?) AS column_exists;", table, column).Scan(&columnExists)
-	if err != nil {
-		return fmt.Errorf("failed to check if column %q exists in table %q: %w", column, table, err)
-	}
-	if columnExists {
+// SaveMissionsToDB inserts the missions, updating the ones that already exist.
+func SaveMissionsToDB(ctx context.Context, db *sql.DB, missions ...MissionDB) error {
+	if len(missions) == 0 {
 		return nil
 	}
 
-	_, err = db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s NOT NULL DEFAULT "%s";`, table, column, sqlType, defaultValue))
-	if err != nil {
-		return fmt.Errorf("failed to add column %q to table %q: %w", column, table, err)
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		for chunk := range chunks(missions, maxRowsPerInsert) {
+			var values []any
+			for _, m := range chunk {
+				values = append(values, m.ID, m.Number, m.Kind, m.Label, m.Status, formatTime(m.StartedAt), m.Description)
+			}
+			req := missionInsert + placeholders(7, len(chunk)) + missionOnConflict
+			if _, err := tx.ExecContext(ctx, req, values...); err != nil {
+				return fmt.Errorf("while upserting missions: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+const workOrderInsert = `INSERT INTO work_orders (id, mission_id, number, label, repair_date_start, repair_date_end, supplier_id, supplier_name, supplier_activity) VALUES `
+
+const workOrderOnConflict = ` ON CONFLICT(id) DO UPDATE SET
+	mission_id = excluded.mission_id,
+	number = excluded.number,
+	label = excluded.label,
+	repair_date_start = excluded.repair_date_start,
+	repair_date_end = excluded.repair_date_end,
+	supplier_id = excluded.supplier_id,
+	supplier_name = excluded.supplier_name,
+	supplier_activity = excluded.supplier_activity;`
+
+// SaveWorkOrdersToDB inserts the work orders, updating the ones that already
+// exist.
+func SaveWorkOrdersToDB(ctx context.Context, db *sql.DB, workOrders []WorkOrderDB) error {
+	if len(workOrders) == 0 {
+		return nil
 	}
 
-	return nil
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		for chunk := range chunks(workOrders, maxRowsPerInsert) {
+			var values []any
+			for _, w := range chunk {
+				values = append(values, w.ID, w.MissionID, w.Number, w.Label,
+					formatTime(w.RepairDateStart), formatTime(w.RepairDateEnd),
+					w.Supplier.ID, w.Supplier.Name, w.Supplier.Activity)
+			}
+			req := workOrderInsert + placeholders(9, len(chunk)) + workOrderOnConflict
+			logutil.Debugf("sql SaveWorkOrdersToDB: %s with:%s", req, fprintfValues(values, ",", "\n", 9))
+			if _, err := tx.ExecContext(ctx, req, values...); err != nil {
+				return fmt.Errorf("while upserting work orders: %w", err)
+			}
+		}
+		return nil
+	})
 }
+
+func scanMission(rows *sql.Rows) (MissionDB, error) {
+	var m MissionDB
+	var startedAt string
+	if err := rows.Scan(&m.ID, &m.Number, &m.Kind, &m.Label, &m.Status, &startedAt, &m.Description); err != nil {
+		return MissionDB{}, err
+	}
+	var err error
+	m.StartedAt, err = parseTime("started_at", startedAt)
+	if err != nil {
+		return MissionDB{}, err
+	}
+	return m, nil
+}
+
+func GetMissionsDB(ctx context.Context, db *sql.DB) ([]MissionDB, error) {
+	missions, err := queryAll(ctx, db,
+		"SELECT id, number, kind, label, status, started_at, description FROM missions ORDER BY started_at DESC",
+		scanMission)
+	if err != nil {
+		return nil, err
+	}
+
+	var missionIDs []string
+	for i := range missions {
+		missionIDs = append(missionIDs, missions[i].ID)
+	}
+	workOrderMap, err := getWorkOrdersDB(ctx, db, missionIDs...)
+	if err != nil {
+		return nil, fmt.Errorf("while getting work orders from DB: %w", err)
+	}
+
+	for i := range missions {
+		workOrders, found := workOrderMap[missions[i].ID]
+		if !found {
+			continue
+		}
+		missions[i].WorkOrders = workOrders
+	}
+	return missions, nil
+}
+
+// workOrderRow is a work order joined with its supplier and the supplier's
+// contract documents. The mission ID is kept separately so that the caller can
+// group the work orders by mission.
+type workOrderRow struct {
+	missionID string
+	workOrder WorkOrderDB
+}
+
+func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map[string][]WorkOrderDB, error) {
+	if len(missionIDs) == 0 {
+		return nil, nil
+	}
+
+	// Join the tables work_orders with suppliers and contract_documents.
+	req := `SELECT
+				w.id, w.mission_id, w.number, w.label, w.repair_date_start, w.repair_date_end, w.supplier_id,
+				s.name, s.activity,
+				d.id, d.file_path, d.hash_file
+			FROM work_orders w
+			LEFT JOIN suppliers s ON s.id = w.supplier_id
+			LEFT JOIN contract_documents d ON d.supplier_id = w.supplier_id
+			WHERE w.mission_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(missionIDs)), ",") + `);`
+
+	var values []any
+	for _, id := range missionIDs {
+		values = append(values, id)
+	}
+
+	rows, err := queryAll(ctx, db, req, scanWorkOrderRow, values...)
+	if err != nil {
+		return nil, err
+	}
+
+	workOrderMap := make(map[string][]WorkOrderDB)
+	for _, r := range rows {
+		workOrderMap[r.missionID] = append(workOrderMap[r.missionID], r.workOrder)
+	}
+	return workOrderMap, nil
+}
+
+func scanWorkOrderRow(rows *sql.Rows) (workOrderRow, error) {
+	var r workOrderRow
+	var repairDateStart, repairDateEnd string
+	// The LEFT JOINs mean these may legitimately be NULL.
+	var supplName, supplActivity sql.NullString
+	var docID, docFilePath, docHashFile sql.NullString
+	err := rows.Scan(
+		&r.workOrder.ID, &r.missionID, &r.workOrder.Number, &r.workOrder.Label,
+		&repairDateStart, &repairDateEnd, &r.workOrder.Supplier.ID,
+		&supplName, &supplActivity,
+		&docID, &docFilePath, &docHashFile,
+	)
+	if err != nil {
+		return workOrderRow{}, err
+	}
+
+	r.workOrder.Supplier.Name = supplName.String
+	r.workOrder.Supplier.Activity = supplActivity.String
+
+	r.workOrder.RepairDateStart, err = parseTime("repair_date_start", repairDateStart)
+	if err != nil {
+		return workOrderRow{}, err
+	}
+	r.workOrder.RepairDateEnd, err = parseTime("repair_date_end", repairDateEnd)
+	if err != nil {
+		return workOrderRow{}, err
+	}
+	return r, nil
+}
+
+// -----------------------------------------------------------------------------
+// Suppliers and their contract documents.
+// -----------------------------------------------------------------------------
 
 type SupplierDB struct {
 	ID        string
 	Name      string // Examples: "2NRT-POMPES ENVIRONNEMENT"
 	Activity  string // Examples: "PLOM", "ADBE", "ISOL"
 	Documents []SupplierContractDocumentDB
-}
-
-func GetSuppliersDB(ctx context.Context, db *sql.DB) ([]SupplierDB, error) {
-	// Get the suppliers and documents.
-	req := `SELECT id, name, activity FROM suppliers;`
-	rows, err := db.QueryContext(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	var suppliers []SupplierDB
-	for rows.Next() {
-		var s SupplierDB
-		err = rows.Scan(&s.ID, &s.Name, &s.Activity)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning row: %w", err)
-		}
-		suppliers = append(suppliers, s)
-	}
-
-	// Then, get the documents for each supplier.
-	for i := range suppliers {
-		docs, err := GetSupplierContractBySupplierIDDB(ctx, db, suppliers[i].ID)
-		if err != nil {
-			return nil, fmt.Errorf("while getting documents for supplier %q: %v", suppliers[i].ID, err)
-		}
-		suppliers[i].Documents = docs
-	}
-
-	return suppliers, nil
-}
-
-func GetSupplierContractBySupplierIDDB(ctx context.Context, db *sql.DB, supplierID string) ([]SupplierContractDocumentDB, error) {
-	req := `SELECT id, file_path, hash_file, supplier_id FROM contract_documents WHERE supplier_id = ?;`
-	rows, err := db.QueryContext(ctx, req, supplierID)
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	var documents []SupplierContractDocumentDB
-	for rows.Next() {
-		var d SupplierContractDocumentDB
-		err = rows.Scan(&d.ID, &d.FilePath, &d.HashFile, &d.SupplierID)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning row: %w", err)
-		}
-		documents = append(documents, d)
-	}
-
-	return documents, nil
 }
 
 type SupplierContractDocumentDB struct {
@@ -265,129 +337,163 @@ type SupplierContractDocumentDB struct {
 	SupplierID string
 }
 
-func GetSupplierContractDocsDB(ctx context.Context, db *sql.DB) ([]SupplierContractDocumentDB, error) {
-	req := `SELECT id, file_path, hash_file, supplier_id FROM contract_documents;`
-	rows, err := db.QueryContext(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	var documents []SupplierContractDocumentDB
-	for rows.Next() {
-		var d SupplierContractDocumentDB
-		err = rows.Scan(&d.ID, &d.FilePath, &d.HashFile, &d.SupplierID)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning row: %w", err)
-		}
-		documents = append(documents, d)
-	}
-
-	return documents, nil
+func scanSupplier(rows *sql.Rows) (SupplierDB, error) {
+	var s SupplierDB
+	err := rows.Scan(&s.ID, &s.Name, &s.Activity)
+	return s, err
 }
 
-// Documents are merged using their IDs. O(N^2) but OK because N is small. When
-// the previous value (e.g. filepath) was set the current value is empty, the
+func scanContractDoc(rows *sql.Rows) (SupplierContractDocumentDB, error) {
+	var d SupplierContractDocumentDB
+	err := rows.Scan(&d.ID, &d.FilePath, &d.HashFile, &d.SupplierID)
+	return d, err
+}
+
+func GetSuppliersDB(ctx context.Context, db *sql.DB) ([]SupplierDB, error) {
+	suppliers, err := queryAll(ctx, db, `SELECT id, name, activity FROM suppliers;`, scanSupplier)
+	if err != nil {
+		return nil, err
+	}
+
+	// Then, get the documents for each supplier.
+	for i := range suppliers {
+		docs, err := GetSupplierContractBySupplierIDDB(ctx, db, suppliers[i].ID)
+		if err != nil {
+			return nil, fmt.Errorf("while getting documents for supplier %q: %w", suppliers[i].ID, err)
+		}
+		suppliers[i].Documents = docs
+	}
+
+	return suppliers, nil
+}
+
+func GetSupplierContractBySupplierIDDB(ctx context.Context, db *sql.DB, supplierID string) ([]SupplierContractDocumentDB, error) {
+	return queryAll(ctx, db,
+		`SELECT id, file_path, hash_file, supplier_id FROM contract_documents WHERE supplier_id = ?;`,
+		scanContractDoc, supplierID)
+}
+
+func GetSupplierContractDocsDB(ctx context.Context, db *sql.DB) ([]SupplierContractDocumentDB, error) {
+	return queryAll(ctx, db,
+		`SELECT id, file_path, hash_file, supplier_id FROM contract_documents;`,
+		scanContractDoc)
+}
+
+func GetSupplierContractByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) (SupplierContractDocumentDB, error) {
+	var d SupplierContractDocumentDB
+	err := db.QueryRowContext(ctx, "SELECT id, file_path, hash_file, supplier_id FROM contract_documents WHERE hash_file = ?", hashFile).
+		Scan(&d.ID, &d.FilePath, &d.HashFile, &d.SupplierID)
+	if err != nil {
+		return SupplierContractDocumentDB{}, fmt.Errorf("while querying database: %w", err)
+	}
+	return d, nil
+}
+
+// UpsertSuppliersToDB inserts the suppliers, and updates the name and activity
+// of the ones that already exist.
+func UpsertSuppliersToDB(ctx context.Context, db *sql.DB, suppliers []SupplierDB) error {
+	if len(suppliers) == 0 {
+		return nil
+	}
+
+	const req = `INSERT INTO suppliers (id, name, activity) VALUES (?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET name = excluded.name, activity = excluded.activity;`
+
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		for _, s := range suppliers {
+			if _, err := tx.ExecContext(ctx, req, s.ID, s.Name, s.Activity); err != nil {
+				return fmt.Errorf("db: while upserting supplier %q: %w", s.ID, err)
+			}
+			logutil.Debugf("db: upserted supplier %q: %+v", s.ID, s)
+		}
+		return nil
+	})
+}
+
+func UpsertContractDocumentsWithDB(ctx context.Context, db *sql.DB, documents []SupplierContractDocumentDB) error {
+	if len(documents) == 0 {
+		return nil
+	}
+
+	const req = `INSERT INTO contract_documents (id, supplier_id, file_path, hash_file) VALUES (?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			supplier_id = excluded.supplier_id,
+			file_path = excluded.file_path,
+			hash_file = excluded.hash_file;`
+
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		for _, d := range documents {
+			if _, err := tx.ExecContext(ctx, req, d.ID, d.SupplierID, d.FilePath, d.HashFile); err != nil {
+				return fmt.Errorf("while upserting contract document %q: %w", d.ID, err)
+			}
+			logutil.Debugf("db: upserted contract document %q: %+v", d.ID, d)
+		}
+		return nil
+	})
+}
+
+// -----------------------------------------------------------------------------
+// Merging documents coming from the API with the ones already in the database.
+// -----------------------------------------------------------------------------
+
+// mergeByID compares the documents already in the database (previous) with the
+// ones just fetched from the API (current). It returns the documents that are
+// missing from the database, the ones that have changed (already merged with
+// their previous version), and the ones that have disappeared from the API.
+func mergeByID[T any](
+	previous, current []T,
+	id func(T) string,
+	equal func(a, b T) bool,
+	merge func(previous, current T) T,
+) (missing, updated, removed []T) {
+	prevByID := make(map[string]T, len(previous))
+	for _, p := range previous {
+		prevByID[id(p)] = p
+	}
+	curByID := make(map[string]T, len(current))
+	for _, c := range current {
+		curByID[id(c)] = c
+	}
+
+	for _, c := range current {
+		prev, found := prevByID[id(c)]
+		switch {
+		case !found:
+			missing = append(missing, c)
+		case !equal(prev, c):
+			updated = append(updated, merge(prev, c))
+		}
+	}
+
+	for _, p := range previous {
+		if _, found := curByID[id(p)]; !found {
+			removed = append(removed, p)
+		}
+	}
+
+	return missing, updated, removed
+}
+
+// MergeSupplierContractDocs merges documents using their IDs. When the previous
+// value (e.g. the file path) was set and the current value is empty, the
 // previous value is kept.
 func MergeSupplierContractDocs(previous, current []SupplierContractDocumentDB) (missing, updated, removed []SupplierContractDocumentDB) {
-	// Find the current documents that weren't there previously.
-	var newDocs []SupplierContractDocumentDB
-	for _, c := range current {
-		found := false
-		for _, p := range previous {
-			if c.ID == p.ID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			newDocs = append(newDocs, c)
-		}
-	}
-
-	// Find the documents that have changed.
-	var changedDocs []SupplierContractDocumentDB
-	for _, cur := range current {
-		for _, prev := range previous {
-			if cur.ID != prev.ID {
-				continue
-			}
-
-			if EqualSupplierDocs(cur, prev) {
-				continue
-			}
-			changedDocs = append(changedDocs, MergeSupplierDoc(prev, cur))
-		}
-	}
-
-	// Find the documents that have been deleted.
-	var deletedDocs []SupplierContractDocumentDB
-	for _, p := range previous {
-		found := false
-		for _, c := range current {
-			if c.ID == p.ID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			deletedDocs = append(deletedDocs, p)
-		}
-	}
-
-	return newDocs, changedDocs, deletedDocs
+	return mergeByID(previous, current,
+		func(d SupplierContractDocumentDB) string { return d.ID },
+		EqualSupplierDocs,
+		MergeSupplierDoc,
+	)
 }
 
-// Documents are merged using their IDs. O(1) operation. Regarding the FilePath,
-// When the previous value was set the current value is empty, the previous
-// value is kept.
+// MergeAccountDocumentsDB merges documents using their IDs. Regarding the
+// FilePath: when the previous value was set and the current value is empty, the
+// previous value is kept.
 func MergeAccountDocumentsDB(previous, current []AccountDocumentDB) (missing, updated, removed []AccountDocumentDB) {
-	// Find the current documents that weren't there previously.
-	var newDocs []AccountDocumentDB
-	for _, c := range current {
-		found := false
-		for _, p := range previous {
-			if c.ID == p.ID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			newDocs = append(newDocs, c)
-		}
-	}
-
-	// Find the documents that have changed.
-	var changedDocs []AccountDocumentDB
-	for _, cur := range current {
-		for _, prev := range previous {
-			if cur.ID != prev.ID {
-				continue
-			}
-
-			if EqualAccountDocs(prev, cur) {
-				continue
-			}
-			changedDocs = append(changedDocs, MergeAccountDoc(prev, cur))
-		}
-	}
-
-	// Find the documents that have been deleted.
-	var deletedDocs []AccountDocumentDB
-	for _, p := range previous {
-		found := false
-		for _, c := range current {
-			if c.ID == p.ID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			deletedDocs = append(deletedDocs, p)
-		}
-	}
-
-	return newDocs, changedDocs, deletedDocs
+	return mergeByID(previous, current,
+		func(d AccountDocumentDB) string { return d.ID },
+		EqualAccountDocs,
+		MergeAccountDoc,
+	)
 }
 
 // The FilePath needs to be carried over. That's why we need this special merge
@@ -420,167 +526,9 @@ func EqualSupplierDocs(a, b SupplierContractDocumentDB) bool {
 	return a == b
 }
 
-func GetSupplierContractByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) (SupplierContractDocumentDB, error) {
-	var d SupplierContractDocumentDB
-	err := db.QueryRowContext(ctx, "SELECT id, file_path, hash_file, supplier_id FROM contract_documents WHERE hash_file = ?", hashFile).Scan(&d.ID, &d.FilePath, &d.HashFile, &d.SupplierID)
-	if err != nil {
-		return SupplierContractDocumentDB{}, fmt.Errorf("while querying database: %w", err)
-	}
-
-	return d, nil
-}
-
-func UpsertSuppliersToDB(ctx context.Context, db *sql.DB, suppliers []SupplierDB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("while starting transaction: %w", err)
-	}
-	defer func() {
-		err = tx.Rollback()
-		if err != nil && err != sql.ErrTxDone {
-			logutil.Errorf("while rolling back transaction: %w", err)
-		}
-	}()
-
-	// Find the suppliers that are already in the database.
-	req := "SELECT id, name, activity FROM suppliers;"
-	rows, err := tx.QueryContext(ctx, req)
-	if err != nil {
-		return fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	var suppliersInDB []SupplierDB
-	for rows.Next() {
-		var s SupplierDB
-		err = rows.Scan(&s.ID, &s.Name, &s.Activity)
-		if err != nil {
-			return fmt.Errorf("while scanning row: %w", err)
-		}
-		suppliersInDB = append(suppliersInDB, s)
-	}
-
-	// Find the suppliers that aren't already in the database.
-	var newSuppliers []SupplierDB
-	for _, s := range suppliers {
-		found := false
-		for _, sInDB := range suppliersInDB {
-			if s.ID == sInDB.ID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			newSuppliers = append(newSuppliers, s)
-		}
-	}
-
-	// Insert the suppliers that aren't already in the database.
-	for _, s := range newSuppliers {
-		req := "INSERT INTO suppliers (id, name, activity) VALUES (?, ?, ?);"
-		_, err := tx.ExecContext(ctx, req, s.ID, s.Name, s.Activity)
-		if err != nil {
-			return fmt.Errorf("db: while inserting supplier %q: %v", s.ID, err)
-		}
-		logutil.Debugf("db: added supplier %q: %+v", s.ID, s)
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		return fmt.Errorf("while committing transaction: %w", err)
-	}
-	return nil
-}
-
-func UpsertContractDocumentsWithDB(ctx context.Context, db *sql.DB, documents []SupplierContractDocumentDB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("while starting transaction: %w", err)
-	}
-	defer func() {
-		err = tx.Rollback()
-		if err != nil && err != sql.ErrTxDone {
-			logutil.Errorf("while rolling back transaction: %w", err)
-		}
-	}()
-
-	for _, e := range documents {
-		req := "UPDATE contract_documents SET supplier_id = ?, file_path = ?, hash_file = ? WHERE id = ?;"
-		res, err := tx.ExecContext(ctx, req, e.SupplierID, e.FilePath, e.HashFile, e.ID)
-		if err != nil {
-			return fmt.Errorf("while updating contract documents: %w", err)
-		}
-
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("while getting rows affected: %w", err)
-		}
-		if n != 0 {
-			logutil.Debugf("db: updated contract document %q: %+v", e.ID, e)
-			continue
-		}
-
-		// No existing row was found: insert a new one.
-		req = "INSERT INTO contract_documents (id, supplier_id, file_path, hash_file) VALUES (?, ?, ?, ?);"
-		_, err = tx.ExecContext(ctx, req, e.ID, e.SupplierID, e.FilePath, e.HashFile)
-		if err != nil {
-			return fmt.Errorf("while inserting contract documents: %w", err)
-		}
-		logutil.Debugf("db: added document %q: %+v", e.ID, e)
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		return fmt.Errorf("while committing transaction: %w", err)
-	}
-	return nil
-}
-
-// FilePath is the only field that ca be updated.
-func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDocumentDB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("while starting transaction: %w", err)
-	}
-	defer func() {
-		err = tx.Rollback()
-		if err != nil && err != sql.ErrTxDone {
-			logutil.Errorf("while rolling back transaction: %w", err)
-		}
-	}()
-
-    for _, e := range expense {
-        req := "UPDATE expenses SET file_path = ?, source = ? WHERE label = ? AND date = ? AND amount = ? AND accounting_allocation = ? AND accounting_expense_type = ? AND hash_file = ?;"
-        args := []any{e.FilePath, e.Source, e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile}
-        res, err := tx.ExecContext(ctx, req, args...)
-		if err != nil {
-			return fmt.Errorf("while updating expenses: %w", err)
-		}
-
-		// If no row was updated, insert a new one.
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("while getting rows affected: %w", err)
-		}
-		if n > 0 {
-			logutil.Debugf("db: updated expense %q: %+v", e.Date, e)
-		} else {
-			req := "INSERT INTO expenses (invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);"
-			args := []any{e.InvoiceID, e.Label, e.Amount, e.Date.Format(time.RFC3339Nano), e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType}
-			_, err := tx.ExecContext(ctx, req, args...)
-			if err != nil {
-				return fmt.Errorf("while inserting expenses: %w", err)
-			}
-			logutil.Debugf("db: added expense %q: %+v", e.Date, e)
-		}
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		return fmt.Errorf("while committing transaction: %w", err)
-	}
-	return nil
-}
+// -----------------------------------------------------------------------------
+// Expenses.
+// -----------------------------------------------------------------------------
 
 // This "hash file" is an opaque hash that comes from AWS S3. For example, the
 // URL will look like this:
@@ -618,14 +566,9 @@ func (a Amount) String() string {
 	return fmt.Sprintf("%s%d,%02d €", sign, a/100, a%100)
 }
 
-// To see why there is no primary key ID, see the ID() func below.
-//
-//	invoice_id TEXT,       -- May be "" if no invoice file
-//	label TEXT,
-//	amount INTEGER,
-//	date TEXT,             -- time.RFC3339Nano
-//	file_path TEXT,        -- May be "" if no invoice file
-//	hash_file TEXT         -- May be "" if no invoice file
+// Foncia's API doesn't return an ID for the expenses returned by
+// getBuildingAccountingCurrent, so the `id` column is derived in Go, see
+// expenseID.
 //
 // Sometimes, the invoice ID and piece.hashFile are empty, but we still want to
 // keep track of the item.
@@ -662,7 +605,6 @@ func (a Amount) String() string {
 //	    "isFromPreviousPeriod": false
 //	}
 //
-//
 //	In other cases, the invoice ID is set, but the piece.hashFile is empty.
 //
 //	{
@@ -677,7 +619,7 @@ func (a Amount) String() string {
 //	    },
 //	}
 //
-// Also, an invoiceID amd HashFile may be re-used across multiple items. See
+// Also, an invoiceID and HashFile may be re-used across multiple items. See
 // AccountingKey for an example.
 type ExpenseDocumentDB struct {
 	Label  string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
@@ -704,6 +646,26 @@ type ExpenseDocumentDB struct {
 	Source Source
 
 	AccountingKey AccountingKey
+}
+
+func (e ExpenseDocumentDB) Filename() string {
+	// "OU CHANNA - CT01037406 - 2024-10-01 - _27.pdf"
+	return filepath.Base(e.FilePath)
+}
+
+func (a ExpenseDocumentDB) Equal(b ExpenseDocumentDB) bool {
+	// We ignore the file path, and compare the rest.
+	a.FilePath = ""
+	b.FilePath = ""
+	return a == b
+}
+
+func Merge(oldFromDB, newFromAPI ExpenseDocumentDB) ExpenseDocumentDB {
+	// Everything from the API is used except for the file path, since the file
+	// path is only stored in DB.
+	merged := newFromAPI
+	merged.FilePath = oldFromDB.FilePath
+	return merged
 }
 
 // Expenses can come from two different sources:
@@ -782,58 +744,44 @@ func (a AccountingKey) String() string {
 
 type ExpenseDocumentID string
 
-// Foncia's API doesn't return an ID for the expenses returned by
-// getBuildingAccountingCurrent. Thus, I have to create my own ID. This isn't
-// ideal since some expenses have the same tuple (invoiceId, label, hashFile,
-// date, amount). The closest items I have found can be separated thanks to
-// their date:
+// expenseKey is the identifying tuple of an expense, ignoring the hash file.
+// The separator is a NUL byte so that it can't appear in any of the fields.
+func expenseKey(e ExpenseDocumentDB) string {
+	return strings.Join([]string{
+		e.Label,
+		formatTime(e.Date),
+		fmt.Sprintf("%d", int(e.Amount)),
+		e.AccountingKey.Allocation,
+		e.AccountingKey.ExpenseType,
+	}, "\x00")
+}
+
+// expenseID is the deterministic primary key of an expense. Foncia's API
+// doesn't return an ID for the expenses returned by
+// getBuildingAccountingCurrent, so we derive one from (label, date, amount,
+// allocation, expense type, hash file).
 //
-//	{
-//	  "invoiceId": null,
-//	  "piece": null,
-//	  "label": "RELIQUAT DE REPARTITION",
-//	  "date": "2024-06-30T22:00:00.000Z",
-//	  "amount": {"value": 2},
-//	  "isFromPreviousPeriod": false,
-//	},
-//	{
-//	  "invoiceId": null,
-//	  "piece": null,
-//	  "label": "RELIQUAT DE REPARTITION",
-//	  "date": "2023-06-30T22:00:00.000Z",
-//	  "amount": {"value": 2},
-//	  "isFromPreviousPeriod": true,
-//	}
+// The hash file is part of the key because two otherwise identical expenses can
+// only be told apart by their hash file, e.g.:
 //
-// Sometimes, there is a hash file but no invoice ID:
+//   - piece: {hashFile: 66dafe199f013b45ee991c96}
+//     label: ELECO
+//     date: "2024-06-30T00:00:00.000Z"
+//     amount: {value: 79200}
+//   - piece: {hashFile: 66e2b7bd424b4b0f0ab3954b}
+//     label: ELECO
+//     date: "2024-06-30T00:00:00.000Z"
+//     amount: {value: 79200}
 //
-//	{
-//	  "invoiceId": null,
-//	  "piece": {
-//	    "hashFile": "678f833860313bc2ff80e5b4",
-//	    "__typename": "Document"
-//	  },
-//	  "label": "Honoraires Forfaitaires du 01/01/2025 au 31/01/2025",
-//	  "date": "2025-01-21T11:21:24.342Z",
-//	  "amount": {
-//	    "value": 56480,
-//	    "currency": "EUR",
-//	    "__typename": "Debit"
-//	  },
-//	  "isFromPreviousPeriod": false,
-//	}
-//
-// But I have never found a case where the invoice ID is set but not the hash
-// file. Thus, I won't be using the invoice to identify the expenses; I will use
-// the hashfile if it exists, and (label, date, amount) otherwise. Note that the
-// hash file may appear later on, so the item should be updated in the database
-// when the hash file starts appearing for a given (label, date, amount).
-//
-// What's weird is that getBuildingAccountingRGDD does return an ID for the
-// expenses...
-//
-// Note that we may end up with duplicate expenses in the database when
-// upserting, but that's a risk I'm willing to take.
+// The hash file may also appear on a later sync for an expense that didn't have
+// one; UpsertExpensesWithDB takes care of that case, see there.
+func expenseID(e ExpenseDocumentDB) string {
+	sum := sha256.Sum256([]byte(expenseKey(e) + "\x00" + string(e.HashFile)))
+	return hex.EncodeToString(sum[:])
+}
+
+// See the ExpenseDocumentsIndex type for why an invoice ID or a hash file
+// cannot be used alone to identify an expense.
 //
 // Note that an invoice ID or HashFile may be re-used across multiple items, so
 // the label, date, and amount must always be used in the index. For example:
@@ -855,75 +803,12 @@ type ExpenseDocumentID string
 //	  }
 //	]
 //
-// The invoice ID or HashFile can also be re-used across multiple allocations:
-//
-//	allocations:
-//	  - name: CHARGES ASCENSEUR D
-//	    code: "601"
-//	    expenseTypes:
-//	      - name: CONTRAT ETENDU ASCENSEUR
-//	        code: "136"
-//	        expenses:
-//	          - invoiceId: 6615521aac44b7c09440aeaa
-//	            piece: { hashFile: 6615521a0ee3bdcd450363fa }
-//	            label: TKE ENTRETIEN ASCENSEUR 2T2024
-//	            date: 2024-04-09T14:35:07.357Z
-//	            amount: { value: 41049, currency: EUR, __typename: Debit }
-//	            isFromPreviousPeriod: true
-//	  - name: CHARGES ASCENSEUR C
-//	    code: "600"
-//	    expenseTypes:
-//	      - name: CONTRAT ETENDU ASCENSEUR
-//	        code: "136"
-//	        expenses:
-//	          - invoiceId: 6615521aac44b7c09440aeaa
-//	            piece: { hashFile: 6615521a0ee3bdcd450363fa }
-//	            label: TKE ENTRETIEN ASCENSEUR 2T2024
-//	            date: 2024-04-09T14:35:07.357Z
-//	            amount: { value: 41048, currency: EUR, __typename: Debit }
-//	            isFromPreviousPeriod: true
-//
-// Another problem I've seen is that some expenses have the same tuple (label,
-// date, amount). In the below example, the only way to differentiate the two
-// first expenses is to look at the hashFile:
-//
-//	allocations:
-//	  - name: "CHARGES UNITAIRES C"
-//	    code: "501"
-//	    expenseTypes:
-//	      - name: "CONTRAT EXTRACTEURS"
-//	        code: "126"
-//	        expenses:
-//	          - invoiceId: null
-//	            piece: { hashFile: 66dafe199f013b45ee991c96 }
-//	            label: ELECO
-//	            date: "2024-06-30T00:00:00.000Z"
-//	            amount: { value: 79200, currency: EUR, __typename: Debit }
-//	            isFromPreviousPeriod: true
-//	          - invoiceId: null
-//	            piece: { hashFile: 66e2b7bd424b4b0f0ab3954b }
-//	            label: ELECO
-//	            date: "2024-06-30T00:00:00.000Z"
-//	            amount: { value: 79200, currency: EUR, __typename: Debit }
-//	            isFromPreviousPeriod: true
-//	  - name: "CHARGES UNITAIRES D"
-//	    code: "502"
-//	    expenseTypes:
-//	      - name: "CONTRAT EXTRACTEURS"
-//	        code: "126"
-//	        expenses:
-//	          - invoiceId: null
-//	            piece: { hashFile: 66dafe459f013b45ee992188 }
-//	            label: ELECO
-//	            date: "2024-06-30T00:00:00.000Z"
-//	            amount: { value: 79200, currency: EUR, __typename: Debit }
-//	            isFromPreviousPeriod: true
-//	          - invoiceId: null
-//	            piece: { hashFile: 66dafd87d024fd1b510e1e37 }
-//	            label: ELECO
-//	            date: "2024-06-30T00:00:00.000Z"
-//	            amount: { value: 79200, currency: EUR, __typename: Debit }
-//	            isFromPreviousPeriod: true
+// I have never found a case where the invoice ID is set but not the hash file.
+// Thus, the invoice ID isn't used to identify the expenses; the hash file is
+// used if it exists, and (label, date, amount, allocation, expense type)
+// otherwise. Note that the hash file may appear later on, so the item must be
+// updated in the database when the hash file starts appearing for a given
+// (label, date, amount, allocation, expense type).
 type ExpenseDocumentsIndex struct {
 	Elements                     []ExpenseDocumentDB
 	ByLabelDateAmountKey         map[string]int
@@ -938,107 +823,113 @@ func NewExpenseDocumentsIndex(expenses []ExpenseDocumentDB) ExpenseDocumentsInde
 	}
 	for i, e := range expenses {
 		if e.HashFile != "" {
+			index.ByLabelDateAmountKeyHashfile[expenseID(e)] = i
 			continue
 		}
-		index.ByLabelDateAmountKey[fmt.Sprintf("%s-%s-%d-%s", e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.String())] = i
-	}
-	for i, e := range expenses {
-		if e.HashFile == "" {
-			continue
-		}
-		index.ByLabelDateAmountKeyHashfile[fmt.Sprintf("%s-%s-%d-%s-%s", e.Label, e.Date.Format(time.RFC3339Nano), e.Amount, e.AccountingKey.String(), e.HashFile)] = i
+		index.ByLabelDateAmountKey[expenseKey(e)] = i
 	}
 	return index
 }
 
-// Match returns a pointer to the original slice of expenses so that you can
-// modify the original slice if you want to.
+// Match returns the expense stored in the index that matches the given partial
+// expense. The hash file is used when it is set, and the (label, date, amount,
+// allocation, expense type) tuple is used as a fallback so that an expense that
+// only later got a hash file still matches.
 func (idx ExpenseDocumentsIndex) Match(partial ExpenseDocumentDB) (ExpenseDocumentDB, bool) {
 	if partial.HashFile != "" {
-		i, ok := idx.ByLabelDateAmountKeyHashfile[fmt.Sprintf("%s-%s-%d-%s-%s", partial.Label, partial.Date.Format(time.RFC3339Nano), partial.Amount, partial.AccountingKey.String(), partial.HashFile)]
-		if ok {
+		if i, ok := idx.ByLabelDateAmountKeyHashfile[expenseID(partial)]; ok {
 			return idx.Elements[i], true
 		}
 	}
 
-	i, ok := idx.ByLabelDateAmountKey[fmt.Sprintf("%s-%s-%d-%s", partial.Label, partial.Date.Format(time.RFC3339Nano), partial.Amount, partial.AccountingKey.String())]
-	if ok {
+	if i, ok := idx.ByLabelDateAmountKey[expenseKey(partial)]; ok {
 		return idx.Elements[i], true
 	}
 
 	return ExpenseDocumentDB{}, false
 }
 
-func (a ExpenseDocumentDB) Equal(b ExpenseDocumentDB) bool {
-	// We ignore the file path, and compare the rest.
-	a.FilePath = ""
-	b.FilePath = ""
-	return a == b
+const expenseColumns = "invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type"
+
+func scanExpense(rows *sql.Rows) (ExpenseDocumentDB, error) {
+	var e ExpenseDocumentDB
+	var date string
+	err := rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile,
+		&e.Source, &e.AccountingKey.Allocation, &e.AccountingKey.ExpenseType)
+	if err != nil {
+		return ExpenseDocumentDB{}, err
+	}
+	e.Date, err = parseTime("date", date)
+	if err != nil {
+		return ExpenseDocumentDB{}, err
+	}
+	return e, nil
 }
 
-func Merge(oldFromDB, newFromAPI ExpenseDocumentDB) ExpenseDocumentDB {
-	// Everything from the API is used except for the file path, since the file
-	// path is only stored in DB.
-	merged := newFromAPI
-	merged.FilePath = oldFromDB.FilePath
-	return merged
-}
-
-func (e ExpenseDocumentDB) Filename() string {
-	// "OU CHANNA - CT01037406 - 2024-10-01 - _27.pdf"
-	return filepath.Base(e.FilePath)
+func GetExpensesDB(ctx context.Context, db *sql.DB) ([]ExpenseDocumentDB, error) {
+	return queryAll(ctx, db, "SELECT "+expenseColumns+" FROM expenses", scanExpense)
 }
 
 func GetExpensesByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) ([]ExpenseDocumentDB, error) {
-	var expenses []ExpenseDocumentDB
-	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type FROM expenses WHERE hash_file = ?", hashFile)
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	for rows.Next() {
-		var e ExpenseDocumentDB
-		var date string
-		err = rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile, &e.Source, &e.AccountingKey.Allocation, &e.AccountingKey.ExpenseType)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning database row: %w", err)
-		}
-
-		e.Date, err = time.Parse(time.RFC3339Nano, date)
-
-		if err != nil {
-			return nil, fmt.Errorf("while parsing 'date': %w", err)
-		}
-		expenses = append(expenses, e)
-	}
-
-	return expenses, nil
+	return queryAll(ctx, db, "SELECT "+expenseColumns+" FROM expenses WHERE hash_file = ?", scanExpense, hashFile)
 }
 
 func GetExpensesByInvoiceID(ctx context.Context, db *sql.DB, invoiceID string) ([]ExpenseDocumentDB, error) {
-	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type FROM expenses WHERE invoice_id = ?", invoiceID)
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-
-	var expenses []ExpenseDocumentDB
-	for rows.Next() {
-		var e ExpenseDocumentDB
-		var date string
-		err = rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile, &e.Source, &e.AccountingKey.Allocation, &e.AccountingKey.ExpenseType)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning database row: %w", err)
-		}
-
-		e.Date, err = time.Parse(time.RFC3339Nano, date)
-		if err != nil {
-			return nil, fmt.Errorf("while parsing 'date': %w", err)
-		}
-
-		expenses = append(expenses, e)
-	}
-
-	return expenses, nil
+	return queryAll(ctx, db, "SELECT "+expenseColumns+" FROM expenses WHERE invoice_id = ?", scanExpense, invoiceID)
 }
+
+// promoteExpense takes an expense row that was stored without a hash file and
+// gives it the hash file that just showed up in the API, along with the new
+// primary key that goes with it. "OR IGNORE" covers the case where the row with
+// the new key already exists, in which case upsertExpense below just updates
+// it.
+const promoteExpense = `UPDATE OR IGNORE expenses SET id = ?, hash_file = ? WHERE id = ? AND hash_file = '';`
+
+const upsertExpense = `INSERT INTO expenses (id, invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET
+		invoice_id = excluded.invoice_id,
+		file_path = excluded.file_path,
+		hash_file = excluded.hash_file,
+		source = excluded.source;`
+
+// UpsertExpensesWithDB inserts the expenses, and updates the ones that already
+// exist. Only invoice_id, file_path, hash_file and source can change; the other
+// columns are part of the primary key.
+//
+// An expense that was first seen without a hash file and later comes back with
+// one is updated in place rather than inserted a second time.
+func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDocumentDB) error {
+	if len(expense) == 0 {
+		return nil
+	}
+
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		for _, e := range expense {
+			if e.HashFile != "" {
+				withoutHash := e
+				withoutHash.HashFile = ""
+				_, err := tx.ExecContext(ctx, promoteExpense, expenseID(e), e.HashFile, expenseID(withoutHash))
+				if err != nil {
+					return fmt.Errorf("while attaching the hash file to expense %q: %w", e.Label, err)
+				}
+			}
+
+			_, err := tx.ExecContext(ctx, upsertExpense,
+				expenseID(e), e.InvoiceID, e.Label, int(e.Amount), formatTime(e.Date),
+				e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType)
+			if err != nil {
+				return fmt.Errorf("while upserting expense %q: %w", e.Label, err)
+			}
+			logutil.Debugf("db: upserted expense %q: %+v", e.Date, e)
+		}
+		return nil
+	})
+}
+
+// -----------------------------------------------------------------------------
+// Account documents.
+// -----------------------------------------------------------------------------
 
 type AccountDocumentDB struct {
 	ID        string           // Example: "64850e8057dcdd65a89cc462"
@@ -1112,139 +1003,149 @@ var GeneralAssemblyCategories = []DocumentCategory{
 	DocumentCategoryGeneralAssembly,
 }
 
+const accountDocumentColumns = "id, hash_file, file_path, mime_type, category, created_at"
+
+func scanAccountDocument(rows *sql.Rows) (AccountDocumentDB, error) {
+	var d AccountDocumentDB
+	var createdAt string
+	err := rows.Scan(&d.ID, &d.HashFile, &d.FilePath, &d.MimeType, &d.Category, &createdAt)
+	if err != nil {
+		return AccountDocumentDB{}, err
+	}
+	d.CreatedAt, err = parseTime("created_at", createdAt)
+	if err != nil {
+		return AccountDocumentDB{}, err
+	}
+	return d, nil
+}
+
 func GetAccountDocumentByHashFileDB(ctx context.Context, db *sql.DB, hashFile string) (AccountDocumentDB, error) {
 	var d AccountDocumentDB
 	var createdAt string
-	err := db.QueryRowContext(ctx, "SELECT id, hash_file, file_path, mime_type, category, created_at FROM account_documents WHERE hash_file = ?", hashFile).Scan(&d.ID, &d.HashFile, &d.FilePath, &d.MimeType, &d.Category, &createdAt)
+	err := db.QueryRowContext(ctx, "SELECT "+accountDocumentColumns+" FROM account_documents WHERE hash_file = ?", hashFile).
+		Scan(&d.ID, &d.HashFile, &d.FilePath, &d.MimeType, &d.Category, &createdAt)
 	if err != nil {
 		return AccountDocumentDB{}, fmt.Errorf("while querying database: %w", err)
 	}
 
-	d.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
+	d.CreatedAt, err = parseTime("created_at", createdAt)
 	if err != nil {
-		return AccountDocumentDB{}, fmt.Errorf("while parsing 'created_at': %w", err)
+		return AccountDocumentDB{}, err
 	}
-
 	return d, nil
 }
 
 func GetAccountDocumentByCategoryDB(ctx context.Context, db *sql.DB, category DocumentCategory) ([]AccountDocumentDB, error) {
-	rows, err := db.QueryContext(ctx, "SELECT id, hash_file, file_path, mime_type, category, created_at FROM account_documents WHERE category = ?", category)
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	var documents []AccountDocumentDB
-	for rows.Next() {
-		var d AccountDocumentDB
-		var createdAt string
-		err = rows.Scan(&d.ID, &d.HashFile, &d.FilePath, &d.MimeType, &d.Category, &createdAt)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning row: %w", err)
-		}
-
-		d.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
-		if err != nil {
-			return nil, fmt.Errorf("while parsing 'created_at': %w", err)
-		}
-		documents = append(documents, d)
-	}
-
-	return documents, nil
+	return queryAll(ctx, db,
+		"SELECT "+accountDocumentColumns+" FROM account_documents WHERE category = ?",
+		scanAccountDocument, category)
 }
 
 func GetAccountDocumentsDB(ctx context.Context, db *sql.DB) ([]AccountDocumentDB, error) {
-	rows, err := db.QueryContext(ctx, "SELECT id, hash_file, file_path, mime_type, category, created_at FROM account_documents")
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	var documents []AccountDocumentDB
-	for rows.Next() {
-		var d AccountDocumentDB
-		var createdAt string
-		err = rows.Scan(&d.ID, &d.HashFile, &d.FilePath, &d.MimeType, &d.Category, &createdAt)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning row: %w", err)
-		}
-
-		d.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
-		if err != nil {
-			return nil, fmt.Errorf("while parsing 'created_at': %w", err)
-		}
-		documents = append(documents, d)
-	}
-
-	return documents, nil
+	return queryAll(ctx, db, "SELECT "+accountDocumentColumns+" FROM account_documents", scanAccountDocument)
 }
 
 func UpsertAccountDocumentsWithDB(ctx context.Context, db *sql.DB, documents []AccountDocumentDB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("while starting transaction: %w", err)
+	if len(documents) == 0 {
+		return nil
 	}
-	defer func() {
-		err = tx.Rollback()
-		if err != nil && err != sql.ErrTxDone {
-			logutil.Errorf("while rolling back transaction: %w", err)
-		}
-	}()
 
-	for _, d := range documents {
-		req := "UPDATE account_documents SET file_path = ?, mime_type = ?, category = ?, created_at = ? WHERE hash_file = ?;"
-		res, err := tx.ExecContext(ctx, req, d.FilePath, d.MimeType, d.Category, d.CreatedAt.Format(time.RFC3339Nano), d.HashFile)
-		if err != nil {
-			return fmt.Errorf("while updating account documents: %w", err)
-		}
+	const req = `INSERT INTO account_documents (id, hash_file, file_path, mime_type, category, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			hash_file = excluded.hash_file,
+			file_path = excluded.file_path,
+			mime_type = excluded.mime_type,
+			category = excluded.category,
+			created_at = excluded.created_at;`
 
-		// If no row was updated, insert a new one.
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("while getting rows affected: %w", err)
-		}
-		if n > 0 {
-			logutil.Debugf("db: updated account document %q: %+v", d.ID, d)
-		} else {
-			req := "INSERT INTO account_documents (id, hash_file, file_path, mime_type, category, created_at) VALUES (?, ?, ?, ?, ?, ?);"
-			_, err := tx.ExecContext(ctx, req, d.ID, d.HashFile, d.FilePath, d.MimeType, d.Category, d.CreatedAt.Format(time.RFC3339Nano))
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		for _, d := range documents {
+			_, err := tx.ExecContext(ctx, req, d.ID, d.HashFile, d.FilePath, d.MimeType, d.Category, formatTime(d.CreatedAt))
 			if err != nil {
-				return fmt.Errorf("while inserting account documents: %w", err)
+				return fmt.Errorf("while upserting account document %q: %w", d.ID, err)
 			}
-			logutil.Debugf("db: added account document %q: %+v", d.ID, d)
+			logutil.Debugf("db: upserted account document %q: %+v", d.ID, d)
 		}
-	}
+		return nil
+	})
+}
 
-	err = tx.Commit()
+// -----------------------------------------------------------------------------
+// Misc.
+// -----------------------------------------------------------------------------
+
+func RmLastExpenseDB(db *sql.DB) error {
+	_, err := db.Exec("DELETE FROM expenses WHERE rowid = (SELECT max(rowid) FROM expenses);")
 	if err != nil {
-		return fmt.Errorf("while committing transaction: %w", err)
+		return fmt.Errorf("while deleting last expense: %w", err)
 	}
 	return nil
 }
 
-func SaveWorkOrdersToDB(ctx context.Context, db *sql.DB, workOrders []WorkOrderDB) error {
-	req := "INSERT INTO work_orders (id, mission_id, number, label, repair_date_start, repair_date_end, supplier_id, supplier_name, supplier_activity) VALUES "
-
-	var values []any
-	for _, w := range workOrders {
-		req += "(?, ?, ?, ?, ?, ?, ?, ?, ?),"
-		values = append(values, w.ID, w.MissionID, w.Number, w.Label, w.RepairDateStart.Format(time.RFC3339Nano), w.RepairDateEnd.Format(time.RFC3339Nano), w.Supplier.ID, w.Supplier.Name, w.Supplier.Activity)
-	}
-
-	// No need to do anything if there are no work orders to insert.
-	if len(values) == 0 {
-		return nil
-	}
-	req = strings.TrimSuffix(req, ",")
-	_, err := db.ExecContext(ctx, req, values...)
-
-	logutil.Debugf("sql saveWorkOrdersToDB: %s with:%s", req, fprintfValues(values, ",", "\n", 9))
+func RmLastMissionDB(db *sql.DB) error {
+	// First, remove the work orders associated with the last mission.
+	_, err := db.Exec("DELETE FROM work_orders WHERE mission_id = (SELECT id FROM missions ORDER BY started_at DESC LIMIT 1);")
 	if err != nil {
-		return fmt.Errorf("while inserting work orders: %w", err)
+		return fmt.Errorf("while deleting work orders: %w", err)
 	}
 
+	_, err = db.Exec("DELETE FROM missions WHERE id = (SELECT id FROM missions ORDER BY started_at DESC LIMIT 1);")
+	if err != nil {
+		return fmt.Errorf("while deleting last mission: %w", err)
+	}
 	return nil
+}
+
+// We consider that the database is empty when there are no missions and no
+// expenses.
+func IsEmptyDB(ctx context.Context, db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM missions;").Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("while querying database: %w", err)
+	}
+	if n > 0 {
+		return false, nil
+	}
+
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM expenses;").Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("while querying database: %w", err)
+	}
+	if n > 0 {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+var missionNumberRE = regexp.MustCompile(`N° ([A-Z0-9]+)`)
+
+// MissionNumber parses the mission number ("Ordre de service" in French) from
+// the subject. For example, given the subject:
+//
+//	"Ordre de service N° OSMIL805898844 – 2NRT POMPE ENVIRONNEMENT - 3 RUE BERTRAN 31200 TOULOUSE"
+//
+// we want to extract "OSMIL805898844".
+func MissionNumber(s string) string {
+	m := missionNumberRE.FindStringSubmatch(s)
+	if len(m) != 2 {
+		return ""
+	}
+	return m[1]
+}
+
+// chunks yields successive slices of at most n elements.
+func chunks[T any](s []T, n int) func(func([]T) bool) {
+	return func(yield func([]T) bool) {
+		for i := 0; i < len(s); i += n {
+			end := min(i+n, len(s))
+			if !yield(s[i:end]) {
+				return
+			}
+		}
+	}
 }
 
 // If the request entries look like
@@ -1269,250 +1170,4 @@ func fprintfValues(values []any, sep, entrySep string, valuesPerEntry int) strin
 		b.WriteString(fmt.Sprintf("%v%s", v, sep))
 	}
 	return b.String()
-}
-
-func SaveMissionsToDB(ctx context.Context, db *sql.DB, missions ...MissionDB) error {
-	req := "INSERT INTO missions (id, number, kind, label, status, started_at, description) VALUES "
-	var values []any
-	for _, e := range missions {
-		req += "(?, ?, ?, ?, ?, ?, ?),"
-		values = append(values, e.ID, e.Number, e.Kind, e.Label, e.Status, e.StartedAt.Format(time.RFC3339Nano), e.Description)
-	}
-	req = strings.TrimSuffix(req, ",")
-	_, err := db.ExecContext(ctx, req, values...)
-	if err != nil {
-		return fmt.Errorf("while inserting values: %w", err)
-	}
-
-	return nil
-}
-
-func GetMissionsDB(ctx context.Context, db *sql.DB) ([]MissionDB, error) {
-	rows, err := db.QueryContext(ctx, "SELECT id, number, kind, label, status, started_at, description FROM missions ORDER BY started_at DESC")
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	var missions []MissionDB
-	for rows.Next() {
-		var m MissionDB
-		var startedAt string
-		err = rows.Scan(&m.ID, &m.Number, &m.Kind, &m.Label, &m.Status, &startedAt, &m.Description)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning row: %w", err)
-		}
-
-		m.StartedAt, err = time.Parse(time.RFC3339Nano, startedAt)
-		if err != nil {
-			return nil, fmt.Errorf("while parsing 'started_at': %w", err)
-		}
-		missions = append(missions, m)
-	}
-
-	var missionIDs []string
-	for i := range missions {
-		missionIDs = append(missionIDs, missions[i].ID)
-	}
-	workOrderMap, err := getWorkOrdersDB(ctx, db, missionIDs...)
-	if err != nil {
-		return nil, fmt.Errorf("while getting work orders from DB: %w", err)
-	}
-
-	for i := range missions {
-		workOrders, found := workOrderMap[missions[i].ID]
-		if !found {
-			continue
-		}
-		missions[i].WorkOrders = workOrders
-	}
-	return missions, nil
-}
-
-func getWorkOrdersDB(ctx context.Context, db *sql.DB, missionIDs ...string) (map[string][]WorkOrderDB, error) {
-	if len(missionIDs) == 0 {
-		return nil, nil
-	}
-	// Join the tables work_orders with suppliers and contract_documents.
-	req := `SELECT
-				w.id, w.mission_id, w.number, w.label, w.repair_date_start, w.repair_date_end, w.supplier_id,
-				s.name, s.activity,
-				d.id, d.file_path, d.hash_file
-			FROM work_orders w
-			LEFT JOIN suppliers s ON s.id = w.supplier_id
-			LEFT JOIN contract_documents d ON d.supplier_id = w.supplier_id
-			WHERE w.mission_id in (`
-	var values []any
-	for _, id := range missionIDs {
-		req += "?,"
-		values = append(values, id)
-	}
-	req = strings.TrimSuffix(req, ",") + ");"
-	// logutil.Debugf("sql getWorkOrdersDB: %s", req)
-
-	rows, err := db.QueryContext(ctx, req, values...)
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	workOrderMap := make(map[string][]WorkOrderDB)
-	for rows.Next() {
-		var wo WorkOrderDB
-		var missionID, repairDateStart, repairDateEnd string
-		var supplName, supplActivity sql.NullString
-		var docID, docFilePath, docHashFile sql.NullString
-		err = rows.Scan(
-			&wo.ID, &missionID, &wo.Number, &wo.Label, &repairDateStart, &repairDateEnd, &wo.Supplier.ID,
-			&supplName, &supplActivity,
-			&docID, &docFilePath, &docHashFile,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning row: %w", err)
-		}
-
-		wo.Supplier.Name = supplName.String
-		wo.Supplier.Activity = supplActivity.String
-
-		wo.RepairDateStart, err = time.Parse(time.RFC3339Nano, repairDateStart)
-		if err != nil {
-			return nil, fmt.Errorf("while parsing 'repair_date_start': %w", err)
-		}
-		wo.RepairDateEnd, err = time.Parse(time.RFC3339Nano, repairDateEnd)
-		if err != nil {
-			return nil, fmt.Errorf("while parsing 'repair_date_end': %w", err)
-		}
-
-		workOrderMap[missionID] = append(workOrderMap[missionID], wo)
-	}
-
-	return workOrderMap, nil
-}
-
-func GetExpensesDB(ctx context.Context, db *sql.DB) ([]ExpenseDocumentDB, error) {
-	rows, err := db.QueryContext(ctx, "SELECT invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type FROM expenses")
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	var expenses []ExpenseDocumentDB
-	for rows.Next() {
-		var e ExpenseDocumentDB
-		var date string
-		var source sql.NullString // The `source` field was added later on, so it may be NULL.
-		err = rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile, &source, &e.AccountingKey.Allocation, &e.AccountingKey.ExpenseType)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning row: %w", err)
-		}
-
-		e.Source = Source(source.String)
-		e.Date, err = time.Parse(time.RFC3339Nano, date)
-		if err != nil {
-			return nil, fmt.Errorf("while parsing 'date': %w", err)
-		}
-
-		expenses = append(expenses, e)
-	}
-
-	return expenses, nil
-}
-
-func RmLastExpenseDB(db *sql.DB) error {
-	_, err := db.Exec("DELETE FROM expenses WHERE rowid = (SELECT max(rowid) FROM expenses);")
-	if err != nil {
-		return fmt.Errorf("while deleting last expense: %w", err)
-	}
-	return nil
-}
-func RmLastMissionDB(db *sql.DB) error {
-	// First, remove the work orders associated with the last mission.
-	_, err := db.Exec("DELETE FROM work_orders WHERE mission_id = (SELECT id FROM missions ORDER BY started_at DESC LIMIT 1);")
-	if err != nil {
-		return fmt.Errorf("while deleting work orders: %w", err)
-	}
-
-	_, err = db.Exec("DELETE FROM missions WHERE id = (SELECT id FROM missions ORDER BY started_at DESC LIMIT 1);")
-	if err != nil {
-		return fmt.Errorf("while deleting last mission: %w", err)
-	}
-	return nil
-}
-
-// We consider that the database is empty when there are no missions and no
-// expenses.
-func IsEmptyDB(ctx context.Context, db *sql.DB) (bool, error) {
-	var n int
-	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM missions;").Scan(&n)
-	if err != nil {
-		return false, fmt.Errorf("while querying database: %w", err)
-	}
-
-	if n > 0 {
-		return false, nil
-	}
-
-	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM expenses;").Scan(&n)
-	if err != nil {
-		return false, fmt.Errorf("while querying database: %w", err)
-	}
-
-	if n > 0 {
-		return false, nil
-	}
-
-	return true, nil
-}
-
-// Parse the mission number ("Ordre de service in French") from the subject.
-// For example, given the subject:
-//
-//	"Ordre de service N° OSMIL805898844 – 2NRT POMPE ENVIRONNEMENT - 3 RUE BERTRAN 31200 TOULOUSE"
-//
-// we want to extract "OSMIL805898844".
-func MissionNumber(s string) string {
-	re := regexp.MustCompile(`N° ([A-Z0-9]+)`)
-	m := re.FindStringSubmatch(s)
-	if len(m) != 2 {
-		return ""
-	}
-	return m[1]
-}
-
-// For example: getLastSyncForQuery(ctx, db, "getCouncilMissionSuppliers")
-type LastSync struct {
-	LastCursor string
-	Date       time.Time
-}
-
-func GetLastSyncs(ctx context.Context, db *sql.DB) (map[string]LastSync, error) {
-	var m map[string]LastSync
-
-	req := "SELECT graphql_query_name, last_cursor, date FROM last_syncs;"
-	rows, err := db.QueryContext(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("while querying database: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var l LastSync
-		var queryName string
-		err = rows.Scan(&queryName, &l.LastCursor, &l.Date)
-		if err != nil {
-			return nil, fmt.Errorf("while scanning row: %w", err)
-		}
-		m[queryName] = l
-	}
-
-	return m, nil
-}
-
-// For example: SetLastSyncForQuery(ctx, db, "getCouncilMissionSuppliers", "cursor")
-func SetLastSyncForQuery(ctx context.Context, db *sql.DB, queryName, cursor string) error {
-	_, err := db.ExecContext(ctx, "REPLACE INTO last_syncs (graphql_query_name, last_cursor, date) VALUES (?, ?, ?);", queryName, cursor, time.Now().Format(time.RFC3339Nano))
-	if err != nil {
-		return fmt.Errorf("while inserting into last_syncs: %w", err)
-	}
-	return nil
 }

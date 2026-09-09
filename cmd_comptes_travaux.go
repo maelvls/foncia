@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,20 +21,20 @@ import (
 //
 // The `search` argument can either be the ID of a "compte travaux", or a
 // case-insensitive fragment of its label, e.g. "ascenseur".
-func ComptesTravauxCmd(username string, password api.Password, search string, asJSON, withTotals bool) {
+func ComptesTravauxCmd(ctx context.Context, username string, password api.Password, search string, asJSON, withTotals bool) {
 	client, err := api.AuthenticatedClient(&http.Client{}, graphqlURL, username, password)
 	if err != nil {
 		logutil.Errorf("while authenticating: %v", err)
 		os.Exit(1)
 	}
 
-	accUUID, err := api.GetAccountUUID(client)
+	accUUID, err := api.GetAccountUUID(ctx, client, graphqlURL)
 	if err != nil {
 		logutil.Errorf("while getting account UUID: %v", err)
 		os.Exit(1)
 	}
 
-	budgets, err := api.GetRepairBudgets(client, graphqlURL, accUUID)
+	budgets, err := api.GetRepairBudgets(ctx, client, graphqlURL, accUUID)
 	if err != nil {
 		logutil.Errorf("while getting the comptes travaux: %v", err)
 		os.Exit(1)
@@ -45,7 +46,7 @@ func ComptesTravauxCmd(username string, password api.Password, search string, as
 			logutil.Errorf("%v", err)
 			os.Exit(1)
 		}
-		details, err := api.GetRepairBudgetDetailsFull(client, graphqlURL, accUUID, budget.ID)
+		details, err := api.GetRepairBudgetDetailsFull(ctx, client, graphqlURL, accUUID, budget.ID)
 		if err != nil {
 			logutil.Errorf("while getting the details of the compte travaux %q: %v", budget.Label, err)
 			os.Exit(1)
@@ -73,7 +74,7 @@ func ComptesTravauxCmd(username string, password api.Password, search string, as
 	for _, budget := range budgets {
 		row := budgetWithTotal{RepairBudgetAPI: budget}
 		if withTotals {
-			details, err := api.GetRepairBudgetDetailsFull(client, graphqlURL, accUUID, budget.ID)
+			details, err := api.GetRepairBudgetDetailsFull(ctx, client, graphqlURL, accUUID, budget.ID)
 			if err != nil {
 				logutil.Errorf("while getting the details of the compte travaux %q: %v", budget.Label, err)
 				os.Exit(1)

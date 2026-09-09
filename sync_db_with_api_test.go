@@ -7,46 +7,49 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/dnaeon/go-vcr/recorder"
 	_ "github.com/glebarez/go-sqlite"
-	"github.com/goccy/go-yaml"
-	"github.com/maelvls/foncia/api"
 	"github.com/maelvls/foncia/db"
-	"github.com/maelvls/foncia/undent"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	_ "embed"
 )
-
-// Load from disk api/mock/realGetAccountingCurrent.json using Go's embed.FS
-//
-//go:embed api/mock/getAccountingCurrent.json
-var realGetAccountingCurrent []byte
 
 func TestSyncExpensesWithDB(t *testing.T) {
 	t.Run("api returns the same thing twice", func(t *testing.T) {
+		// A bulk sync, then the very same payload again: the second run must
+		// report nothing new and must not duplicate anything.
+		const count = 264
+		var expenses []map[string]any
+		for i := range count {
+			expenses = append(expenses, with(
+				fmt.Sprintf("FOURNISSEUR %03d", i),
+				fmt.Sprintf("2024-01-%02dT09:35:13.195Z", i%28+1),
+				fmt.Sprintf("%024x", i),
+				fmt.Sprintf("%024x", i+1_000_000),
+			))
+		}
+
 		sqlDB := withRealDB(t)
-		srv := withMockServer(t, realGetAccountingCurrent, []byte(`{}`))
+		srv := withMockServer(t, withAccountingCurrentResp(expenses), withRGDDResp(nil))
 
 		newExpenses, err := syncExpensesWithDB(t.Context(), srv.Client(), sqlDB, srv.URL+"/graphql", "fake", "not-used")
 		require.NoError(t, err)
 		expensesInDB, err := db.GetExpensesDB(t.Context(), sqlDB)
 		require.NoError(t, err)
-		assert.Len(t, newExpenses, 264)
-		assert.Len(t, expensesInDB, 264)
+		assert.Len(t, newExpenses, count)
+		assert.Len(t, expensesInDB, count)
+		hasNoDuplicates(t, expensesInDB)
 
 		newExpenses, err = syncExpensesWithDB(t.Context(), srv.Client(), sqlDB, srv.URL+"/graphql", "fake", "not-used")
 		require.NoError(t, err)
 		expensesInDB, err = db.GetExpensesDB(t.Context(), sqlDB)
 		require.NoError(t, err)
 		assert.Len(t, newExpenses, 0)
-		assert.Len(t, expensesInDB, 264)
+		assert.Len(t, expensesInDB, count)
+		hasNoDuplicates(t, expensesInDB)
 	})
 
 	t.Run("api returns a new expense", func(t *testing.T) {
@@ -107,55 +110,6 @@ func TestSyncExpensesWithDB(t *testing.T) {
 	})
 }
 
-func TestSyncExpensesWithDBVCR(t *testing.T) {
-	t.Skip("this test takes forever, only ever run it manually")
-	mode := recorder.ModeReplaying
-	var authenticated http.RoundTripper
-	if os.Getenv("RECORD") != "" {
-		mode = recorder.ModeRecording
-		token := os.Getenv("FONCIA_TOKEN")
-		if token == "" {
-			t.Fatal("FONCIA_TOKEN is not set")
-		}
-		authenticated = api.AuthenticatedClientToken(api.Token(token)).Transport
-	}
-
-	switch mode {
-	case recorder.ModeRecording:
-		t.Logf("mode: recording")
-	case recorder.ModeReplaying:
-		t.Logf("mode: replaying")
-	default:
-		t.Logf("mode: %v", mode)
-	}
-
-	r, err := recorder.NewAsMode("sync_expenses_vcr", mode, authenticated)
-	require.NoError(t, err)
-	defer r.Stop()
-
-	sqlDB := withRealDB(t)
-
-	uuid := "eyJhY2NvdW50SWQiOiI2NDg1MGU4MGIzYjI5NDdjNmNmYmQ2MDgiLCJjdXN0b21lcklkIjoiNjQ4NTBlODAzNmNjZGMyNDA3YmFlY2Q0IiwicXVhbGl0eSI6IkNPX09XTkVSIiwiYnVpbGRpbmdJZCI6IjY0ODUwZTgwYTRjY2I5NWNlNGI2YjExNSIsInRydXN0ZWVNZW1iZXIiOnRydWV9"
-	invoicesDir := "invoices"
-
-	newExpenses, err := syncExpensesWithDB(t.Context(), &http.Client{Transport: r}, sqlDB, graphqlURL, uuid, invoicesDir)
-	require.NoError(t, err)
-	expensesInDB, err := db.GetExpensesDB(t.Context(), sqlDB)
-	require.NoError(t, err)
-	assert.Equal(t, 1067, len(newExpenses))
-	assert.Equal(t, 1067, len(expensesInDB))
-	hasNoDuplicates(t, expensesInDB)
-
-	r, _ = recorder.NewAsMode("sync_expenses_vcr", mode, authenticated)
-	newExpenses, err = syncExpensesWithDB(t.Context(), &http.Client{Transport: r}, sqlDB, graphqlURL, uuid, invoicesDir)
-	require.NoError(t, err)
-	expensesInDB, err = db.GetExpensesDB(t.Context(), sqlDB)
-	require.NoError(t, err)
-	assert.Equal(t, 0, newExpenses)
-	assert.Equal(t, 1067, expensesInDB)
-	hasNoDuplicates(t, expensesInDB)
-}
-
 func withDate(date string) time.Time {
 	t, err := time.Parse(time.RFC3339, date)
 	if err != nil {
@@ -176,11 +130,9 @@ func hasNoDuplicates(t *testing.T, expenses []db.ExpenseDocumentDB) {
 }
 
 func withRealDB(t *testing.T) *sql.DB {
-	sqlDB, err := sql.Open("sqlite", "file::memory:")
+	sqlDB, err := db.Open(":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { sqlDB.Close() })
-	err = db.InitAndUpdateDB(t.Context(), sqlDB)
-	require.NoError(t, err)
 	return sqlDB
 }
 
@@ -201,7 +153,7 @@ func withMockServer(t *testing.T, getAccountingCurrentResp []byte, getRGDDResp [
 		case strings.Contains(string(bytes), "query getBuildingAccountingCurrent"):
 			_, _ = w.Write(getAccountingCurrentResp)
 		case strings.Contains(string(bytes), "query getAccountingPeriods"):
-			_, _ = w.Write([]byte(undent.Undent(`
+			_, _ = w.Write([]byte(`
 				{
 				  "data": {
 				    "coownerAccount": {
@@ -218,7 +170,7 @@ func withMockServer(t *testing.T, getAccountingCurrentResp []byte, getRGDDResp [
 				    }
 				  }
 				}
-			`)))
+			`))
 		case strings.Contains(string(bytes), "query getBuildingAccountingRGDD"):
 			_, _ = w.Write(getRGDDResp)
 		case strings.Contains(string(bytes), "query getRepairBudgets"):
@@ -319,18 +271,4 @@ func withAccountingCurrentResp(expenses []map[string]any) []byte {
 		panic(err)
 	}
 	return bytes
-}
-
-func toJSON(yamlStr string) string {
-	var v map[string]any
-	err := yaml.Unmarshal([]byte(yamlStr), &v)
-	if err != nil {
-		panic(err)
-	}
-
-	bytes, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	return string(bytes)
 }

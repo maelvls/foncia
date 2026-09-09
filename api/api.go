@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,20 +14,28 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/cloudmailin/cloudmailin-go"
 	"github.com/maelvls/foncia/db"
 	"github.com/maelvls/foncia/logutil"
 	"github.com/sethgrid/gencurl"
-	"github.com/shurcooL/graphql"
-	"golang.org/x/oauth2"
 )
+
+// DefaultTimeout is the timeout given to the HTTP clients created by this
+// package. Without it, a request that the Foncia gateway never answers hangs
+// forever, and since these calls are also made from HTTP handlers, that means a
+// stuck web server.
+const DefaultTimeout = 60 * time.Second
+
+// GraphQLURL is the production Foncia GraphQL gateway. It is only a default:
+// every func in this package takes the URL so that the tests can point it at an
+// httptest server.
+const GraphQLURL = "https://myfoncia-gateway.prod.fonciamillenium.net/graphql"
 
 type MissionAPI struct {
 	ID          string         // "64850e8019d5d64c415d13dd"
@@ -57,40 +64,209 @@ var (
 	Repair   MissionKindAPI = "Repair"
 )
 
-// The `authClient` given as input is only used to authenticate and is not used
-// after that. A fresh client is returned.
+// Time is a time.Time that knows how to decode the dates the Foncia API
+// returns: RFC 3339, except that a missing date is an empty string rather than
+// `null`. An empty string (and `null`) decode to the zero time; anything else
+// that isn't a date is an error rather than a silently dropped record.
+type Time struct {
+	time.Time
+}
+
+func (t *Time) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("expected a date as a JSON string, got %s", string(b))
+	}
+	if s == "" {
+		t.Time = time.Time{}
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return fmt.Errorf("error parsing time: %w", err)
+	}
+	t.Time = parsed
+	return nil
+}
+
+func (t Time) MarshalJSON() ([]byte, error) {
+	if t.IsZero() {
+		return []byte(`""`), nil
+	}
+	return json.Marshal(t.Format(time.RFC3339Nano))
+}
+
+// amount is the `Money` type of the Foncia API. The value is in cents, e.g.
+// 1234567890 means "1234567,90 €".
+type amount struct {
+	Value    int    `json:"value"`
+	Currency string `json:"currency"`
+}
+
+// pageInfo is the Relay-style pagination info returned by every paginated
+// field of the Foncia API.
+type pageInfo struct {
+	StartCursor     string `json:"startCursor"`
+	EndCursor       string `json:"endCursor"`
+	HasPreviousPage bool   `json:"hasPreviousPage"`
+	HasNextPage     bool   `json:"hasNextPage"`
+}
+
+// documentNode is the shape of a document as returned by the API.
+type documentNode struct {
+	ID               string `json:"id"`
+	HashFile         string `json:"hashFile"`
+	MimeType         string `json:"mimeType"`
+	OriginalFilename string `json:"originalFilename"`
+	Category         string `json:"category"`
+	CreatedAt        Time   `json:"createdAt"`
+}
+
+type supplierNode struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	FirstName string `json:"firstName"`
+	Activity  string `json:"activity"`
+}
+
+func (s supplierNode) toAPI() SupplierAPI {
+	return SupplierAPI{ID: s.ID, Name: s.Name, FirstName: s.FirstName, Activity: s.Activity}
+}
+
 // AuthenticatedClient returns a client that logs in again when the token
 // expires. The tokens handed out by Foncia are valid for 30 days, which is
 // plenty for the one-shot commands, but the `serve` command stays up for
 // months. It used to keep using the very first token forever, which meant that
 // after 30 days every call to the API failed; the sync stopped, and the
 // "Télécharger depuis Foncia" links started answering "not found".
+//
+// The `authClient` given as input is only used to log in, and is not mutated: a
+// copy of it is used.
 func AuthenticatedClient(authClient *http.Client, graphqlURL, username string, password Password) (*http.Client, error) {
-	EnableDebugCurlLogs(authClient)
+	// A copy: we don't want to mutate the caller's client.
+	loginClient := *authClient
+	if loginClient.Timeout == 0 {
+		loginClient.Timeout = DefaultTimeout
+	}
+	loginClient.Transport = withDebugCurlLogs(loginClient.Transport)
 
 	src := &loginTokenSource{
-		authClient: authClient,
+		authClient: &loginClient,
 		graphqlURL: graphqlURL,
 		username:   username,
 		password:   password,
 	}
 
+	tr := &tokenTransport{
+		base:  withDebugCurlLogs(nil),
+		login: src.Token,
+	}
+
 	// Let's log in once right away so that wrong credentials are reported when
 	// the command starts rather than on the first call to the API.
-	token, err := src.Token()
-	if err != nil {
+	if _, err := tr.token(context.Background(), false); err != nil {
 		return nil, fmt.Errorf("while authenticating: %w", err)
 	}
 
-	// ReuseTokenSource hands out the token it has until it is about to expire,
-	// and calls src.Token() again after that.
-	client := oauth2.NewClient(context.Background(), oauth2.ReuseTokenSource(token, src))
-	EnableDebugCurlLogs(client)
-	return client, nil
+	return &http.Client{Transport: tr, Timeout: DefaultTimeout}, nil
 }
 
-// loginTokenSource logs in with the username and password every time oauth2
-// needs a fresh token.
+// AuthenticatedClientToken is used when the token is given directly with
+// FONCIA_TOKEN. Contrary to AuthenticatedClient, this client has no way to log
+// in again, so it stops working when the token expires.
+func AuthenticatedClientToken(token Token) *http.Client {
+	return &http.Client{
+		Transport: &tokenTransport{base: withDebugCurlLogs(nil), tok: token},
+		Timeout:   DefaultTimeout,
+	}
+}
+
+// expiryDelta is the margin taken on the expiry date: a token that is about to
+// expire is replaced right away rather than half-way through a request.
+const expiryDelta = 30 * time.Second
+
+// tokenTransport attaches the `Authorization: Bearer` header, and logs in again
+// when the token it holds has expired or when the server tells us it doesn't
+// like it (401). This replaces golang.org/x/oauth2, which pulled in appengine
+// and the deprecated github.com/golang/protobuf, and which couldn't re-login on
+// a 401.
+type tokenTransport struct {
+	base http.RoundTripper
+
+	// login is nil when the token was given by the user (FONCIA_TOKEN): there
+	// is then no way to get a fresh one.
+	login func(ctx context.Context) (Token, time.Time, error)
+
+	mu     sync.Mutex
+	tok    Token
+	expiry time.Time // Zero means "we don't know", i.e. never re-login.
+}
+
+// token returns the token to use, logging in if the current one is missing,
+// expired, or if `force` is set. The mutex is deliberately held during the
+// login call so that concurrent requests don't all log in at once.
+func (t *tokenTransport) token(ctx context.Context, force bool) (Token, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	stillGood := t.tok != "" && (t.expiry.IsZero() || time.Now().Before(t.expiry.Add(-expiryDelta)))
+	if !force && stillGood {
+		return t.tok, nil
+	}
+	if t.login == nil {
+		// Static token: nothing better to offer.
+		return t.tok, nil
+	}
+	tok, expiry, err := t.login(ctx)
+	if err != nil {
+		return "", err
+	}
+	t.tok, t.expiry = tok, expiry
+	return tok, nil
+}
+
+func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	tok, err := t.token(req.Context(), false)
+	if err != nil {
+		return nil, fmt.Errorf("while getting a token: %w", err)
+	}
+
+	// A RoundTripper must not modify the request it is given.
+	authReq := req.Clone(req.Context())
+	authReq.Header.Set("Authorization", "Bearer "+string(tok))
+
+	resp, err := t.base.RoundTrip(authReq)
+	if err != nil {
+		return nil, err
+	}
+
+	// The token was rejected: log in again and replay the request once. Only
+	// possible if we know how to log in and if the body can be re-read.
+	replayable := t.login != nil && (req.Body == nil || req.GetBody != nil)
+	if resp.StatusCode != http.StatusUnauthorized || !replayable {
+		return resp, nil
+	}
+	logutil.Debugf("authentication: got a 401, logging in again and retrying")
+	resp.Body.Close()
+
+	tok, err = t.token(req.Context(), true)
+	if err != nil {
+		return nil, fmt.Errorf("while logging in again after a 401: %w", err)
+	}
+	retryReq := req.Clone(req.Context())
+	retryReq.Header.Set("Authorization", "Bearer "+string(tok))
+	if req.GetBody != nil {
+		body, err := req.GetBody()
+		if err != nil {
+			return nil, fmt.Errorf("while rewinding the body to retry after a 401: %w", err)
+		}
+		retryReq.Body = body
+	}
+	return t.base.RoundTrip(retryReq)
+}
+
+// loginTokenSource logs in with the username and password every time a fresh
+// token is needed.
 type loginTokenSource struct {
 	authClient *http.Client
 	graphqlURL string
@@ -98,93 +274,38 @@ type loginTokenSource struct {
 	password   Password
 }
 
-func (s *loginTokenSource) Token() (*oauth2.Token, error) {
-	token, err := GetToken(s.authClient, s.graphqlURL, s.username, s.password)
-	if err != nil {
-		return nil, err
-	}
-
-	// oauth2 needs to know when the token expires, otherwise it never asks for
-	// a new one.
-	expiry, err := parseJWTExp(string(token))
-	if err != nil {
-		return nil, fmt.Errorf("while parsing the JWT that was just issued: %w", err)
-	}
-
-	return &oauth2.Token{AccessToken: string(token), TokenType: "Bearer", Expiry: expiry}, nil
+// Token logs in and returns the new token along with its expiry date.
+func (s *loginTokenSource) Token(ctx context.Context) (Token, time.Time, error) {
+	return GetToken(ctx, s.authClient, s.graphqlURL, s.username, s.password)
 }
 
-// AuthenticatedClientToken is used when the token is given directly with
-// FONCIA_TOKEN. Contrary to AuthenticatedClient, this client has no way to log
-// in again, so it stops working when the token expires.
-func AuthenticatedClientToken(token Token) *http.Client {
-	client := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: string(token)},
-	))
-	EnableDebugCurlLogs(client)
-	return client
-}
-
-// Detect when 429 too many requests is returned by the server.
-func IsTooManyRequests(body []byte) bool {
-	var resp struct {
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	err := json.Unmarshal(body, &resp)
-	if err != nil {
-		return false
-	}
-	for _, err := range resp.Errors {
-		if err.Message == "429: Too Many Requests" {
-			return true
-		}
-	}
-	return false
-}
-
-// After getting the token, create a client with the following:
+// GetToken logs in and returns the token together with the expiry date read
+// from the token's `exp` claim.
 //
-//	client := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
-//	    &oauth2.getToken{AccessToken: token},
-//	))
-//
-// The given client isn't mutated.
+// The given client isn't mutated: GetToken needs a client that doesn't follow
+// redirects (a 302 on a login is an error, not a redirect) and that keeps
+// cookies, so it works on a copy.
 //
 //	curl 'https://myfoncia-gateway.prod.fonciamillenium.net/graphql' \
-//	  -H 'accept: */*' \
-//	  -H 'accept-language: en-US,en;q=0.9,fr;q=0.8,fr-FR;q=0.7' \
-//	  -H 'authorization;' \
 //	  -H 'content-type: application/json' \
-//	  -H 'origin: https://my-foncia.fonciamillenium.net' \
-//	  -H 'priority: u=1, i' \
-//	  -H 'referer: https://my-foncia.fonciamillenium.net/' \
-//	  -H 'sec-ch-ua: "Not A(Brand";v="8", "Chromium";v="132", "Microsoft Edge";v="132"' \
-//	  -H 'sec-ch-ua-mobile: ?0' \
-//	  -H 'sec-ch-ua-platform: "macOS"' \
-//	  -H 'sec-fetch-dest: empty' \
-//	  -H 'sec-fetch-mode: cors' \
-//	  -H 'sec-fetch-site: same-site' \
-//	  -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0' \
-//	  --data-raw $'{"query":"mutation login($request: LoginRequest\u0021) {\\n  login(request: $request) {\\n    token\\n    __typename\\n  }\\n}","variables":{"request":{"username":"","password":"","appId":"myfoncia"}},"operationName":"login"}'
-func GetToken(client *http.Client, graphqlURL, username string, password Password) (Token, error) {
+//	  --data-raw $'{"query":"mutation login($request: LoginRequest!) {\\n  login(request: $request) {\\n    token\\n  }\\n}","variables":{"request":{"username":"","password":"","appId":"myfoncia"}},"operationName":"login"}'
+func GetToken(ctx context.Context, client *http.Client, graphqlURL, username string, password Password) (Token, time.Time, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("error creating cookie jar: %w", err)
+	}
+
+	loginClient := *client
+	loginClient.Jar = jar
 	// Redirects don't make sense for HTML pages. For example, a 302 redirect
 	// might actually indicate an error.
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+	loginClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return "", fmt.Errorf("error creating cookie jar: %w", err)
-	}
-	client.Jar = jar
-
-	query := `mutation login($request: LoginRequest!) {
+	const query = `mutation login($request: LoginRequest!) {
 		login(request: $request) {
 			token
-			__typename
 		}
 	}`
 
@@ -194,17 +315,12 @@ func GetToken(client *http.Client, graphqlURL, username string, password Passwor
 		AppID    string `json:"appId"`
 	}
 	var loginResp struct {
-		Data struct {
-			Login struct {
-				Token string `json:"token"`
-			} `json:"login"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
+		Login struct {
+			Token string `json:"token"`
+		} `json:"login"`
 	}
 
-	err = DoGraphQL(client, graphqlURL, query, map[string]any{
+	err = DoGraphQL(ctx, &loginClient, graphqlURL, query, map[string]any{
 		"request": LoginRequest{
 			Username: username,
 			Password: password.Raw(),
@@ -212,23 +328,22 @@ func GetToken(client *http.Client, graphqlURL, username string, password Passwor
 		},
 	}, &loginResp)
 	if err != nil {
-		return "", fmt.Errorf("error while querying loginResp: %w", err)
+		return "", time.Time{}, fmt.Errorf("error while logging in: %w", err)
 	}
-
-	if len(loginResp.Errors) > 0 {
-		return "", fmt.Errorf("error while logging in: %s", loginResp.Errors[0].Message)
+	if loginResp.Login.Token == "" {
+		return "", time.Time{}, fmt.Errorf("the login mutation returned an empty token")
 	}
 
 	// We parse the JWT to know when the token expires. We can't verify the JWT
 	// because we don't have the public key (and we don't need to verify it),
 	// but I trust that the `exp` claim is correct since I trust the server.
-	expiry, err := parseJWTExp(string(loginResp.Data.Login.Token))
+	expiry, err := parseJWTExp(loginResp.Login.Token)
 	if err != nil {
-		return "", fmt.Errorf("while parsing JWT: %w", err)
+		return "", time.Time{}, fmt.Errorf("while parsing the JWT that was just issued: %w", err)
 	}
 
-	logutil.Debugf("authentication: token expires in %s (%s)", expiry.Sub(time.Now()).Round(time.Second), expiry)
-	return Token(loginResp.Data.Login.Token), nil
+	logutil.Debugf("authentication: token expires in %s (%s)", time.Until(expiry).Round(time.Second), expiry)
+	return Token(loginResp.Login.Token), expiry, nil
 }
 
 // Returns the expiry date of the given JWT. WARNING: This func doesn't verify
@@ -255,8 +370,7 @@ func parseJWTExp(token string) (time.Time, error) {
 	if !ok {
 		return time.Time{}, fmt.Errorf("JWT payload 'exp' is not a number")
 	}
-	expTime := time.Unix(int64(expInt), 0)
-	return expTime, nil
+	return time.Unix(int64(expInt), 0), nil
 }
 
 // The accountUUID is the base 64 encoded ID of the account. For example:
@@ -266,108 +380,33 @@ func parseJWTExp(token string) (time.Time, error) {
 // which decodes to:
 //
 //	{"accountId":"64850e80b3b2947c6cfbd608","customerId":"64850e8036ccdc2407baecd4","quality":"CO_OWNER","buildingId":"64850e80a4ccb95ce4b6b115","trusteeMember":true}
-//
-// I copy-pasted the graphql query from the "Dev tools" in Chrome, and asked
-// ChatGPT to turn that query into Go.
-func GetAccountUUID(client *http.Client) (string, error) {
-	gqlclient := graphql.NewClient("https://myfoncia-gateway.prod.fonciamillenium.net/graphql", client)
-
-	type Account struct {
-		UUID string `graphql:"uuid"`
+func GetAccountUUID(ctx context.Context, client *http.Client, graphqlURL string) (string, error) {
+	const getAccountsQuery = `query getAccounts {accounts {uuid}}`
+	var getAccountsResp struct {
+		Accounts []struct {
+			UUID string `json:"uuid"`
+		} `json:"accounts"`
 	}
 
-	q := struct {
-		Accounts []Account `graphql:"accounts"`
-	}{}
-
-	err := gqlclient.Query(context.Background(), &q, nil)
+	err := DoGraphQL(ctx, client, graphqlURL, getAccountsQuery, nil, &getAccountsResp)
 	if err != nil {
-		return "", fmt.Errorf("error while querying: %w", err)
+		return "", fmt.Errorf("error while querying getAccountsResp: %w", err)
 	}
-
-	if len(q.Accounts) == 0 {
+	if len(getAccountsResp.Accounts) == 0 {
 		return "", fmt.Errorf("no accounts found")
 	}
-
-	return q.Accounts[0].UUID, nil
+	return getAccountsResp.Accounts[0].UUID, nil
 }
 
-// Repairs and Incidents. Use GetAccountUUID to get the accountUUID.
-// `fromCursor` allows you to skip missions that you already have.
-func GetMissionsAPI(client *http.Client, graphqlURL, accountUUID string, fromCursor string) (_ []MissionAPI, lastCursor string, _ error) {
-	var interventions []MissionAPI
+// pagesLimit is a safety net: the loop stops after that many pages even if the
+// server keeps claiming there is a next page.
+const pagesLimit = 10000
 
-	type PageInfo struct {
-		EndCursor   string `json:"endCursor"`
-		HasNextPage bool   `json:"hasNextPage"`
-	}
-
-	type MissionIncidents struct {
-		TotalCount int      `json:"totalCount"`
-		PageInfo   PageInfo `json:"pageInfo"`
-		Edges      []struct {
-			Node struct {
-				ID          string `json:"id"`
-				Number      string `json:"number"`
-				StartedAt   string `json:"startedAt"`
-				Label       string `json:"label"`
-				Status      string `json:"status"`
-				Description string `json:"description"`
-			} `json:"node"`
-		} `json:"edges"`
-	}
-
-	type MissionRepairs struct {
-		TotalCount int      `json:"totalCount"`
-		PageInfo   PageInfo `json:"pageInfo"`
-		Edges      []struct {
-			Node struct {
-				ID          string `json:"id"`
-				Number      string `json:"number"`
-				StartedAt   string `json:"startedAt"`
-				Label       string `json:"label"`
-				Status      string `json:"status"`
-				Description string `json:"description"`
-			} `json:"node"`
-		} `json:"edges"`
-	}
-
-	const getIncidentsQuery = `
-		query getCouncilMissionIncidents($accountUuid: EncodedID!, $first: Int, $after: Cursor, $sortBy: [SortByType!]) {
-			coownerAccount(uuid: $accountUuid) {
-				uuid
-				trusteeCouncil {
-					missionIncidents(first: $first, after: $after, sortBy: $sortBy) {
-						totalCount
-						pageInfo {
-							startCursor
-							endCursor
-							hasPreviousPage
-							hasNextPage
-							pageNumber
-							itemsPerPage
-							totalDisplayPages
-							totalPages
-						}
-						edges {
-							node {
-								id
-								number
-								startedAt
-								label
-								status
-								description
-							}
-						}
-					}
-				}
-			}
-		}
-	`
-
-	perPage := 100 // I found that it is the maximum value that works.
-	pagesLimit := 100000
-
+// paginate calls `fetch` page after page, following the end cursor, until the
+// server says there is no next page. It returns the cursor of the last page so
+// that the next sync can resume from there; when nothing was fetched, the
+// `fromCursor` given as input is returned unchanged.
+func paginate(ctx context.Context, fromCursor string, fetch func(ctx context.Context, after *string) (pageInfo, error)) (lastCursor string, _ error) {
 	// The reason *string is needed is because I found that the empty string
 	// doesn't work to get the first page. To get the first page, the field
 	// `after` must be appearing as `null`.
@@ -375,161 +414,186 @@ func GetMissionsAPI(client *http.Client, graphqlURL, accountUUID string, fromCur
 	if fromCursor != "" {
 		cursor = &fromCursor
 	}
-	pageCount := 0
-	for {
-		var getIncidentsResp struct {
-			Data struct {
-				CoownerAccount struct {
-					UUID           string `json:"uuid"`
-					TrusteeCouncil struct {
-						MissionIncidents MissionIncidents `json:"missionIncidents"`
-					} `json:"trusteeCouncil"`
-				}
-			} `json:"data"`
+	lastCursor = fromCursor
+
+	for page := 0; page < pagesLimit; page++ {
+		info, err := fetch(ctx, cursor)
+		if err != nil {
+			return lastCursor, err
 		}
-		err := DoGraphQL(client, graphqlURL, getIncidentsQuery, map[string]any{
+		if info.EndCursor != "" {
+			lastCursor = info.EndCursor
+		}
+		// Guard against a server that keeps saying "there is a next page" while
+		// handing us the same cursor over and over.
+		if !info.HasNextPage || info.EndCursor == "" || (cursor != nil && info.EndCursor == *cursor) {
+			return lastCursor, nil
+		}
+		endCursor := info.EndCursor
+		cursor = &endCursor
+	}
+	return lastCursor, nil
+}
+
+// perPage is the maximum page size the Foncia API accepts.
+const perPage = 100
+
+// MissionsCursor remembers where the previous call to GetMissionsAPI stopped.
+// Incidents and repairs are two distinct paginated lists on the Foncia side, so
+// they each need their own cursor; feeding one's cursor to the other query
+// silently skips or duplicates missions.
+type MissionsCursor struct {
+	IncidentsCursor string
+	RepairsCursor   string
+}
+
+// missionNode is what both `missionIncidents` and `missionRepairs` return.
+type missionNode struct {
+	ID          string `json:"id"`
+	Number      string `json:"number"`
+	StartedAt   Time   `json:"startedAt"`
+	Label       string `json:"label"`
+	Status      string `json:"status"`
+	Description string `json:"description"`
+}
+
+type missionConnection struct {
+	TotalCount int      `json:"totalCount"`
+	PageInfo   pageInfo `json:"pageInfo"`
+	Edges      []struct {
+		Node missionNode `json:"node"`
+	} `json:"edges"`
+}
+
+const missionsPageInfoFields = `
+	pageInfo {
+		startCursor
+		endCursor
+		hasPreviousPage
+		hasNextPage
+	}
+	edges {
+		node {
+			id
+			number
+			startedAt
+			label
+			status
+			description
+		}
+	}`
+
+const getIncidentsQuery = `
+	query getCouncilMissionIncidents($accountUuid: EncodedID!, $first: Int, $after: Cursor, $sortBy: [SortByType!]) {
+		coownerAccount(uuid: $accountUuid) {
+			uuid
+			trusteeCouncil {
+				missionIncidents(first: $first, after: $after, sortBy: $sortBy) {
+					totalCount` + missionsPageInfoFields + `
+				}
+			}
+		}
+	}`
+
+const getRepairsQuery = `
+	query getCouncilMissionRepairs($accountUuid: EncodedID!, $first: Int, $after: Cursor, $sortBy: [SortByType!]) {
+		coownerAccount(uuid: $accountUuid) {
+			uuid
+			trusteeCouncil {
+				missionRepairs(first: $first, after: $after, sortBy: $sortBy) {
+					totalCount` + missionsPageInfoFields + `
+				}
+			}
+		}
+	}`
+
+// GetMissionsAPI returns the repairs and incidents. Use GetAccountUUID to get
+// the accountUUID. `from` lets you skip the missions you already have; the
+// returned cursor pair is meant to be persisted and handed back on the next
+// call.
+func GetMissionsAPI(ctx context.Context, client *http.Client, graphqlURL, accountUUID string, from MissionsCursor) (_ []MissionAPI, _ MissionsCursor, _ error) {
+	var missions []MissionAPI
+	last := from
+
+	// Incidents.
+	var err error
+	last.IncidentsCursor, err = paginate(ctx, from.IncidentsCursor, func(ctx context.Context, after *string) (pageInfo, error) {
+		var resp struct {
+			CoownerAccount struct {
+				UUID           string `json:"uuid"`
+				TrusteeCouncil struct {
+					MissionIncidents missionConnection `json:"missionIncidents"`
+				} `json:"trusteeCouncil"`
+			} `json:"coownerAccount"`
+		}
+		err := DoGraphQL(ctx, client, graphqlURL, getIncidentsQuery, map[string]any{
 			"accountUuid": accountUUID,
 			"first":       perPage,
-			"after":       cursor,
+			"after":       after,
 			// We don't sort by "createdAt" because some entries have the same
 			// timestamp, leading to unpredictable ordering, which, combined
 			// with pagination, leads to duplicate or missing entries.
-		}, &getIncidentsResp)
+		}, &resp)
 		if err != nil {
-			return nil, "", fmt.Errorf("error while querying getIncidentsResp: %w", err)
+			return pageInfo{}, fmt.Errorf("error while querying getIncidentsResp: %w", err)
 		}
-
-		for _, edge := range getIncidentsResp.Data.CoownerAccount.TrusteeCouncil.MissionIncidents.Edges {
-			var startedAt time.Time
-			if edge.Node.StartedAt != "" {
-				var err error
-				startedAt, err = time.Parse(time.RFC3339Nano, edge.Node.StartedAt)
-				if err != nil {
-					logutil.Debugf("error parsing time: %v", err)
-					return nil, "", fmt.Errorf("error parsing time: %w", err)
-				}
-			}
-			interventions = append(interventions, MissionAPI{
-				ID:          edge.Node.ID,
-				Number:      edge.Node.Number,
-				Label:       edge.Node.Label,
-				Status:      edge.Node.Status,
-				StartedAt:   startedAt,
-				Description: edge.Node.Description,
-				Kind:        Incident,
-			})
-		}
-
-		if !getIncidentsResp.Data.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.HasNextPage {
-			break
-		}
-		temp := getIncidentsResp.Data.CoownerAccount.TrusteeCouncil.MissionIncidents.PageInfo.EndCursor
-		cursor = &temp
-
-		pageCount++
-		if pageCount == pagesLimit {
-			break
-		}
+		conn := resp.CoownerAccount.TrusteeCouncil.MissionIncidents
+		missions = append(missions, missionsFromEdges(conn, Incident)...)
+		return conn.PageInfo, nil
+	})
+	if err != nil {
+		return nil, from, err
 	}
 
 	// Repairs.
-	const getRepairsQuery = `
-		query getCouncilMissionRepairs($accountUuid: EncodedID!, $first: Int, $after: Cursor, $sortBy: [SortByType!]) {
-			coownerAccount(uuid: $accountUuid) {
-				uuid
-				trusteeCouncil {
-					missionRepairs(first: $first, after: $after, sortBy: $sortBy) {
-						totalCount
-						pageInfo {
-							startCursor
-							endCursor
-							hasPreviousPage
-							hasNextPage
-							pageNumber
-							itemsPerPage
-							totalDisplayPages
-							totalPages
-						}
-						edges {
-							node {
-								id
-								number
-								startedAt
-								label
-								status
-								description
-							}
-						}
-					}
-				}
-			}
+	last.RepairsCursor, err = paginate(ctx, from.RepairsCursor, func(ctx context.Context, after *string) (pageInfo, error) {
+		var resp struct {
+			CoownerAccount struct {
+				UUID           string `json:"uuid"`
+				TrusteeCouncil struct {
+					MissionRepairs missionConnection `json:"missionRepairs"`
+				} `json:"trusteeCouncil"`
+			} `json:"coownerAccount"`
 		}
-	`
-
-	cursor = nil
-	pageCount = 0
-	for {
-		var getRepairsResp struct {
-			Data struct {
-				CoownerAccount struct {
-					UUID           string `json:"uuid"`
-					TrusteeCouncil struct {
-						MissionRepairs MissionRepairs `json:"missionRepairs"`
-					} `json:"trusteeCouncil"`
-				}
-			} `json:"data"`
-		}
-		err := DoGraphQL(client, graphqlURL, getRepairsQuery, map[string]any{
+		err := DoGraphQL(ctx, client, graphqlURL, getRepairsQuery, map[string]any{
 			"accountUuid": accountUUID,
 			"first":       perPage,
-			"after":       cursor,
-			// We don't sort by "createdAt" because some entries have the same
-			// timestamp, leading to unpredictable ordering, which, combined
-			// with pagination, leads to duplicate or missing entries.
-		}, &getRepairsResp)
+			"after":       after,
+		}, &resp)
 		if err != nil {
-			return nil, "", fmt.Errorf("error while querying getRepairsResp: %w", err)
+			return pageInfo{}, fmt.Errorf("error while querying getRepairsResp: %w", err)
 		}
-
-		for _, edge := range getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.Edges {
-			var startedAt time.Time
-			if edge.Node.StartedAt != "" {
-				startedAt, err = time.Parse(time.RFC3339Nano, edge.Node.StartedAt)
-				if err != nil {
-					return nil, "", fmt.Errorf("error parsing time: %w", err)
-				}
-			}
-			interventions = append(interventions, MissionAPI{
-				ID:          edge.Node.ID,
-				Number:      edge.Node.Number,
-				Label:       edge.Node.Label,
-				Status:      edge.Node.Status,
-				StartedAt:   startedAt,
-				Description: edge.Node.Description,
-				Kind:        Repair,
-			})
-		}
-
-		cursor = &getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.EndCursor
-		if !getRepairsResp.Data.CoownerAccount.TrusteeCouncil.MissionRepairs.PageInfo.HasNextPage {
-			break
-		}
-
-		pageCount++
-		if pageCount == pagesLimit {
-			break
-		}
+		conn := resp.CoownerAccount.TrusteeCouncil.MissionRepairs
+		missions = append(missions, missionsFromEdges(conn, Repair)...)
+		return conn.PageInfo, nil
+	})
+	if err != nil {
+		return nil, from, err
 	}
 
-	sort.Slice(interventions, func(i, j int) bool {
-		return interventions[i].StartedAt.After(interventions[j].StartedAt)
+	sort.Slice(missions, func(i, j int) bool {
+		return missions[i].StartedAt.After(missions[j].StartedAt)
 	})
-	// The `cursor` pointer must be not nil if we are getting here. If it is
-	// nil, it means that an error occurred above, which should have returned.
-	return interventions, *cursor, nil
+	return missions, last, nil
 }
 
-func GetWorkOrdersAPI(client *http.Client, graphqlURL, accountUUID, missionID string) (_ []WorkOrderAPI, _ error) {
+func missionsFromEdges(conn missionConnection, kind MissionKindAPI) []MissionAPI {
+	var missions []MissionAPI
+	for _, edge := range conn.Edges {
+		missions = append(missions, MissionAPI{
+			ID:          edge.Node.ID,
+			Number:      edge.Node.Number,
+			Label:       edge.Node.Label,
+			Status:      edge.Node.Status,
+			StartedAt:   edge.Node.StartedAt.Time,
+			Description: edge.Node.Description,
+			Kind:        kind,
+		})
+	}
+	return missions
+}
+
+func GetWorkOrdersAPI(ctx context.Context, client *http.Client, graphqlURL, accountUUID, missionID string) (_ []WorkOrderAPI, _ error) {
 	const getWorkOrders = `
 		query getWorkOrders($accountUuid: EncodedID!, $missionId: ID!, $first: Int, $before: Cursor, $after: Cursor) {
 			workOrders(accountUuid: $accountUuid, missionId: $missionId, first: $first, before: $before, after: $after) {
@@ -554,85 +618,73 @@ func GetWorkOrdersAPI(client *http.Client, graphqlURL, accountUUID, missionID st
 		}
 	`
 	var getWorkOrdersResp struct {
-		Data struct {
-			WorkOrders struct {
-				Edges []struct {
-					Node struct {
-						ID         string `json:"id"`
-						Number     string `json:"number"`
-						Label      string `json:"label"`
-						RepairDate struct {
-							Start string `json:"start"`
-							End   string `json:"end"`
-						} `json:"repairDate"`
-						Supplier struct {
-							ID        string `json:"id"`
-							Name      string `json:"name"`
-							FirstName string `json:"firstName"`
-							Activity  string `json:"activity"`
-						} `json:"supplier"`
-					} `json:"node"`
-				} `json:"edges"`
-			} `json:"workOrders"`
-		} `json:"data"`
+		WorkOrders struct {
+			Edges []struct {
+				Node struct {
+					ID         string `json:"id"`
+					Number     string `json:"number"`
+					Label      string `json:"label"`
+					RepairDate struct {
+						Start Time `json:"start"`
+						End   Time `json:"end"`
+					} `json:"repairDate"`
+					Supplier supplierNode `json:"supplier"`
+				} `json:"node"`
+			} `json:"edges"`
+		} `json:"workOrders"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getWorkOrders, map[string]any{
+	err := DoGraphQL(ctx, client, graphqlURL, getWorkOrders, map[string]any{
 		"accountUuid": accountUUID,
 		"missionId":   missionID,
-		"first":       100,
+		"first":       perPage,
 	}, &getWorkOrdersResp)
 	if err != nil {
 		return nil, fmt.Errorf("error while querying getWorkOrdersResp for mission %s: %w", missionID, err)
 	}
 
 	var orders []WorkOrderAPI
-	for _, edge := range getWorkOrdersResp.Data.WorkOrders.Edges {
-		var start, end time.Time
-		if edge.Node.RepairDate.Start != "" {
-			start, err = time.Parse(time.RFC3339Nano, edge.Node.RepairDate.Start)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing time: %w", err)
-			}
-		}
-		if edge.Node.RepairDate.End != "" {
-			end, err = time.Parse(time.RFC3339Nano, edge.Node.RepairDate.End)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing time: %w", err)
-			}
-		}
-
+	for _, edge := range getWorkOrdersResp.WorkOrders.Edges {
 		orders = append(orders, WorkOrderAPI{
 			ID:              edge.Node.ID,
 			Number:          edge.Node.Number,
 			Label:           edge.Node.Label,
-			RepairDateStart: start,
-			RepairDateEnd:   end,
-			Supplier: SupplierAPI{
-				ID:        edge.Node.Supplier.ID,
-				Name:      edge.Node.Supplier.Name,
-				FirstName: edge.Node.Supplier.FirstName,
-				Activity:  edge.Node.Supplier.Activity,
-			},
+			RepairDateStart: edge.Node.RepairDate.Start.Time,
+			RepairDateEnd:   edge.Node.RepairDate.End.Time,
+			Supplier:        edge.Node.Supplier.toAPI(),
 		})
 	}
 
 	return orders, nil
 }
 
+// EnableDebugCurlLogs makes the client log every request as a curl command when
+// --debug is on. The wrapping is free when --debug is off: the request is only
+// cloned (which means re-reading the body) when the log is actually emitted.
 func EnableDebugCurlLogs(client *http.Client) {
-	if client.Transport == nil {
-		client.Transport = http.DefaultTransport
-	}
-	client.Transport = transportCurlLogs{trWrapped: client.Transport}
+	client.Transport = withDebugCurlLogs(client.Transport)
 }
 
-// Only used when --debug is passed.
+func withDebugCurlLogs(rt http.RoundTripper) http.RoundTripper {
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	if _, alreadyWrapped := rt.(transportCurlLogs); alreadyWrapped {
+		return rt
+	}
+	return transportCurlLogs{trWrapped: rt}
+}
+
+// Only does something when --debug is passed.
 type transportCurlLogs struct {
 	trWrapped http.RoundTripper
 }
 
 func (tr transportCurlLogs) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !logutil.EnableDebug {
+		return tr.trWrapped.RoundTrip(r)
+	}
+
 	// Clone request to redact sensitive headers from debug logs.
 	r2 := r.Clone(r.Context())
 	if r.GetBody != nil {
@@ -655,6 +707,47 @@ func (tr transportCurlLogs) RoundTrip(r *http.Request) (*http.Response, error) {
 	return tr.trWrapped.RoundTrip(r)
 }
 
+// GraphQLError is one entry of the `errors` array of a GraphQL response.
+type GraphQLError struct {
+	Message   string `json:"message"`
+	Locations []struct {
+		Line   int `json:"line"`
+		Column int `json:"column"`
+	} `json:"locations"`
+	Path       []any          `json:"path"`
+	Extensions map[string]any `json:"extensions"`
+}
+
+// GraphQLErrors is returned by DoGraphQL when the server answered with a
+// non-empty `errors` array. Note that GraphQL reports errors with a 200 status
+// code, so this can (and usually does) happen on a 200.
+type GraphQLErrors struct {
+	StatusCode int
+	Errors     []GraphQLError
+}
+
+func (e *GraphQLErrors) Error() string {
+	msgs := make([]string, 0, len(e.Errors))
+	for _, err := range e.Errors {
+		msgs = append(msgs, err.Message)
+	}
+	return fmt.Sprintf("graphql error (status %d): %s", e.StatusCode, strings.Join(msgs, "; "))
+}
+
+// maxBodySize is a crude protection against a server that would answer with a
+// body large enough to make us run out of memory.
+const maxBodySize = 64 << 20 // 64 MiB.
+
+// firstBackoff is how long Do waits before the first retry; it doubles at every
+// attempt after that. It is a var only so that the tests don't have to wait.
+var firstBackoff = time.Second
+
+// DoGraphQL runs the given query and unmarshals the `data` field of the answer
+// into `resp`, which must be a pointer (it may be nil if you don't care about
+// the answer). A non-empty `errors` field is reported as a *GraphQLErrors, even
+// when the status code is 200 -- that is the normal way for a GraphQL server to
+// report an error, and ignoring it means silently decoding zero values.
+//
 // At first, I coded this using ShurcooL/graphql. I stopped using it for three
 // reasons: (1) I found it painful to have to guess the types of anything that
 // is not a graphql.String, graphql.Int. (2) In the same vein, I wasted a few
@@ -665,16 +758,7 @@ func (tr transportCurlLogs) RoundTrip(r *http.Request) (*http.Response, error) {
 // reason is that the GraphQL library I was using had mismatched types... A
 // variable was expected to be "[SortByType!]" but the variable had to be a
 // SortByType... and this was impossible to work around in ShurcooL/graphql.
-//
-// The reason (3) isn't related to ShurcooL/graphql, but (1) and (2) is... This
-// library seems to be the mostly used one, which says a lot about GraphQL's
-// maturity!
-func DoGraphQL[T any](client *http.Client, url, query string, variables map[string]any, resp T) error {
-	// Minify the query.
-	query = strings.ReplaceAll(query, "\n", " ")
-	query = strings.ReplaceAll(query, "\t", " ")
-	query = regexp.MustCompile(`\s+`).ReplaceAllString(query, " ")
-
+func DoGraphQL(ctx context.Context, client *http.Client, url, query string, variables map[string]any, resp any) error {
 	req := struct {
 		Query     string         `json:"query"`
 		Variables map[string]any `json:"variables"`
@@ -686,50 +770,130 @@ func DoGraphQL[T any](client *http.Client, url, query string, variables map[stri
 	if err != nil {
 		return fmt.Errorf("error marshaling request body: %w", err)
 	}
-	httpResp, err := Do(client, http.MethodPost, url, reqBody)
+	httpResp, err := Do(ctx, client, http.MethodPost, url, reqBody)
 	if err != nil {
 		return fmt.Errorf("error while querying: %w", err)
 	}
 	defer httpResp.Body.Close()
 
-	// It would be more efficient to parse the JSON blob straigt from the
-	// io.Reader (would use less memory), but I don't care. If the body
-	// can't be parsed as JSON, I want to see a dump of it. I should set a
-	// limit to the size of the body though to prevent DoS attacks, but I
-	// don't care about that right now.
-	body, err := io.ReadAll(httpResp.Body)
+	// It would be more efficient to parse the JSON blob straight from the
+	// io.Reader (would use less memory), but I don't care. If the body can't be
+	// parsed as JSON, I want to see a dump of it.
+	body, err := io.ReadAll(io.LimitReader(httpResp.Body, maxBodySize))
 	if err != nil {
 		return fmt.Errorf("status code %d, error while reading body: %w", httpResp.StatusCode, err)
 	}
 
-	if httpResp.StatusCode == 400 {
-		var graphQLResp struct {
-			Errors []struct {
-				Message   string `json:"message"`
-				Locations []struct {
-					Line   int `json:"line"`
-					Column int `json:"column"`
-				} `json:"locations"`
-			} `json:"errors"`
-		}
-		errUnmarsh := json.Unmarshal(body, &graphQLResp)
-		if errUnmarsh != nil {
-			// Fall back to showing the raw body.
-			return fmt.Errorf("status code was 400, but body isn't a standard graphql JSON error, body: %v", string(body))
-		}
-		bytes, _ := json.MarshalIndent(graphQLResp, "", "  ")
-		return fmt.Errorf("status code 400: %s", string(bytes))
+	var envelope struct {
+		Data   json.RawMessage `json:"data"`
+		Errors []GraphQLError  `json:"errors"`
 	}
-	if httpResp.StatusCode != 200 {
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		if httpResp.StatusCode != http.StatusOK {
+			return fmt.Errorf("unexpected status code %d, body: %s", httpResp.StatusCode, string(body))
+		}
+		return fmt.Errorf("status code was 200, but the body isn't a GraphQL answer: %s\nbody: %s", err, string(body))
+	}
+
+	if len(envelope.Errors) > 0 {
+		return &GraphQLErrors{StatusCode: httpResp.StatusCode, Errors: envelope.Errors}
+	}
+	if httpResp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status code %d, body: %s", httpResp.StatusCode, string(body))
 	}
-
-	err = json.Unmarshal(body, &resp)
-	if err != nil {
-		return fmt.Errorf("status code was 200 but body could not be parsed as %T: %s\nbody: %s", resp, err, string(body))
+	if resp == nil || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+		return nil
 	}
 
+	if err := json.Unmarshal(envelope.Data, resp); err != nil {
+		return fmt.Errorf("status code was 200 but the 'data' field could not be parsed as %T: %s\nbody: %s", resp, err, string(body))
+	}
 	return nil
+}
+
+// I found that after many calls, the server starts returning:
+//
+//	HTTP/2.0 403
+//	x-amzn-errortype: ForbiddenException
+//
+//	{"message":"Forbidden"}
+//
+// Also, in some instances, it returns an error with `peer closed connection`.
+//
+// Do wraps client.Do and retries the transient failures with an exponential
+// backoff that stops as soon as the context is cancelled. Note that a 403 is
+// NOT treated as rate limiting anymore: an expired or revoked token also
+// answers 403, and retrying that for minutes only delays the error. It is
+// retried once, in case it really was a hiccup, and that's it.
+func Do(ctx context.Context, client *http.Client, method string, url string, body []byte) (*http.Response, error) {
+	const maxAttempts = 4
+
+	backoff := firstBackoff
+	forbiddenRetries := 1
+
+	for attempt := 1; ; attempt++ {
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, url, reader)
+		if err != nil {
+			return nil, fmt.Errorf("while creating request: %w", err)
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, err := client.Do(req)
+
+		var reason string
+		switch {
+		case err != nil && ctx.Err() != nil:
+			// Don't retry when we are the ones giving up.
+			return nil, fmt.Errorf("while doing request: %w", err)
+		case errors.Is(err, syscall.ECONNRESET), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+			// `resp` is nil when `err` is non-nil: closing resp.Body here used
+			// to panic the whole process on every connection reset.
+			reason = fmt.Sprintf("connection reset (%v)", err)
+		case err != nil:
+			return nil, fmt.Errorf("while doing request: %w", err)
+		case resp.StatusCode == http.StatusTooManyRequests,
+			resp.StatusCode == http.StatusBadGateway,
+			resp.StatusCode == http.StatusServiceUnavailable,
+			resp.StatusCode == http.StatusGatewayTimeout:
+			reason = fmt.Sprintf("status code %d", resp.StatusCode)
+			resp.Body.Close()
+		case resp.StatusCode == http.StatusForbidden && forbiddenRetries > 0:
+			forbiddenRetries--
+			reason = "status code 403"
+			resp.Body.Close()
+		default:
+			return resp, nil
+		}
+
+		if attempt >= maxAttempts {
+			return nil, fmt.Errorf("giving up after %d attempts, last failure: %s", attempt, reason)
+		}
+		logutil.Infof("%s, retrying in %s (attempt %d/%d)", reason, backoff, attempt, maxAttempts)
+		if err := sleepCtx(ctx, backoff); err != nil {
+			return nil, fmt.Errorf("while waiting to retry after %s: %w", reason, err)
+		}
+		backoff *= 2
+	}
+}
+
+// sleepCtx waits for `d`, or until the context is cancelled, whichever comes
+// first. Contrary to time.Sleep, a cancelled context doesn't have to wait for
+// the whole duration to elapse.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 type SupplierAPI struct {
@@ -758,7 +922,7 @@ type DocumentAPI struct {
 	CreatedAt        time.Time   // Example: "2023-03-09T22:00:00.000Z"
 }
 
-func GetCouncilMissionSuppliersAPI(client *http.Client, graphqlURL, accountUUID string) ([]SupplierContractAPI, error) {
+func GetCouncilMissionSuppliersAPI(ctx context.Context, client *http.Client, graphqlURL, accountUUID string) ([]SupplierContractAPI, error) {
 	const getSuppliersQuery = `
 		query getCouncilMissionSuppliers(
 		  $accountUuid: EncodedID!
@@ -811,97 +975,68 @@ func GetCouncilMissionSuppliersAPI(client *http.Client, graphqlURL, accountUUID 
 		    }
 		  }
 		}`
-	var getCouncilMissionSuppliers struct {
-		Data struct {
+
+	var contracts []SupplierContractAPI
+	_, err := paginate(ctx, "", func(ctx context.Context, after *string) (pageInfo, error) {
+		var resp struct {
 			CoownerAccount struct {
 				UUID           string `json:"uuid"`
 				TrusteeCouncil struct {
 					SupplierContracts struct {
-						PageInfo struct {
-							EndCursor   string `json:"endCursor"`
-							HasNextPage bool   `json:"hasNextPage"`
-						} `json:"pageInfo"`
-						Edges []struct {
+						PageInfo pageInfo `json:"pageInfo"`
+						Edges    []struct {
 							Node struct {
-								ID          string `json:"id"`
-								Label       string `json:"label"`
-								Description string `json:"description"`
-								Number      string `json:"number"`
-								EndingDate  string `json:"endingDate"`
-								Supplier    struct {
-									ID        string `json:"id"`
-									Name      string `json:"name"`
-									FirstName string `json:"firstName"`
-									Activity  string `json:"activity"`
-								} `json:"supplier"`
-								Documents []struct {
-									ID               string `json:"id"`
-									HashFile         string `json:"hashFile"`
-									MimeType         string `json:"mimeType"`
-									OriginalFilename string `json:"originalFilename"`
-									Category         string `json:"category"`
-									CreatedAt        string `json:"createdAt"`
-								} `json:"documents"`
+								ID          string         `json:"id"`
+								Label       string         `json:"label"`
+								Description string         `json:"description"`
+								Number      string         `json:"number"`
+								EndingDate  Time           `json:"endingDate"`
+								Supplier    supplierNode   `json:"supplier"`
+								Documents   []documentNode `json:"documents"`
 							} `json:"node"`
 						} `json:"edges"`
 					} `json:"supplierContracts"`
 				} `json:"trusteeCouncil"`
 			} `json:"coownerAccount"`
-		} `json:"data"`
-	}
-
-	err := DoGraphQL(client, graphqlURL, getSuppliersQuery, map[string]any{
-		"accountUuid":      accountUUID,
-		"description":      "",
-		"supplierFullname": "",
-		"first":            100,
-	}, &getCouncilMissionSuppliers)
-	if err != nil {
-		return nil, fmt.Errorf("error while querying getCouncilMissionSuppliers: %w", err)
-	}
-
-	var contracts []SupplierContractAPI
-	for _, edge := range getCouncilMissionSuppliers.Data.CoownerAccount.TrusteeCouncil.SupplierContracts.Edges {
-		var endingDate time.Time
-		if edge.Node.EndingDate != "" {
-			endingDate, err = time.Parse(time.RFC3339Nano, edge.Node.EndingDate)
-			if err != nil {
-				logutil.Errorf("error parsing time: %v", err)
-				continue
-			}
 		}
 
-		var docs []DocumentAPI
-		for _, doc := range edge.Node.Documents {
-			createdAt, err := time.Parse(time.RFC3339Nano, doc.CreatedAt)
-			if err != nil {
-				logutil.Errorf("error parsing time: %v", err)
-				continue
+		err := DoGraphQL(ctx, client, graphqlURL, getSuppliersQuery, map[string]any{
+			"accountUuid":      accountUUID,
+			"description":      "",
+			"supplierFullname": "",
+			"first":            perPage,
+			"after":            after,
+		}, &resp)
+		if err != nil {
+			return pageInfo{}, fmt.Errorf("error while querying getCouncilMissionSuppliers: %w", err)
+		}
+
+		for _, edge := range resp.CoownerAccount.TrusteeCouncil.SupplierContracts.Edges {
+			var docs []DocumentAPI
+			for _, doc := range edge.Node.Documents {
+				docs = append(docs, DocumentAPI{
+					ID:               doc.ID,
+					HashFile:         db.HashFile(doc.HashFile),
+					OriginalFilename: doc.OriginalFilename,
+					MimeType:         doc.MimeType,
+					Category:         doc.Category,
+					CreatedAt:        doc.CreatedAt.Time,
+				})
 			}
-			docs = append(docs, DocumentAPI{
-				ID:               doc.ID,
-				HashFile:         db.HashFile(doc.HashFile),
-				OriginalFilename: doc.OriginalFilename,
-				MimeType:         doc.MimeType,
-				Category:         doc.Category,
-				CreatedAt:        createdAt,
+			contracts = append(contracts, SupplierContractAPI{
+				ID:          edge.Node.ID,
+				Label:       edge.Node.Label,
+				Description: edge.Node.Description,
+				Number:      edge.Node.Number,
+				EndingDate:  edge.Node.EndingDate.Time,
+				Supplier:    edge.Node.Supplier.toAPI(),
+				Documents:   docs,
 			})
 		}
-
-		contracts = append(contracts, SupplierContractAPI{
-			ID:          edge.Node.ID,
-			Label:       edge.Node.Label,
-			Description: edge.Node.Description,
-			Number:      edge.Node.Number,
-			EndingDate:  endingDate,
-			Supplier: SupplierAPI{
-				ID:        edge.Node.Supplier.ID,
-				Name:      edge.Node.Supplier.Name,
-				FirstName: edge.Node.Supplier.FirstName,
-				Activity:  edge.Node.Supplier.Activity,
-			},
-			Documents: docs,
-		})
+		return resp.CoownerAccount.TrusteeCouncil.SupplierContracts.PageInfo, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return contracts, nil
 }
@@ -929,66 +1064,62 @@ var ErrEmptyURL = fmt.Errorf("empty URL")
 // will return an empty URL. To know if the URL returned was empty:
 //
 //	errors.Is(err, api.ErrEmptyURL)
-func GetInvoiceURL(client *http.Client, graphqlURL, invoiceID string) (filename, fileURL string, _ error) {
+func GetInvoiceURL(ctx context.Context, client *http.Client, graphqlURL, invoiceID string) (filename, fileURL string, _ error) {
 	const getInvoiceURLQuery = `query getInvoiceURL($invoiceId: String!) {invoiceURL(invoiceId: $invoiceId)}`
 	var getInvoiceURLResp struct {
-		Data struct {
-			InvoiceURL string `json:"invoiceURL"`
-		} `json:"data"`
+		InvoiceURL string `json:"invoiceURL"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getInvoiceURLQuery, map[string]any{
+	err := DoGraphQL(ctx, client, graphqlURL, getInvoiceURLQuery, map[string]any{
 		"invoiceId": invoiceID,
 	}, &getInvoiceURLResp)
 	if err != nil {
 		return "", "", fmt.Errorf("while querying getInvoiceURLResp: %w", err)
 	}
 
-	if getInvoiceURLResp.Data.InvoiceURL == "" {
+	if getInvoiceURLResp.InvoiceURL == "" {
 		return "", "", fmt.Errorf("getInvoiceURL: %w", ErrEmptyURL)
 	}
 
-	filename, err = getFilenameFromURL(getInvoiceURLResp.Data.InvoiceURL)
+	filename, err = getFilenameFromURL(getInvoiceURLResp.InvoiceURL)
 	if err != nil {
-		return "", "", fmt.Errorf("while getting filename from %s: %w", getInvoiceURLResp.Data.InvoiceURL, err)
+		return "", "", fmt.Errorf("while getting filename from %s: %w", getInvoiceURLResp.InvoiceURL, err)
 	}
 
-	return filename, getInvoiceURLResp.Data.InvoiceURL, nil
+	return filename, getInvoiceURLResp.InvoiceURL, nil
 }
 
 // To know if the URL returned was empty:
 //
 //	errors.Is(err, api.ErrEmptyURL)
-func GetDocumentURL(client *http.Client, graphqlURL string, hash db.HashFile) (filename, fileURL string, _ error) {
+func GetDocumentURL(ctx context.Context, client *http.Client, graphqlURL string, hash db.HashFile) (filename, fileURL string, _ error) {
 	const getDocumentURLQuery = `query getDocumentURL($hash: String!) {documentURL(hash: $hash)}`
 	var getDocumentURLResp struct {
-		Data struct {
-			DocumentURL string `json:"documentURL"`
-		} `json:"data"`
+		DocumentURL string `json:"documentURL"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getDocumentURLQuery, map[string]any{
+	err := DoGraphQL(ctx, client, graphqlURL, getDocumentURLQuery, map[string]any{
 		"hash": hash,
 	}, &getDocumentURLResp)
 	if err != nil {
 		return "", "", fmt.Errorf("error while querying getDocumentURL: %w", err)
 	}
 
-	if getDocumentURLResp.Data.DocumentURL == "" {
+	if getDocumentURLResp.DocumentURL == "" {
 		return "", "", fmt.Errorf("getDocumentURL: %w", ErrEmptyURL)
 	}
 
-	filename, err = getFilenameFromURL(getDocumentURLResp.Data.DocumentURL)
+	filename, err = getFilenameFromURL(getDocumentURLResp.DocumentURL)
 	if err != nil {
 		return "", "", fmt.Errorf("error getting filename from URL: %w", err)
 	}
-	return filename, getDocumentURLResp.Data.DocumentURL, nil
+	return filename, getDocumentURLResp.DocumentURL, nil
 }
 
 // The URLs are short-lived and look like this:
-// https://fon-mil-prod-plato-prv.s3.eu-west-3.amazonaws.com/e/6/6/6/2/674836bfb753160398ee6662?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=ASIAXMTESETVHY3LHMDR%2F20250129%2Feu-west-3%2Fs3%2Faws4_request&X-Amz-Date=20250129T171628Z&X-Amz-Expires=900&X-Amz-Security-Token=IQoJb3JpZ2luX2VjEIf%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaCWV1LXdlc3QtMyJHMEUCIQDj8iWPBGZspCL2CUSMniDTOhPCKTr8o17mjxtWdO00UwIgL4D1u5DtZfYCKCEpUX78c0b4SDYeR2VddKGkGdcNdpIqgAQIkP%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FARACGgw1MDgwOTA3ODcwNTAiDN51Bas9kmYPyShHAyrUA7wx2z79PWterZcfjBNa1kQmpd1SESDoHBUV05Bv%2FW2HIiGMDBVv1l1B4Xa4hH3ixDokqYjttUqbOde3oJLgKzhdSRx8AKWtNLxGFGRKg49bEi6TC2SjuOFCd51ZGOcLxRY1EnyP9jr9CaDsDk%2FJDurkEdInf8ASH56pXwpaz4BhCSn7PKexefL7YNfNmYFl0u9LAXR24%2FOCngnLP%2Fug0klrN3qttY50MxiLvKN1nnjwpBIr%2FMeGexwf0btY4LWgh6ipWURmdsCHyMQtfkn%2B7sAhQ3ujUXmcrRrTcffaqDckJEkfC2Od7y4CnTNWrHdgWrkR2ksD8pfjIrL4Iv2Ct8IhKaGmlG0sbiP5YprFHmLA1nkr87buei8EOkTfSiuZu%2FKGaWcYHOzdGQitRBeT4MZkNd4uOL%2F6V62ncHHP8MoD%2BXIBcQkL7W1cUkMXrkyHT6VaDGiEXLJ1J7Y194wE0uJq6XTfGtJc2SEzMDm4wN2TvSBUAjBo1RAmEDzMSV6evXNCv2oATxufxKDQ0HLJ0Dq6IWsm0pbMwc2n1pjdx9aHFpFd9U%2BJHwjruKQfpTbY2LYxc2LhkhHlW0xH2UzXWxO94eU%2BVIZLFiy2yuEUBVggIgTVCDDXhum8BjqlAdxyOC29dGCIo%2F3dk1vvqbzAppsm4mKv0TjM45BOiReDsu%2FPpEpLd1klWv7iWuW%2BG8uqQr0Gilfbt6y%2F6I5eOzYlm%2BfmYWCOPxVFAaR1iosjwpmpOKmDxow6O4CvntbXC1TgE8gUb3WLI45xq1A2kYMD9PjgoiZj01hia1qwh47bptY8%2BOnkCfF1UByAm2nis9fd5P75QLRVj%2B8DLqKbahlQ0O7jsA%3D%3D&X-Amz-Signature=7c1094dee2ee4812de265c48533846f9a353a4be234180ed47b0d772c91dcbd6&X-Amz-SignedHeaders=host&response-content-disposition=filename%3D%22IZQUIERDO%2520-%2520OSMIL806596688%2520-%25202024-11-28%2520-%252025-074.pdf%22&x-id=GetObject
+// https://fon-mil-prod-plato-prv.s3.eu-west-3.amazonaws.com/e/6/6/6/2/674836bfb753160398ee6662?X-Amz-Algorithm=AWS4-HMAC-SHA256&...&response-content-disposition=filename%3D%22IZQUIERDO%2520-%2520OSMIL806596688%2520-%25202024-11-28%2520-%252025-074.pdf%22&x-id=GetObject
 //
-// The file path is deduced from from one of the URL's query parameters:
+// The file path is deduced from one of the URL's query parameters:
 //
 //	response-content-disposition=filename%3D%22IZQUIERDO%2520-%2520OSMIL806596688%2520-%25202024-11-28%2520-%252025-074.pdf%22
 func getFilenameFromURL(fileURL string) (string, error) {
@@ -1042,7 +1173,7 @@ func getFilenameFromURL(fileURL string) (string, error) {
 }
 
 // This query is light and doesn't need to be paginated.
-func GetBuildingAccountingCurrent(client *http.Client, graphqlURL, accountUUID string) ([]ExpenseDocumentAPI, error) {
+func GetBuildingAccountingCurrent(ctx context.Context, client *http.Client, graphqlURL, accountUUID string) ([]ExpenseDocumentAPI, error) {
 	const getBuildingAccountingCurrentQuery = `
 		query getBuildingAccountingCurrent($uuid: EncodedID!) {
 		  coownerAccount(uuid: $uuid) {
@@ -1104,103 +1235,60 @@ func GetBuildingAccountingCurrent(client *http.Client, graphqlURL, accountUUID s
 		  }
 		}`
 	var getBuildingAccountingCurrentResp struct {
-		Data struct {
-			CoownerAccount struct {
-				TrusteeCouncil struct {
-					BankBalance struct {
-						Value    int    `json:"value"`
-						Currency string `json:"currency"`
-					} `json:"bankBalance"`
-					AccountingCurrent struct {
-						ID            string `json:"id"`
-						OpeningDate   string `json:"openingDate"`
-						ClosingDate   string `json:"closingDate"`
-						PreviousTotal struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"previousTotal"`
-						VotedTotal struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"votedTotal"`
-						Total struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"total"`
-						NextVotedTotal struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"nextVotedTotal"`
-						Allocations []struct {
-							ID            string `json:"id"`
-							Name          string `json:"name"`
-							Code          string `json:"code"`
-							PreviousTotal struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"previousTotal"`
-							VotedTotal struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"votedTotal"`
-							Total struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"total"`
-							NextVotedTotal struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"nextVotedTotal"`
-							ExpenseTypes []struct {
-								AllocationID  string `json:"allocationId"`
-								Name          string `json:"name"`
-								Code          string `json:"code"`
-								PreviousTotal struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"previousTotal"`
-								VotedTotal struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"votedTotal"`
-								Total struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"total"`
-								NextVotedTotal struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"nextVotedTotal"`
-								Expenses []struct {
-									// For some reason, expenses don't have an
-									// ID. The invoice ID is sometimes empty...
-									// but we use that since we have no other
-									// way.
-									InvoiceID string `json:"invoiceId"`
-									Piece     struct {
-										ID       string `json:"id"`
-										HashFile string `json:"hashFile"`
-										Category string `json:"category"`
-									} `json:"piece"`
-									Label string `json:"label"`
-									Date  string `json:"date"`
-									// This is a union type, "Debit" or "Credit".
-									Amount struct {
-										Value    int    `json:"value"`
-										Currency string `json:"currency"`
-										Typename string `json:"__typename"`
-									} `json:"amount"`
-									IsFromPreviousPeriod bool `json:"isFromPreviousPeriod"`
-								} `json:"expenses"`
-							} `json:"expenseTypes"`
-						} `json:"allocations"`
-					} `json:"accountingCurrent"`
-				} `json:"trusteeCouncil"`
-			} `json:"coownerAccount"`
-		} `json:"data"`
+		CoownerAccount struct {
+			TrusteeCouncil struct {
+				BankBalance       amount `json:"bankBalance"`
+				AccountingCurrent struct {
+					ID             string `json:"id"`
+					OpeningDate    Time   `json:"openingDate"`
+					ClosingDate    Time   `json:"closingDate"`
+					PreviousTotal  amount `json:"previousTotal"`
+					VotedTotal     amount `json:"votedTotal"`
+					Total          amount `json:"total"`
+					NextVotedTotal amount `json:"nextVotedTotal"`
+					Allocations    []struct {
+						ID             string `json:"id"`
+						Name           string `json:"name"`
+						Code           string `json:"code"`
+						PreviousTotal  amount `json:"previousTotal"`
+						VotedTotal     amount `json:"votedTotal"`
+						Total          amount `json:"total"`
+						NextVotedTotal amount `json:"nextVotedTotal"`
+						ExpenseTypes   []struct {
+							AllocationID   string `json:"allocationId"`
+							Name           string `json:"name"`
+							Code           string `json:"code"`
+							PreviousTotal  amount `json:"previousTotal"`
+							VotedTotal     amount `json:"votedTotal"`
+							Total          amount `json:"total"`
+							NextVotedTotal amount `json:"nextVotedTotal"`
+							Expenses       []struct {
+								// For some reason, expenses don't have an ID.
+								// The invoice ID is sometimes empty... but we
+								// use that since we have no other way.
+								InvoiceID string `json:"invoiceId"`
+								Piece     struct {
+									ID       string `json:"id"`
+									HashFile string `json:"hashFile"`
+									Category string `json:"category"`
+								} `json:"piece"`
+								Label string `json:"label"`
+								Date  Time   `json:"date"`
+								// This is a union type, "Debit" or "Credit".
+								Amount struct {
+									amount
+									Typename string `json:"__typename"`
+								} `json:"amount"`
+								IsFromPreviousPeriod bool `json:"isFromPreviousPeriod"`
+							} `json:"expenses"`
+						} `json:"expenseTypes"`
+					} `json:"allocations"`
+				} `json:"accountingCurrent"`
+			} `json:"trusteeCouncil"`
+		} `json:"coownerAccount"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getBuildingAccountingCurrentQuery, map[string]any{
+	err := DoGraphQL(ctx, client, graphqlURL, getBuildingAccountingCurrentQuery, map[string]any{
 		"uuid": accountUUID,
 	}, &getBuildingAccountingCurrentResp)
 	if err != nil {
@@ -1208,32 +1296,24 @@ func GetBuildingAccountingCurrent(client *http.Client, graphqlURL, accountUUID s
 	}
 
 	var expenses []ExpenseDocumentAPI
-	for _, allocation := range getBuildingAccountingCurrentResp.Data.CoownerAccount.TrusteeCouncil.AccountingCurrent.Allocations {
+	for _, allocation := range getBuildingAccountingCurrentResp.CoownerAccount.TrusteeCouncil.AccountingCurrent.Allocations {
 		for _, expenseType := range allocation.ExpenseTypes {
 			for _, expense := range expenseType.Expenses {
-				var amount int
+				var value int
 				switch expense.Amount.Typename {
 				case "Credit":
-					amount = -expense.Amount.Value
+					value = -expense.Amount.Value
 				case "Debit":
-					amount = expense.Amount.Value
+					value = expense.Amount.Value
 				default:
 					return nil, fmt.Errorf("was expecting typename 'Credit' or 'Debit', but got %q for expense %+v", expense.Amount.Typename, expense)
-				}
-				var date time.Time
-				if expense.Date != "" {
-					var err error
-					date, err = time.Parse(time.RFC3339Nano, expense.Date)
-					if err != nil {
-						return nil, fmt.Errorf("error parsing time: %w", err)
-					}
 				}
 				expenses = append(expenses, ExpenseDocumentAPI{
 					HashFile:              db.HashFile(expense.Piece.HashFile),
 					InvoiceID:             expense.InvoiceID,
 					Label:                 expense.Label,
-					Date:                  date,
-					Amount:                db.Amount(amount),
+					Date:                  expense.Date.Time,
+					Amount:                db.Amount(value),
 					AccountingAllocation:  allocation.Name,
 					AccountingExpenseType: expenseType.Name,
 				})
@@ -1254,7 +1334,7 @@ type AccountingPeriodAPI struct {
 
 // This query is light and doesn't need to be paginated. No need to remember the
 // last cursor.
-func GetAccountingPeriods(client *http.Client, graphqlURL, accountUUID string) ([]AccountingPeriodAPI, error) {
+func GetAccountingPeriods(ctx context.Context, client *http.Client, graphqlURL, accountUUID string) ([]AccountingPeriodAPI, error) {
 	const getAccountingPeriodsQuery = `
 		query getAccountingPeriods($accountUuid: EncodedID!, $sortBy: [SortByType!], $status: [AccountingPeriodStatusEnum!], $closingDateTo: String, $first: Int, $before: Cursor, $after: Cursor) {
 		  coownerAccount(uuid: $accountUuid) {
@@ -1289,33 +1369,26 @@ func GetAccountingPeriods(client *http.Client, graphqlURL, accountUUID string) (
 		  }
 		}`
 	var getAccountingPeriodsResp struct {
-		Data struct {
-			CoownerAccount struct {
-				TrusteeCouncil struct {
-					AccountingPeriods struct {
-						TotalCount int `json:"totalCount"`
-						PageInfo   struct {
-							StartCursor     string `json:"startCursor"`
-							EndCursor       string `json:"endCursor"`
-							HasPreviousPage bool   `json:"hasPreviousPage"`
-							HasNextPage     bool   `json:"hasNextPage"`
-						} `json:"pageInfo"`
-						Edges []struct {
-							Node struct {
-								ID          string `json:"id"`
-								Name        string `json:"name"`
-								OpeningDate string `json:"openingDate"`
-								ClosingDate string `json:"closingDate"`
-								Status      string `json:"status"`
-							} `json:"node"`
-						} `json:"edges"`
-					} `json:"accountingPeriods"`
-				} `json:"trusteeCouncil"`
-			} `json:"coownerAccount"`
-		} `json:"data"`
+		CoownerAccount struct {
+			TrusteeCouncil struct {
+				AccountingPeriods struct {
+					TotalCount int      `json:"totalCount"`
+					PageInfo   pageInfo `json:"pageInfo"`
+					Edges      []struct {
+						Node struct {
+							ID          string `json:"id"`
+							Name        string `json:"name"`
+							OpeningDate Time   `json:"openingDate"`
+							ClosingDate Time   `json:"closingDate"`
+							Status      string `json:"status"`
+						} `json:"node"`
+					} `json:"edges"`
+				} `json:"accountingPeriods"`
+			} `json:"trusteeCouncil"`
+		} `json:"coownerAccount"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getAccountingPeriodsQuery, map[string]any{
+	err := DoGraphQL(ctx, client, graphqlURL, getAccountingPeriodsQuery, map[string]any{
 		"accountUuid": accountUUID,
 	}, &getAccountingPeriodsResp)
 	if err != nil {
@@ -1323,27 +1396,12 @@ func GetAccountingPeriods(client *http.Client, graphqlURL, accountUUID string) (
 	}
 
 	var periods []AccountingPeriodAPI
-	for _, edge := range getAccountingPeriodsResp.Data.CoownerAccount.TrusteeCouncil.AccountingPeriods.Edges {
-		var openingDate, closingDate time.Time
-		if edge.Node.OpeningDate != "" {
-			var err error
-			openingDate, err = time.Parse(time.RFC3339Nano, edge.Node.OpeningDate)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing time: %w", err)
-			}
-		}
-		if edge.Node.ClosingDate != "" {
-			var err error
-			closingDate, err = time.Parse(time.RFC3339Nano, edge.Node.ClosingDate)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing time: %w", err)
-			}
-		}
+	for _, edge := range getAccountingPeriodsResp.CoownerAccount.TrusteeCouncil.AccountingPeriods.Edges {
 		periods = append(periods, AccountingPeriodAPI{
 			ID:          edge.Node.ID,
 			Name:        edge.Node.Name,
-			OpeningDate: openingDate,
-			ClosingDate: closingDate,
+			OpeningDate: edge.Node.OpeningDate.Time,
+			ClosingDate: edge.Node.ClosingDate.Time,
 			Status:      edge.Node.Status,
 		})
 	}
@@ -1352,58 +1410,31 @@ func GetAccountingPeriods(client *http.Client, graphqlURL, accountUUID string) (
 
 // This query is light and doesn't need to be paginated. No need to remember the
 // last cursor.
-func GetBuildingAccountingRGDD(client *http.Client, graphqlURL, accountUUID, accountingPeriodID string) ([]ExpenseDocumentAPI, error) {
+func GetBuildingAccountingRGDD(ctx context.Context, client *http.Client, graphqlURL, accountUUID, accountingPeriodID string) ([]ExpenseDocumentAPI, error) {
 	const getBuildingAccountingRGDDQuery = `
 		query getBuildingAccountingRGDD($uuid: EncodedID!, $accountingPeriodId: String) {
 		  coownerAccount(uuid: $uuid) {
 		    uuid
 		    trusteeCouncil {
 		      pastAccountingRGDD(accountingPeriodId: $accountingPeriodId) {
-		        totalToAllocate {
-		          value
-		          currency
-		        }
-		        totalVat {
-		          value
-		          currency
-		        }
-		        totalRecoverable {
-		          value
-		          currency
-		        }
+		        totalToAllocate {value currency}
+		        totalVat {value currency}
+		        totalRecoverable {value currency}
 		        allocations {
 		          id
 		          name
 		          code
-		          toAllocate {
-		            value
-		            currency
-		          }
-		          vat {
-		            value
-		            currency
-		          }
-		          recoverable {
-		            value
-		            currency
-		          }
+		          toAllocate {value currency}
+		          vat {value currency}
+		          recoverable {value currency}
 		          expenseTypes {
 		            id
 		            allocationId
 		            name
 		            code
-		            toAllocate {
-		              value
-		              currency
-		            }
-		            vat {
-		              value
-		              currency
-		            }
-		            recoverable {
-		              value
-		              currency
-		            }
+		            toAllocate {value currency}
+		            vat {value currency}
+		            recoverable {value currency}
 		            expenses {
 					  id
 					  invoiceId
@@ -1414,18 +1445,9 @@ func GetBuildingAccountingRGDD(client *http.Client, graphqlURL, accountUUID, acc
 		                category
 		                id
 		              }
-		              toAllocate {
-		                value
-		                currency
-		              }
-		              vat {
-		                value
-		                currency
-		              }
-		              recoverable {
-		                value
-		                currency
-		              }
+		              toAllocate {value currency}
+		              vat {value currency}
+		              recoverable {value currency}
 		            }
 		          }
 		        }
@@ -1434,111 +1456,64 @@ func GetBuildingAccountingRGDD(client *http.Client, graphqlURL, accountUUID, acc
 		  }
 		}`
 	var getBuildingAccountingRGDDResp struct {
-		Data struct {
-			CoownerAccount struct {
-				TrusteeCouncil struct {
-					PastAccountingRGDD struct {
-						TotalToAllocate struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"totalToAllocate"`
-						TotalVat struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"totalVat"`
-						TotalRecoverable struct {
-							Value    int    `json:"value"`
-							Currency string `json:"currency"`
-						} `json:"totalRecoverable"`
-						Allocations []struct {
-							ID         string `json:"id"`
-							Name       string `json:"name"`
-							Code       string
-							ToAllocate struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"toAllocate"`
-							Vat struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"vat"`
-							Recoverable struct {
-								Value    int    `json:"value"`
-								Currency string `json:"currency"`
-							} `json:"recoverable"`
-							ExpenseTypes []struct {
-								ID           string `json:"id"`
-								AllocationID string `json:"allocationId"`
-								Name         string `json:"name"`
-								Code         string
-								ToAllocate   struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"toAllocate"`
-								Vat struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"vat"`
-								Recoverable struct {
-									Value    int    `json:"value"`
-									Currency string `json:"currency"`
-								} `json:"recoverable"`
-								Expenses []struct {
-									Label     string `json:"label"`
-									Date      string `json:"date"`
-									InvoiceID string `json:"invoiceId"`
-									Piece     struct {
-										HashFile string `json:"hashFile"`
-										Category string `json:"category"`
-										ID       string `json:"id"`
-									} `json:"piece"`
-									ToAllocate struct {
-										Value    int    `json:"value"`
-										Currency string `json:"currency"`
-									} `json:"toAllocate"`
-									Vat struct {
-										Value    int    `json:"value"`
-										Currency string `json:"currency"`
-									} `json:"vat"`
-									Recoverable struct {
-										Value    int    `json:"value"`
-										Currency string `json:"currency"`
-									} `json:"recoverable"`
-								} `json:"expenses"`
-							} `json:"expenseTypes"`
-						} `json:"allocations"`
-					} `json:"pastAccountingRGDD"`
-				} `json:"trusteeCouncil"`
-			} `json:"coownerAccount"`
-		} `json:"data"`
+		CoownerAccount struct {
+			TrusteeCouncil struct {
+				PastAccountingRGDD struct {
+					TotalToAllocate  amount `json:"totalToAllocate"`
+					TotalVat         amount `json:"totalVat"`
+					TotalRecoverable amount `json:"totalRecoverable"`
+					Allocations      []struct {
+						ID           string `json:"id"`
+						Name         string `json:"name"`
+						Code         string `json:"code"`
+						ToAllocate   amount `json:"toAllocate"`
+						Vat          amount `json:"vat"`
+						Recoverable  amount `json:"recoverable"`
+						ExpenseTypes []struct {
+							ID           string `json:"id"`
+							AllocationID string `json:"allocationId"`
+							Name         string `json:"name"`
+							Code         string `json:"code"`
+							ToAllocate   amount `json:"toAllocate"`
+							Vat          amount `json:"vat"`
+							Recoverable  amount `json:"recoverable"`
+							Expenses     []struct {
+								Label     string `json:"label"`
+								Date      Time   `json:"date"`
+								InvoiceID string `json:"invoiceId"`
+								Piece     struct {
+									HashFile string `json:"hashFile"`
+									Category string `json:"category"`
+									ID       string `json:"id"`
+								} `json:"piece"`
+								ToAllocate  amount `json:"toAllocate"`
+								Vat         amount `json:"vat"`
+								Recoverable amount `json:"recoverable"`
+							} `json:"expenses"`
+						} `json:"expenseTypes"`
+					} `json:"allocations"`
+				} `json:"pastAccountingRGDD"`
+			} `json:"trusteeCouncil"`
+		} `json:"coownerAccount"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getBuildingAccountingRGDDQuery, map[string]any{
+	err := DoGraphQL(ctx, client, graphqlURL, getBuildingAccountingRGDDQuery, map[string]any{
 		"uuid":               accountUUID,
 		"accountingPeriodId": accountingPeriodID,
 	}, &getBuildingAccountingRGDDResp)
-
 	if err != nil {
 		return nil, fmt.Errorf("error while querying getBuildingAccountingRGDDResp: %w", err)
 	}
 
 	var expenses []ExpenseDocumentAPI
-	for _, allocation := range getBuildingAccountingRGDDResp.Data.CoownerAccount.TrusteeCouncil.PastAccountingRGDD.Allocations {
+	for _, allocation := range getBuildingAccountingRGDDResp.CoownerAccount.TrusteeCouncil.PastAccountingRGDD.Allocations {
 		for _, expenseType := range allocation.ExpenseTypes {
 			for _, expense := range expenseType.Expenses {
-				var date time.Time
-				if expense.Date != "" {
-					var err error
-					date, err = time.Parse(time.RFC3339Nano, expense.Date)
-					if err != nil {
-						return nil, fmt.Errorf("error parsing time: %w", err)
-					}
-				}
 				expenses = append(expenses, ExpenseDocumentAPI{
 					InvoiceID:             expense.InvoiceID, // May be empty.
 					HashFile:              db.HashFile(expense.Piece.HashFile),
 					Label:                 expense.Label,
-					Date:                  date,
+					Date:                  expense.Date.Time,
 					Amount:                db.Amount(expense.ToAllocate.Value),
 					AccountingAllocation:  allocation.Name,
 					AccountingExpenseType: expenseType.Name,
@@ -1549,14 +1524,18 @@ func GetBuildingAccountingRGDD(client *http.Client, graphqlURL, accountUUID, acc
 	return expenses, nil
 }
 
-func Download(client *http.Client, fileURL string, filePath string) error {
+func Download(ctx context.Context, client *http.Client, fileURL string, filePath string) error {
 	// No need to use the authenticated client here since the URL is
 	// authenticated using one of the query parameters.
-	resp, err := Do(client, http.MethodGet, fileURL, nil)
+	resp, err := Do(ctx, client, http.MethodGet, fileURL, nil)
 	if err != nil {
 		return fmt.Errorf("while downloading invoice: %v", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("while downloading %s: unexpected status code %d", fileURL, resp.StatusCode)
+	}
 
 	// Ensure destination directory exists.
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
@@ -1603,19 +1582,6 @@ func (t Token) StringOnPurpose() string {
 	return string(t)
 }
 
-func SaveEmailToDB(ctx context.Context, db *sql.DB, message *cloudmailin.IncomingMail) error {
-	// Save the message to the database.
-	_, err := db.ExecContext(ctx, `
-		INSERT INTO emails (from, to, subject, body, received_at)
-		VALUES ($1, $2, $3, $4, $5)
-	`, message.Headers.From, message.Headers.To, message.Headers.Subject, message.Plain, message.Headers.Find("Date"))
-	if err != nil {
-		return fmt.Errorf("error while saving email to DB: %w", err)
-	}
-
-	return nil
-}
-
 type AccountDocumentAPI struct {
 	ID               string
 	HashFile         db.HashFile
@@ -1625,7 +1591,7 @@ type AccountDocumentAPI struct {
 	CreatedAt        time.Time
 }
 
-func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, category db.DocumentCategory) ([]AccountDocumentAPI, error) {
+func GetAccountDocuments(ctx context.Context, client *http.Client, graphqlURL, accountUUID string, category db.DocumentCategory) ([]AccountDocumentAPI, error) {
 	const getAccountDocumentsQuery = `
 		query getAccountDocuments($accountUuid: EncodedID!, $first: Int, $after: Cursor, $customerPortalCategory: CustomerPortalFileCategoryEnum!, $originalFilename: String, $subCategories: [String!], $fromDate: String, $toDate: String, $missionGeneralAssemblyIds: [String!]) {
 		  account(uuid: $accountUuid) {
@@ -1646,10 +1612,6 @@ func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, ca
 		        endCursor
 		        hasPreviousPage
 		        hasNextPage
-		        pageNumber
-		        itemsPerPage
-		        totalDisplayPages
-		        totalPages
 		      }
 		      edges {
 		        node {
@@ -1664,212 +1626,49 @@ func GetAccountDocuments(client *http.Client, graphqlURL, accountUUID string, ca
 		    }
 		  }
 		}`
-	var getAccountDocumentsResp struct {
-		Data struct {
+
+	var docs []AccountDocumentAPI
+	// The "generalAssembly" category has more documents than fit in a single
+	// page, so we have to follow the cursor.
+	_, err := paginate(ctx, "", func(ctx context.Context, after *string) (pageInfo, error) {
+		var resp struct {
 			Account struct {
 				Documents struct {
-					TotalCount int `json:"totalCount"`
-					PageInfo   struct {
-						StartCursor       string `json:"startCursor"`
-						EndCursor         string `json:"endCursor"`
-						HasPreviousPage   bool   `json:"hasPreviousPage"`
-						HasNextPage       bool   `json:"hasNextPage"`
-						PageNumber        int    `json:"pageNumber"`
-						ItemsPerPage      int    `json:"itemsPerPage"`
-						TotalDisplayPages int    `json:"totalDisplayPages"`
-						TotalPages        int    `json:"totalPages"`
-					} `json:"pageInfo"`
-					Edges []struct {
-						Node struct {
-							ID               string `json:"id"`
-							HashFile         string `json:"hashFile"`
-							MimeType         string `json:"mimeType"`
-							OriginalFilename string `json:"originalFilename"`
-							Category         string `json:"category"`
-							CreatedAt        string `json:"createdAt"`
-						} `json:"node"`
+					TotalCount int      `json:"totalCount"`
+					PageInfo   pageInfo `json:"pageInfo"`
+					Edges      []struct {
+						Node documentNode `json:"node"`
 					} `json:"edges"`
 				} `json:"documents"`
 			} `json:"account"`
-		} `json:"data"`
-	}
-
-	var docs []AccountDocumentAPI
-	var cursor *string
-	// The "generalAssembly" category has more documents than fit in a single
-	// page, so we have to follow the cursor. 100 is the maximum page size the
-	// API accepts.
-	for {
-		err := DoGraphQL(client, graphqlURL, getAccountDocumentsQuery, map[string]any{
+		}
+		err := DoGraphQL(ctx, client, graphqlURL, getAccountDocumentsQuery, map[string]any{
 			"accountUuid":            accountUUID,
 			"originalFilename":       "",
 			"subCategories":          []string{},
 			"customerPortalCategory": category,
-			"first":                  100,
-			"after":                  cursor,
-		}, &getAccountDocumentsResp)
+			"first":                  perPage,
+			"after":                  after,
+		}, &resp)
 		if err != nil {
-			return nil, fmt.Errorf("error while querying getAccountDocumentsResp: %w", err)
+			return pageInfo{}, fmt.Errorf("error while querying getAccountDocumentsResp: %w", err)
 		}
 
-		documents := getAccountDocumentsResp.Data.Account.Documents
-		for _, edge := range documents.Edges {
-			createdAt, err := time.Parse(time.RFC3339Nano, edge.Node.CreatedAt)
-			if err != nil {
-				logutil.Debugf("error parsing time: %v", err)
-				return nil, err
-			}
-
+		for _, edge := range resp.Account.Documents.Edges {
 			docs = append(docs, AccountDocumentAPI{
 				ID:               edge.Node.ID,
 				HashFile:         db.HashFile(edge.Node.HashFile),
 				MimeType:         edge.Node.MimeType,
 				OriginalFilename: edge.Node.OriginalFilename,
 				Category:         db.DocumentCategory(edge.Node.Category),
-				CreatedAt:        createdAt,
+				CreatedAt:        edge.Node.CreatedAt.Time,
 			})
 		}
-
-		// Guard against a server that keeps saying "there is a next page" while
-		// handing us the same cursor over and over.
-		if !documents.PageInfo.HasNextPage || documents.PageInfo.EndCursor == "" ||
-			(cursor != nil && documents.PageInfo.EndCursor == *cursor) {
-			break
-		}
-		endCursor := documents.PageInfo.EndCursor
-		cursor = &endCursor
-	}
-	return docs, nil
-}
-
-// Annual General Meeting (AGM) of Co-Owners ("Assemblée Générale"). The `after`
-// parameter is the cursor to use to get the next page of results. Leave it
-// empty to get the first page.
-func GetCouncilProjectDocumentsAPI(client *http.Client, graphqlURL, accountUUID, after string) ([]AccountDocumentAPI, error) {
-	const getCouncilProjectDocumentsQuery = `
-    query getCouncilProjectDocuments($accountUuid: EncodedID!, $sortBy: [SortByType!], $first: Int, $after: Cursor, $skipNotPaginatedData: Boolean! = false) {
-        coownerAccount(uuid: $accountUuid) {
-            uuid
-            pastGeneralAssembly @skip(if: $skipNotPaginatedData) {
-                id
-                label
-                officialMeeting {
-                    date
-                }
-                meetingPlace {
-                    address1
-                    address2
-                    city
-                    zipCode
-                    countryCode
-                }
-                lastValidPostalVoteReceptionDate
-                hasAccessToPostalVote
-                hasPreVoting
-                status
-            }
-            nextGeneralAssembly @skip(if: $skipNotPaginatedData) {
-                id
-                label
-                officialMeeting {
-                    date
-                }
-                meetingPlace {
-                    address1
-                    address2
-                    city
-                    zipCode
-                    countryCode
-                }
-                lastValidPostalVoteReceptionDate
-                hasAccessToPostalVote
-                hasPreVoting
-                status
-            }
-            trusteeCouncil {
-                projectDocuments(first: $first, after: $after, sortBy: $sortBy) {
-                    totalCount
-                    pageInfo {
-                        startCursor
-                        endCursor
-                        hasPreviousPage
-                        hasNextPage
-                    }
-                    edges {
-                        node {
-                            id
-                            hashFile
-                            mimeType
-                            originalFilename
-                            category
-                            createdAt
-                        }
-                    }
-                }
-            }
-        }
-    }
-`
-	var getCouncilProjectDocumentsResp struct {
-		Data struct {
-			CoownerAccount struct {
-				TrusteeCouncil struct {
-					ProjectDocuments struct {
-						TotalCount int `json:"totalCount"`
-						PageInfo   struct {
-							StartCursor     string `json:"startCursor"`
-							EndCursor       string `json:"endCursor"`
-							HasPreviousPage bool   `json:"hasPreviousPage"`
-							HasNextPage     bool   `json:"hasNextPage"`
-						} `json:"pageInfo"`
-						Edges []struct {
-							Node struct {
-								ID               string `json:"id"`
-								HashFile         string `json:"hashFile"`
-								MimeType         string `json:"mimeType"`
-								OriginalFilename string `json:"originalFilename"`
-								Category         string `json:"category"`
-								CreatedAt        string `json:"createdAt"`
-							} `json:"node"`
-						} `json:"edges"`
-					} `json:"projectDocuments"`
-				} `json:"trusteeCouncil"`
-			} `json:"coownerAccount"`
-		} `json:"data"`
-	}
-
-	var cursor *string
-	if after != "" {
-		cursor = &after
-	}
-	err := DoGraphQL(client, graphqlURL, getCouncilProjectDocumentsQuery, map[string]any{
-		"accountUuid":          accountUUID,
-		"first":                100, // I found that it is the maximum accepted value.
-		"after":                cursor,
-		"skipNotPaginatedData": false,
-	}, &getCouncilProjectDocumentsResp)
+		return resp.Account.Documents.PageInfo, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("error while querying getCouncilProjectDocumentsResp: %w", err)
+		return nil, err
 	}
-
-	var docs []AccountDocumentAPI
-	for _, edge := range getCouncilProjectDocumentsResp.Data.CoownerAccount.TrusteeCouncil.ProjectDocuments.Edges {
-		createdAt, err := time.Parse(time.RFC3339Nano, edge.Node.CreatedAt)
-		if err != nil {
-			logutil.Debugf("error parsing time: %v", err)
-			return nil, err
-		}
-
-		docs = append(docs, AccountDocumentAPI{
-			ID:               edge.Node.ID,
-			HashFile:         db.HashFile(edge.Node.HashFile),
-			MimeType:         edge.Node.MimeType,
-			OriginalFilename: edge.Node.OriginalFilename,
-			Category:         db.DocumentCategory(edge.Node.Category),
-			CreatedAt:        createdAt,
-		})
-	}
-
 	return docs, nil
 }
 
@@ -1932,7 +1731,7 @@ type RepairExpenseAPI struct {
 // GetRepairBudgets returns the "comptes travaux" of the building. Use
 // GetRepairBudgetDetails or GetRepairBudgetDetailsFull to get the expenses
 // charged to one of them.
-func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]RepairBudgetAPI, error) {
+func GetRepairBudgets(ctx context.Context, client *http.Client, graphqlURL, accountUUID string) ([]RepairBudgetAPI, error) {
 	const getRepairBudgetsQuery = `
         query getRepairBudgets($accountUuid: EncodedID!) {
           repairBudgets(accountUuid: $accountUuid) {
@@ -1945,19 +1744,14 @@ func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]Re
           }
         }`
 	var listRepairIDsResp struct {
-		Data struct {
-			RepairBudgets []struct {
-				ID              string `json:"id"`
-				Label           string `json:"label"`
-				ValidatedAmount struct {
-					Value    int    `json:"value"`
-					Currency string `json:"currency"`
-				} `json:"validatedAmount"`
-			} `json:"repairBudgets"`
-		} `json:"data"`
+		RepairBudgets []struct {
+			ID              string `json:"id"`
+			Label           string `json:"label"`
+			ValidatedAmount amount `json:"validatedAmount"`
+		} `json:"repairBudgets"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getRepairBudgetsQuery, map[string]any{
+	err := DoGraphQL(ctx, client, graphqlURL, getRepairBudgetsQuery, map[string]any{
 		"accountUuid": accountUUID,
 	}, &listRepairIDsResp)
 	if err != nil {
@@ -1965,7 +1759,7 @@ func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]Re
 	}
 
 	var budgets []RepairBudgetAPI
-	for _, repair := range listRepairIDsResp.Data.RepairBudgets {
+	for _, repair := range listRepairIDsResp.RepairBudgets {
 		budgets = append(budgets, RepairBudgetAPI{
 			ID:              repair.ID,
 			Label:           repair.Label,
@@ -1978,8 +1772,8 @@ func GetRepairBudgets(client *http.Client, graphqlURL, accountUUID string) ([]Re
 // GetRepairBudgetDetails returns the expenses charged to a single "compte
 // travaux", flattened. Use GetRepairBudgetDetailsFull if you also need the
 // allocation and expense-type totals.
-func GetRepairBudgetDetails(client *http.Client, graphqlURL, accountUUID, budgetID string) ([]ExpenseDocumentAPI, error) {
-	details, err := GetRepairBudgetDetailsFull(client, graphqlURL, accountUUID, budgetID)
+func GetRepairBudgetDetails(ctx context.Context, client *http.Client, graphqlURL, accountUUID, budgetID string) ([]ExpenseDocumentAPI, error) {
+	details, err := GetRepairBudgetDetailsFull(ctx, client, graphqlURL, accountUUID, budgetID)
 	if err != nil {
 		return nil, err
 	}
@@ -2006,7 +1800,7 @@ func GetRepairBudgetDetails(client *http.Client, graphqlURL, accountUUID, budget
 
 // GetRepairBudgetDetailsFull returns the full breakdown of a single "compte
 // travaux": totals, allocations, expense types, and expenses.
-func GetRepairBudgetDetailsFull(client *http.Client, graphqlURL, accountUUID, budgetID string) (RepairBudgetDetailsAPI, error) {
+func GetRepairBudgetDetailsFull(ctx context.Context, client *http.Client, graphqlURL, accountUUID, budgetID string) (RepairBudgetDetailsAPI, error) {
 	if accountUUID == "" {
 		return RepairBudgetDetailsAPI{}, errors.New("accountUUID is empty")
 	}
@@ -2020,51 +1814,24 @@ func GetRepairBudgetDetailsFull(client *http.Client, graphqlURL, accountUUID, bu
 		    trusteeCouncil {
 		      repairBudgets(accountUuid: $accountUuid, budgetId: $budgetId) {
 		        budgetId
-		        totalToAllocate {
-		          value
-		          currency
-		        }
-		        totalVat {
-		          value
-		          currency
-		        }
-		        totalRecoverable {
-		          value
-		          currency
-		        }
+		        totalToAllocate {value currency}
+		        totalVat {value currency}
+		        totalRecoverable {value currency}
 		        allocations {
 		          id
 		          name
 		          code
-		          toAllocate {
-		            value
-		            currency
-		          }
-		          vat {
-		            value
-		            currency
-		          }
-		          recoverable {
-		            value
-		            currency
-		          }
+		          toAllocate {value currency}
+		          vat {value currency}
+		          recoverable {value currency}
 		          expenseTypes {
 		            id
 		            allocationId
 		            name
 		            code
-		            toAllocate {
-		              value
-		              currency
-		            }
-		            vat {
-		              value
-		              currency
-		            }
-		            recoverable {
-		              value
-		              currency
-		            }
+		            toAllocate {value currency}
+		            vat {value currency}
+		            recoverable {value currency}
 		            expenses {
 		              id
 		              label
@@ -2075,18 +1842,9 @@ func GetRepairBudgetDetailsFull(client *http.Client, graphqlURL, accountUUID, bu
 		                category
 		                id
 		              }
-		              toAllocate {
-		                value
-		                currency
-		              }
-		              vat {
-		                value
-		                currency
-		              }
-		              recoverable {
-		                value
-		                currency
-		              }
+		              toAllocate {value currency}
+		              vat {value currency}
+		              recoverable {value currency}
 		            }
 		          }
 		        }
@@ -2094,57 +1852,51 @@ func GetRepairBudgetDetailsFull(client *http.Client, graphqlURL, accountUUID, bu
 		    }
 		  }
 		}`
-	type amount struct {
-		Value    int    `json:"value"`
-		Currency string `json:"currency"`
-	}
 	var getRepairBudgetDetailsResp struct {
-		Data struct {
-			CoownerAccount struct {
-				TrusteeCouncil struct {
-					RepairBudgets struct {
-						BudgetID         string `json:"budgetId"`
-						TotalToAllocate  amount `json:"totalToAllocate"`
-						TotalVat         amount `json:"totalVat"`
-						TotalRecoverable amount `json:"totalRecoverable"`
-						Allocations      []struct {
+		CoownerAccount struct {
+			TrusteeCouncil struct {
+				RepairBudgets struct {
+					BudgetID         string `json:"budgetId"`
+					TotalToAllocate  amount `json:"totalToAllocate"`
+					TotalVat         amount `json:"totalVat"`
+					TotalRecoverable amount `json:"totalRecoverable"`
+					Allocations      []struct {
+						ID           string `json:"id"`
+						Name         string `json:"name"`
+						Code         string `json:"code"`
+						ToAllocate   amount `json:"toAllocate"`
+						Vat          amount `json:"vat"`
+						Recoverable  amount `json:"recoverable"`
+						ExpenseTypes []struct {
 							ID           string `json:"id"`
+							AllocationID string `json:"allocationId"`
 							Name         string `json:"name"`
 							Code         string `json:"code"`
 							ToAllocate   amount `json:"toAllocate"`
 							Vat          amount `json:"vat"`
 							Recoverable  amount `json:"recoverable"`
-							ExpenseTypes []struct {
-								ID           string `json:"id"`
-								AllocationID string `json:"allocationId"`
-								Name         string `json:"name"`
-								Code         string `json:"code"`
-								ToAllocate   amount `json:"toAllocate"`
-								Vat          amount `json:"vat"`
-								Recoverable  amount `json:"recoverable"`
-								Expenses     []struct {
-									ID        string `json:"id"`
-									InvoiceID string `json:"invoiceId"`
-									Label     string `json:"label"`
-									Date      string `json:"date"`
-									Piece     struct {
-										HashFile string `json:"hashFile"`
-										Category string `json:"category"`
-										ID       string `json:"id"`
-									} `json:"piece"`
-									ToAllocate  amount `json:"toAllocate"`
-									Vat         amount `json:"vat"`
-									Recoverable amount `json:"recoverable"`
-								} `json:"expenses"`
-							} `json:"expenseTypes"`
-						} `json:"allocations"`
-					} `json:"repairBudgets"`
-				} `json:"trusteeCouncil"`
-			} `json:"coownerAccount"`
-		} `json:"data"`
+							Expenses     []struct {
+								ID        string `json:"id"`
+								InvoiceID string `json:"invoiceId"`
+								Label     string `json:"label"`
+								Date      Time   `json:"date"`
+								Piece     struct {
+									HashFile string `json:"hashFile"`
+									Category string `json:"category"`
+									ID       string `json:"id"`
+								} `json:"piece"`
+								ToAllocate  amount `json:"toAllocate"`
+								Vat         amount `json:"vat"`
+								Recoverable amount `json:"recoverable"`
+							} `json:"expenses"`
+						} `json:"expenseTypes"`
+					} `json:"allocations"`
+				} `json:"repairBudgets"`
+			} `json:"trusteeCouncil"`
+		} `json:"coownerAccount"`
 	}
 
-	err := DoGraphQL(client, graphqlURL, getRepairBudgetDetailsQuery, map[string]any{
+	err := DoGraphQL(ctx, client, graphqlURL, getRepairBudgetDetailsQuery, map[string]any{
 		"accountUuid": accountUUID,
 		"budgetId":    budgetID,
 	}, &getRepairBudgetDetailsResp)
@@ -2152,7 +1904,7 @@ func GetRepairBudgetDetailsFull(client *http.Client, graphqlURL, accountUUID, bu
 		return RepairBudgetDetailsAPI{}, fmt.Errorf("error while querying getRepairBudgetDetailsResp: %w", err)
 	}
 
-	raw := getRepairBudgetDetailsResp.Data.CoownerAccount.TrusteeCouncil.RepairBudgets
+	raw := getRepairBudgetDetailsResp.CoownerAccount.TrusteeCouncil.RepairBudgets
 	details := RepairBudgetDetailsAPI{
 		BudgetID:         raw.BudgetID,
 		TotalToAllocate:  db.Amount(raw.TotalToAllocate.Value),
@@ -2178,20 +1930,12 @@ func GetRepairBudgetDetailsFull(client *http.Client, graphqlURL, accountUUID, bu
 				Recoverable: db.Amount(expenseType.Recoverable.Value),
 			}
 			for _, expense := range expenseType.Expenses {
-				var date time.Time
-				if expense.Date != "" {
-					var err error
-					date, err = time.Parse(time.RFC3339Nano, expense.Date)
-					if err != nil {
-						return RepairBudgetDetailsAPI{}, fmt.Errorf("error parsing time: %w", err)
-					}
-				}
 				t.Expenses = append(t.Expenses, RepairExpenseAPI{
 					ID:          expense.ID,
 					InvoiceID:   expense.InvoiceID, // May be empty.
 					HashFile:    db.HashFile(expense.Piece.HashFile),
 					Label:       expense.Label,
-					Date:        date,
+					Date:        expense.Date.Time,
 					ToAllocate:  db.Amount(expense.ToAllocate.Value),
 					Vat:         db.Amount(expense.Vat.Value),
 					Recoverable: db.Amount(expense.Recoverable.Value),
@@ -2203,55 +1947,6 @@ func GetRepairBudgetDetailsFull(client *http.Client, graphqlURL, accountUUID, bu
 	}
 
 	return details, nil
-}
-
-// I found that after many calls, the server starts returning:
-//
-//	HTTP/2.0 403
-//	date: Wed, 29 Jan 2025 20:27:28 GMT
-//	content-type: application/json
-//	content-length: 23
-//	x-amzn-requestid: d612d465-164e-4821-968c-d43a2bc1066f
-//	x-amzn-errortype: ForbiddenException
-//	x-amz-apigw-id: FKtPnFBhCGYEU3w=
-//
-//	{"message":"Forbidden"}
-//
-// Also, in some instances, it returns an error with `peer closed connection`.
-//
-// I suspect that the server is rate-limiting me. This func is meant to wrap
-// client.Do calls and retry them if they fail with a 403.
-func Do(client *http.Client, method string, url string, body []byte) (*http.Response, error) {
-	b := bytes.NewReader(body)
-	for i := 0; i < 10; i++ {
-		_, err := b.Seek(0, 0)
-		if err != nil {
-			return nil, fmt.Errorf("while seeking body: %w", err)
-		}
-		req, err := http.NewRequest(method, url, b)
-		if err != nil {
-			return nil, fmt.Errorf("while creating request: %w", err)
-		}
-
-		resp, err := client.Do(req)
-		switch {
-		case errors.Is(err, syscall.ECONNRESET):
-			logutil.Infof("received connection reset, suspecting rate-limiting, retrying...")
-			resp.Body.Close()
-			time.Sleep(30 * time.Second)
-			continue
-		case err != nil:
-			return nil, fmt.Errorf("while doing request: %w", err)
-		case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusBadGateway:
-			logutil.Infof("received %d, suspecting rate-limiting, retrying...", resp.StatusCode)
-			resp.Body.Close()
-			time.Sleep(30 * time.Second)
-			continue
-		}
-
-		return resp, nil
-	}
-	return nil, fmt.Errorf("retried multiple times, giving up")
 }
 
 type Coowner struct {
@@ -2266,8 +1961,10 @@ type Coowner struct {
 	Units       []int // Lots.
 }
 
-func GetCouncilCoowners(client *http.Client, accountUuid string) ([]Coowner, error) {
-	getCouncilCoownersQuery := `
+// GetCouncilCoowners returns every co-owner of the building. It is paginated:
+// a building with more than 100 lots doesn't fit in a single page.
+func GetCouncilCoowners(ctx context.Context, client *http.Client, graphqlURL, accountUUID string) ([]Coowner, error) {
+	const getCouncilCoownersQuery = `
       query getCouncilCoowners(
         $accountUuid: EncodedID!,
         $first: Int,
@@ -2296,10 +1993,6 @@ func GetCouncilCoowners(client *http.Client, accountUuid string) ([]Coowner, err
                 endCursor
                 hasPreviousPage
                 hasNextPage
-                pageNumber
-                itemsPerPage
-                totalDisplayPages
-                totalPages
               }
               edges {
                 node {
@@ -2333,53 +2026,17 @@ func GetCouncilCoowners(client *http.Client, accountUuid string) ([]Coowner, err
             }
           }
         }
-      }
-	`
-	var cursor *string
-	variables := map[string]any{
-		"accountUuid":      accountUuid,
-		"first":            100,
-		"after":            cursor,
-		"customerName":     "",
-		"fullAddress":      "",
-		"sortBy":           map[string]string{"key": "customerName", "direction": "ASC"},
-		"units":            []string(nil),
-		"holderProperties": []string(nil),
-	}
-	body, err := json.Marshal(map[string]any{
-		"query":     getCouncilCoownersQuery,
-		"variables": variables,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("while marshalling request body: %w", err)
-	}
-	resp, err := Do(client, http.MethodPost, "https://myfoncia-gateway.prod.fonciamillenium.net/graphql", body)
-	if err != nil {
-		return nil, fmt.Errorf("while doing request: %w", err)
-	}
+      }`
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, respBody)
-	}
-
-	var getCouncilCoownersResp struct {
-		Data struct {
+	var coowners []Coowner
+	_, err := paginate(ctx, "", func(ctx context.Context, after *string) (pageInfo, error) {
+		var resp struct {
 			CoownerAccount struct {
 				TrusteeCouncil struct {
 					Coowners struct {
-						TotalCount int `json:"totalCount"`
-						PageInfo   struct {
-							StartCursor       string `json:"startCursor"`
-							EndCursor         string `json:"endCursor"`
-							HasPreviousPage   bool   `json:"hasPreviousPage"`
-							HasNextPage       bool   `json:"hasNextPage"`
-							PageNumber        int    `json:"pageNumber"`
-							ItemsPerPage      int    `json:"itemsPerPage"`
-							TotalDisplayPages int    `json:"totalDisplayPages"`
-							TotalPages        int    `json:"totalPages"`
-						} `json:"pageInfo"`
-						Edges []struct {
+						TotalCount int      `json:"totalCount"`
+						PageInfo   pageInfo `json:"pageInfo"`
+						Edges      []struct {
 							Node struct {
 								ID    string `json:"id"`
 								Units []struct {
@@ -2403,48 +2060,54 @@ func GetCouncilCoowners(client *http.Client, accountUuid string) ([]Coowner, err
 										} `json:"address"`
 									} `json:"customer"`
 								} `json:"mainHolder"`
+								Balance amount `json:"balance"`
 							} `json:"node"`
-						}
-					}
+						} `json:"edges"`
+					} `json:"coowners"`
+				} `json:"trusteeCouncil"`
+			} `json:"coownerAccount"`
+		}
+
+		err := DoGraphQL(ctx, client, graphqlURL, getCouncilCoownersQuery, map[string]any{
+			"accountUuid":      accountUUID,
+			"first":            perPage,
+			"after":            after,
+			"customerName":     "",
+			"fullAddress":      "",
+			"sortBy":           map[string]string{"key": "customerName", "direction": "ASC"},
+			"units":            []string(nil),
+			"holderProperties": []string(nil),
+		}, &resp)
+		if err != nil {
+			return pageInfo{}, fmt.Errorf("error while querying getCouncilCoownersResp: %w", err)
+		}
+
+		for _, edge := range resp.CoownerAccount.TrusteeCouncil.Coowners.Edges {
+			var units []int
+			for _, unit := range edge.Node.Units {
+				unitNumber, err := strconv.Atoi(unit.CoOwnershipByLawsID)
+				if err != nil {
+					return pageInfo{}, fmt.Errorf("error parsing unit number %s: %w", unit.CoOwnershipByLawsID, err)
 				}
+				units = append(units, unitNumber)
 			}
-		}
-	}
 
-	bytes, err := io.ReadAll(resp.Body)
+			coowners = append(coowners, Coowner{
+				Civility:    edge.Node.MainHolder.Customer.Civility,
+				FirstName:   edge.Node.MainHolder.Customer.FirstName,
+				LastName:    edge.Node.MainHolder.Customer.LastName,
+				DisplayName: edge.Node.MainHolder.Customer.DisplayName,
+				Address1:    edge.Node.MainHolder.Customer.Address.Address1,
+				Address2:    edge.Node.MainHolder.Customer.Address.Address2,
+				City:        edge.Node.MainHolder.Customer.Address.City,
+				ZipCode:     edge.Node.MainHolder.Customer.Address.ZipCode,
+				Units:       units,
+			})
+		}
+		return resp.CoownerAccount.TrusteeCouncil.Coowners.PageInfo, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("while reading response body: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if err := json.Unmarshal(bytes, &getCouncilCoownersResp); err != nil {
-		return nil, fmt.Errorf("while unmarshalling response body: %w", err)
-	}
-
-	var coowners []Coowner
-	for _, edge := range getCouncilCoownersResp.Data.CoownerAccount.TrusteeCouncil.Coowners.Edges {
-		var units []int
-		for _, unit := range edge.Node.Units {
-			// Parse front string.
-			unitNumber, err := strconv.Atoi(unit.CoOwnershipByLawsID)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing unit number %s: %w", unit.CoOwnershipByLawsID, err)
-			}
-			units = append(units, unitNumber)
-		}
-
-		coowners = append(coowners, Coowner{
-			Civility:    edge.Node.MainHolder.Customer.Civility,
-			FirstName:   edge.Node.MainHolder.Customer.FirstName,
-			LastName:    edge.Node.MainHolder.Customer.LastName,
-			DisplayName: edge.Node.MainHolder.Customer.DisplayName,
-			Address1:    edge.Node.MainHolder.Customer.Address.Address1,
-			Address2:    edge.Node.MainHolder.Customer.Address.Address2,
-			City:        edge.Node.MainHolder.Customer.Address.City,
-			ZipCode:     edge.Node.MainHolder.Customer.Address.ZipCode,
-			Units:       units,
-		})
-	}
-
 	return coowners, nil
 }

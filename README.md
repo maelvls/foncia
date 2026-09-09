@@ -146,3 +146,48 @@ ssh pi docker logs caddy 2>&1 | grep '^{' | jq --slurp '.[]|select(.logger=="sec
 ssh pi docker logs caddy 2>&1 >/dev/null --follow | grep '"logger":"security"'
 docker logs caddy --follow 2>&1 | grep '^{' | jq 'select(.logger == "security")'
 ```
+
+## Restricting who can see the pages
+
+The pages list the co-owners' names and postal addresses, and the process itself
+does not check who is asking: access control is done entirely by the
+OAuth-terminating reverse proxy in front of it. `--allowed-users` adds a second
+check inside the process, so that a misconfigured or bypassed proxy doesn't
+expose everything:
+
+```bash
+foncia --allowed-users "someone@example.com,someone-else@example.com" serve
+```
+
+The email is read from the header named by `--auth-header`, which defaults to
+`X-Forwarded-Email`. Check what your proxy actually sets before turning this on.
+The proxy **must** also strip that header from incoming requests, otherwise a
+client can just send it themselves. Leaving `--allowed-users` empty, which is the
+default, keeps the previous behaviour of trusting the proxy entirely.
+
+## Development
+
+```bash
+make build     # go build -o foncia .
+make test      # go test ./...
+make vet       # go vet ./...
+make lint      # staticcheck
+```
+
+The same four run in CI on every push, see `.github/workflows/ci.yml`.
+
+The database is a cache of Foncia's API: it can be deleted and re-synced from
+scratch at any time, which is why there is no migration machinery. The schema
+lives in `db/schema.sql`, is embedded in the binary, and is applied every time
+the database is opened. `db.Open` is the only supported way to open it; it sets
+the pragmas the code depends on, in particular `foreign_keys=ON` (foreign keys
+are declared in the schema but SQLite ignores them unless asked) and
+`busy_timeout`, since the web handlers and the sync goroutine write
+concurrently.
+
+The HTML lives in `templates/` and is embedded with `go:embed` rather than
+being held in Go string literals.
+
+Logs go to stderr through `logutil`, which is a thin `log/slog` handler that
+prints `level: message`. Colours turn themselves off when stderr is not a
+terminal or when `NO_COLOR` is set, so container logs stay readable.

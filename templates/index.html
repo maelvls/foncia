@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Suivi des factures et ordres de service de la copro TERRA NOSTRA 2</title>
+<meta charset="utf-8">
+	<style>
+		table {
+			border-collapse: collapse;
+			width: 100%;
+			font-family: Arial, sans-serif;
+			color: #444;
+			font-size: 0.9em;
+			border: 1px solid #f2f2f2;
+		}
+
+		table th {
+			background: #f2f2f2;
+			padding: 10px;
+			font-weight: bold;
+			text-align: left;
+			border-top: 1px solid #e6e6e6;
+		}
+
+		table td {
+			padding: 10px;
+			border-top: 1px solid #e6e6e6;
+			text-align: left;
+		}
+
+		table tr:nth-child(even) {
+			background: #f8f8f8;
+		}
+
+		table tr:hover {
+			background: #f2f2f2;
+		}
+	</style>
+</head>
+<body>
+	<h1>Suivi des factures et ordres de service de la copro TERRA NOSTRA 2</h1>
+
+	{{ template "header" . }}
+
+    <form action="{{.BasePath}}/" method="GET">
+		<input type="radio" id="all" name="filter" value="" {{if eq .Filter ""}}checked{{end}}>
+		<label for="all">Tous</label>
+
+		<input type="radio" id="expenses" name="filter" value="expenses" {{if eq .Filter "expenses"}}checked{{end}}>
+		<label for="expenses">Factures (compte courant et compte travaux)</label>
+
+		<input type="radio" id="missions" name="filter" value="missions" {{if eq .Filter "missions"}}checked{{end}}>
+		<label for="missions">Ordres de mission et ordres de réparation</label>
+
+		<input type="radio" id="visits" name="filter" value="visits" {{if eq .Filter "visits"}}checked{{end}}>
+		<label for="visits">Rapports de visite</label>
+
+		<input type="radio" id="ag" name="filter" value="ag" {{if eq .Filter "ag"}}checked{{end}}>
+		<label for="ag">Assemblées générales (convocations et procès-verbaux)</label>
+
+		<input type="submit" value="Filtrer">
+	</form>
+
+	<table>
+		<thead>
+			<tr>
+				<th>Date</th>
+				<th>Type et statut</th>
+				<th>Label</th>
+				<th>Description</th>
+				<th>Facture ou ordre de service</th>
+			</tr>
+		</thead>
+		<tbody>
+			{{range .Items}}
+				{{with .Mission}}
+				<tr id="{{ .ID }}">
+					<td><a href="{{$.BasePath}}#{{ .ID }}">{{.StartedAt.Format "02 Jan 2006"}}</a></td>
+					<td>{{ .KindFrench }} </br><small>{{ .StatusFrench }}</small></td>
+					<td>{{.Label}}</td>
+					<td><small>{{.Description}}</small></td>
+					<td>
+						<small>
+							{{range .WorkOrders}}
+								{{.Number}}
+								{{.Label}}
+								{{.RepairDateEnd.Format "02/01/2006"}}
+								{{.Supplier.Name}}
+								{{.Supplier.Activity}}</br>
+								{{range .Supplier.Documents}}
+									(<small><a href="{{$.BasePath}}/dl/contract/{{.HashFile}}/{{.FilePath}}">{{.FilePath}}</a></small>)
+								{{end}}
+							{{end}}
+						</small>
+					</td>
+				</tr>
+				{{end}}
+				{{with .Expense}}
+				<tr id="{{or .HashFile .InvoiceID}}">
+					<td><a href="{{$.BasePath}}#{{ or .HashFile .InvoiceID }}">{{.Date.Format "02 Jan 2006"}}</a></td>
+					<td>Facture
+						{{if eq .Source "repairs"}}
+							</br>
+							<small>(compte travaux)</small>
+						{{end}}
+						{{if .AccountingKey}}
+							</br>
+							<small><small>{{.AccountingKey.Allocation}},
+							{{.AccountingKey.ExpenseType}}</small></small>
+						{{end}}
+					</td>
+					<td>{{.Label}}</td>
+					<td><small>
+						{{.Amount}}
+					</small></td>
+					{{if .FilePath}}
+						<td><small>
+						{{if .HashFile}}
+							<a href="{{$.BasePath}}/dl/invoice/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a>
+						{{else if .InvoiceID}}
+							<a href="{{$.BasePath}}/dl/invoiceid/{{.InvoiceID}}/{{.Filename}}">{{.Filename}}</a>
+						{{end}}
+						</small></td>
+					{{else if .HashFile}}
+						<td><small>PDF en attente de téléchargement</small></td>
+					{{else}}
+						<td><small>Pas de PDF</small></td>
+					{{end}}
+				</tr>
+				{{end}}
+				{{with .AccountDocument}}
+				<tr id="{{.ID}}">
+					<td><a href="{{$.BasePath}}#{{.ID}}">{{.CreatedAt.Format "02 Jan 2006"}}</a></td>
+					<td>Document</td>
+					<td>{{.CategoryFrench}}</td>
+					<td><small>{{.MimeType}}</small></td>
+					{{if .FilePath}}
+						<td><small><a href="{{$.BasePath}}/dl/doc/{{.HashFile}}/{{.Filename}}">{{.Filename}}</a></small></td>
+					{{else if .HashFile}}
+						{{/* Not on disk yet: /dl/doc/<hash> downloads it from Foncia, saves it, and serves it. */}}
+						<td><small><a href="{{$.BasePath}}/dl/doc/{{.HashFile}}">Télécharger depuis Foncia</a></small></td>
+					{{else}}
+						<td><small>Pas de PDF</small></td>
+					{{end}}
+				</tr>
+				{{end}}
+			{{end}}
+		</tbody>
+	</table>
+	<div>
+		<small>Version: {{.Version}}</small>
+	</div>
+</body>
+</html>

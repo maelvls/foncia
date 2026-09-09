@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/maelvls/foncia/api"
@@ -17,7 +18,7 @@ import (
 
 // Returns the new items.
 func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid string) ([]db.MissionDB, error) {
-	missions, _, err := api.GetMissionsAPI(client, graphqlURL, uuid, "")
+	missions, _, err := api.GetMissionsAPI(ctx, client, graphqlURL, uuid, api.MissionsCursor{})
 	if err != nil {
 		return nil, fmt.Errorf("while getting interventions: %v", err)
 	}
@@ -41,19 +42,20 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql
 	}
 
 	// Since HTTP request per new mission is made, and there may be 200-300
-	// missions, let's do them in batches of 20 so that we can save to DB in
+	// missions, let's do them in small batches so that we can save to DB
 	// regularly so we don't lose all the work if the program crashes (takes a
 	// lot of time partly because the Raspberry Pi's disk is slow, partly because
 	// there are 200-300 HTTP calls to be made).
 	batchSize := 1
 	i := 0
+	var savedMissions []db.MissionDB
 	err = DoInBatches(batchSize, newMissions, func(batchMissions []db.MissionDB) error {
 		i++
 		var batchWorkOrders []db.WorkOrderDB
 
 		// Let's update each mission with its work orders.
 		for i, mission := range batchMissions {
-			orders, err := api.GetWorkOrdersAPI(client, graphqlURL, uuid, mission.ID)
+			orders, err := api.GetWorkOrdersAPI(ctx, client, graphqlURL, uuid, mission.ID)
 			if err != nil {
 				return fmt.Errorf("while getting work orders from API: %v", err)
 			}
@@ -67,32 +69,37 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql
 			batchWorkOrders = append(batchWorkOrders, missionWorkOrders...)
 		}
 
+		// Missions first: work_orders.mission_id is a foreign key onto
+		// missions.id, and foreign keys are enforced now, so inserting the work
+		// orders first would be rejected.
+		logutil.Debugf("saving %d missions to DB", len(batchMissions))
+		err = db.SaveMissionsToDB(ctx, sqlDB, batchMissions...)
+		if err != nil {
+			return fmt.Errorf("while saving missions: %v", err)
+		}
+
 		logutil.Debugf("saving work orders for %d missions to DB", len(batchMissions))
 		err = db.SaveWorkOrdersToDB(ctx, sqlDB, batchWorkOrders)
 		if err != nil {
 			return fmt.Errorf("while saving work orders: %v", err)
 		}
 
-		logutil.Debugf("saving %d missions to DB", batchMissions)
-
-		err = db.SaveMissionsToDB(ctx, sqlDB, batchMissions...)
-		if err != nil {
-			return fmt.Errorf("while saving missions: %v", err)
-		}
-
+		savedMissions = append(savedMissions, batchMissions...)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		// The batches before the failing one are already in the database.
+		// Hand them back so that the caller can still notify about them.
+		return savedMissions, err
 	}
 
-	return newMissions, nil
+	return savedMissions, nil
 }
 
 // Returns new expenses.
 func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) ([]db.ExpenseDocumentDB, error) {
 	// Unauthenticated client just used for downloading files from AWS.
-	downloadClient := &http.Client{}
+	downloadClient := &http.Client{Timeout: 5 * time.Minute}
 	api.EnableDebugCurlLogs(downloadClient)
 
 	// Create dir if missing.
@@ -104,19 +111,19 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	// For now, the fetched expenses won't contain the FilePath field. It will
 	// be set later on.
 	var expensesLive []db.ExpenseDocumentDB
-	expensesFromAPI, err := api.GetBuildingAccountingCurrent(client, graphqlURL, uuid)
+	expensesFromAPI, err := api.GetBuildingAccountingCurrent(ctx, client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting expenses: %v", err)
 	}
 	for _, e := range expensesFromAPI {
 		expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e, db.SourceAccounting))
 	}
-	periods, err := api.GetAccountingPeriods(client, graphqlURL, uuid)
+	periods, err := api.GetAccountingPeriods(ctx, client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting accounting periods: %v", err)
 	}
 	for _, period := range periods {
-		cur, err := api.GetBuildingAccountingRGDD(client, graphqlURL, uuid, period.ID)
+		cur, err := api.GetBuildingAccountingRGDD(ctx, client, graphqlURL, uuid, period.ID)
 		if err != nil {
 			return nil, fmt.Errorf("while getting building accounting RGDD: %v", err)
 		}
@@ -125,12 +132,12 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		}
 	}
 
-	budgets, err := api.GetRepairBudgets(client, graphqlURL, uuid)
+	budgets, err := api.GetRepairBudgets(ctx, client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting repair IDs: %v", err)
 	}
 	for _, budget := range budgets {
-		got, err := api.GetRepairBudgetDetails(client, graphqlURL, uuid, budget.ID)
+		got, err := api.GetRepairBudgetDetails(ctx, client, graphqlURL, uuid, budget.ID)
 		if err != nil {
 			return nil, fmt.Errorf("while getting repair budget details: %v", err)
 		}
@@ -170,13 +177,13 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 			if fileExists(e.FilePath) {
 				continue
 			} else if e.FilePath != "" {
-				logutil.Debugf("file needs to be downloaded for '%s' (%s, %d)", e.FilePath, e.Label, e.Date, e.Amount)
+				logutil.Debugf("file needs to be downloaded for %q (%s, %s, %s)", e.FilePath, e.Label, e.Date.Format(time.RFC3339), e.Amount)
 			}
 
 			// First try using the HashFile, then the InvoiceID.
 			var fileURL, filename string
 			if e.HashFile != "" {
-				filename, fileURL, err = api.GetDocumentURL(client, graphqlURL, e.HashFile)
+				filename, fileURL, err = api.GetDocumentURL(ctx, client, graphqlURL, e.HashFile)
 				switch {
 				case errors.Is(err, api.ErrEmptyURL):
 					logutil.Debugf("no document URL found for hash file '%s', skipping download. Expense: %+v", e.HashFile, e)
@@ -187,7 +194,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 			} else if e.InvoiceID != "" {
 				// I found that the graphql query 'getInvoiceURL' returns an empty
 				// URL if the invoiceID exists but the hashFile is empty.
-				filename, fileURL, err = api.GetInvoiceURL(client, graphqlURL, e.InvoiceID)
+				filename, fileURL, err = api.GetInvoiceURL(ctx, client, graphqlURL, e.InvoiceID)
 				switch {
 				case errors.Is(err, api.ErrEmptyURL):
 					logutil.Debugf("no invoice URL found for invoice ID '%s', skipping download. Expense: %+v", e.InvoiceID, e)
@@ -205,7 +212,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 				continue
 			}
 
-			err = api.Download(downloadClient, fileURL, e.FilePath)
+			err = api.Download(ctx, downloadClient, fileURL, e.FilePath)
 			if err != nil {
 				return fmt.Errorf("while downloading invoice for expense %s: %v", fileURL, err)
 			}
@@ -236,18 +243,20 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 			}
 		}
 
-		newExpensesDB = append(newExpensesDB, newExpenses...)
-
 		newOrChanged := append(newExpenses, changedExpences...)
 		err = db.UpsertExpensesWithDB(ctx, sqlDB, newOrChanged...)
 		if err != nil {
 			return fmt.Errorf("while saving expenses: %v", err)
 		}
 
+		// Only count them as new once they are actually persisted.
+		newExpensesDB = append(newExpensesDB, newExpenses...)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		// Same as for the missions: the earlier batches are saved, so report
+		// them rather than dropping them on the floor.
+		return newExpensesDB, err
 	}
 
 	return newExpensesDB, nil
@@ -268,10 +277,10 @@ func deduplicate(expenses *[]db.ExpenseDocumentDB) []db.ExpenseDocumentDB {
 
 func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) error {
 	// Unauthenticated client just used for downloading files from AWS.
-	downloadClient := &http.Client{}
+	downloadClient := &http.Client{Timeout: 5 * time.Minute}
 	api.EnableDebugCurlLogs(downloadClient)
 
-	supplierContractsLive, err := api.GetCouncilMissionSuppliersAPI(client, graphqlURL, uuid)
+	supplierContractsLive, err := api.GetCouncilMissionSuppliersAPI(ctx, client, graphqlURL, uuid)
 	if err != nil {
 		return fmt.Errorf("while getting suppliers: %v", err)
 	}
@@ -322,7 +331,7 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 			continue
 		}
 
-		filename, fileURL, err := api.GetDocumentURL(client, graphqlURL, doc.HashFile)
+		filename, fileURL, err := api.GetDocumentURL(ctx, client, graphqlURL, doc.HashFile)
 		if err != nil {
 			return fmt.Errorf("while getting document URL: %v", err)
 		}
@@ -332,7 +341,7 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 			continue
 		}
 
-		err = api.Download(downloadClient, fileURL, doc.FilePath)
+		err = api.Download(ctx, downloadClient, fileURL, doc.FilePath)
 		if err != nil {
 			return fmt.Errorf("while downloading document: %v", err)
 		}
@@ -360,7 +369,7 @@ func syncSuppliersWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB
 // When they aren't on disk, the HTTP server redirects to the Foncia URL.
 func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string, downloadAGDocs bool) error {
 	// Unauthenticated client just used for downloading files from AWS.
-	downloadClient := &http.Client{}
+	downloadClient := &http.Client{Timeout: 5 * time.Minute}
 	api.EnableDebugCurlLogs(downloadClient)
 
 	// The general assembly documents (convocations, procès-verbaux, and the
@@ -373,7 +382,7 @@ func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB 
 
 	var docsLive []db.AccountDocumentDB
 	for _, portalCategory := range portalCategories {
-		accountDocumentsLive, err := api.GetAccountDocuments(client, graphqlURL, uuid, portalCategory)
+		accountDocumentsLive, err := api.GetAccountDocuments(ctx, client, graphqlURL, uuid, portalCategory)
 		if err != nil {
 			return fmt.Errorf("while getting the %q account documents: %v", portalCategory, err)
 		}
@@ -419,7 +428,7 @@ func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB 
 			continue
 		}
 
-		filename, fileURL, err := api.GetDocumentURL(client, graphqlURL, doc.HashFile)
+		filename, fileURL, err := api.GetDocumentURL(ctx, client, graphqlURL, doc.HashFile)
 		if err != nil {
 			return fmt.Errorf("while getting document URL: %v", err)
 		}
@@ -429,7 +438,7 @@ func syncAccountDocumentsWithDB(ctx context.Context, client *http.Client, sqlDB 
 			continue
 		}
 
-		err = api.Download(downloadClient, fileURL, doc.FilePath)
+		err = api.Download(ctx, downloadClient, fileURL, doc.FilePath)
 		if err != nil {
 			return fmt.Errorf("while downloading document: %v", err)
 		}
