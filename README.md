@@ -176,14 +176,26 @@ make lint      # staticcheck
 
 The same four run in CI on every push, see `.github/workflows/ci.yml`.
 
-The database is a cache of Foncia's API: it can be deleted and re-synced from
-scratch at any time, which is why there is no migration machinery. The schema
-lives in `db/schema.sql`, is embedded in the binary, and is applied every time
-the database is opened. `db.Open` is the only supported way to open it; it sets
-the pragmas the code depends on, in particular `foreign_keys=ON` (foreign keys
-are declared in the schema but SQLite ignores them unless asked) and
-`busy_timeout`, since the web handlers and the sync goroutine write
-concurrently.
+**The database is not a cache and must never be recreated.** It looks like one,
+but Foncia's API drops items over time, and once it does this database is the
+only remaining record of them. Those older items still have to show up in the
+UI, so every schema change ships as a migration that transforms the existing
+file in place and preserves every row.
+
+Migrations live in `db/migrations/`, are embedded in the binary, and are applied
+by `db.Open`, which is the only supported way to open the database. They are
+numbered and tracked with SQLite's `user_version`, so each one runs exactly
+once. `CREATE TABLE IF NOT EXISTS` on its own is not a schema strategy here: on
+an existing database it silently does nothing, so new columns never appear and
+the queries that reference them fail at runtime.
+
+`db.Open` also sets the pragmas the code depends on, in particular
+`foreign_keys=ON` (foreign keys are declared in the schema but SQLite ignores
+them unless asked) and `busy_timeout`, since the web handlers and the sync
+goroutine write concurrently.
+
+To add a schema change, add the next numbered migration; never edit one that has
+already been applied in production.
 
 The HTML lives in `templates/` and is embedded with `go:embed` rather than
 being held in Go string literals.

@@ -72,7 +72,7 @@ func TestOpen(t *testing.T) {
 		require.NoError(t, err)
 		defer sqlDB.Close()
 
-		require.NoError(t, ApplySchema(t.Context(), sqlDB), "the schema must be idempotent")
+		require.NoError(t, Migrate(t.Context(), sqlDB), "the migrations must be idempotent")
 	})
 }
 

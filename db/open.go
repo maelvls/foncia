@@ -3,34 +3,19 @@ package db
 import (
 	"context"
 	"database/sql"
-	_ "embed"
 	"fmt"
 	"strings"
 
 	_ "github.com/glebarez/go-sqlite"
 )
 
-//go:embed schema.sql
-var schemaSQL string
-
-// Schema returns the SQL schema that Open applies to the database. Exposed
-// mostly for tests and for debugging.
-func Schema() string {
-	return schemaSQL
-}
-
-// ApplySchema creates the tables and indexes if they don't exist yet. It is
-// idempotent. Open calls it for you; you only need it if you opened the
-// database yourself.
-func ApplySchema(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
-		return fmt.Errorf("while applying the schema: %w", err)
-	}
-	return nil
-}
-
 // Open opens (and creates if needed) the SQLite database at the given path and
-// applies the schema.
+// migrates it to the latest schema version.
+//
+// The schema is not applied from a single schema.sql file any more: the
+// database is the only surviving record of the missions and expenses that
+// Foncia's API has since dropped, so it is migrated in place, never recreated.
+// db/migrations/ is the source of truth for the schema; see migrate.go.
 //
 // The path may be:
 //
@@ -45,8 +30,9 @@ func ApplySchema(ctx context.Context, db *sql.DB) error {
 //	                    concurrently; without this, SQLite returns
 //	                    "database is locked" immediately.
 //	journal_mode(WAL)   readers don't block the writer.
-//	foreign_keys(1)     foreign keys are declared in schema.sql but SQLite
-//	                    ignores them unless this is turned on.
+//	foreign_keys(1)     foreign keys are declared in the migrations but SQLite
+//	                    ignores them unless this is turned on. Migrate turns
+//	                    them off on its own connection while it rebuilds tables.
 //
 // The returned *sql.DB must be closed by the caller.
 func Open(path string) (*sql.DB, error) {
@@ -69,7 +55,7 @@ func Open(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("while connecting to the database %q: %w", path, err)
 	}
 
-	if err := ApplySchema(context.Background(), sqlDB); err != nil {
+	if err := Migrate(context.Background(), sqlDB); err != nil {
 		sqlDB.Close()
 		return nil, fmt.Errorf("database %q: %w", path, err)
 	}
