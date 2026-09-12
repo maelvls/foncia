@@ -407,15 +407,17 @@ func TestGetCouncilCoowners_followsTheCursor(t *testing.T) {
 	assert.Equal(t, []int{34}, coowners[1].Units)
 }
 
-// The `amount` union ("Debit" or "Credit") is decoded through an embedded
-// struct, and a credit must come out negative.
-func TestGetBuildingAccountingCurrent_creditsAreNegative(t *testing.T) {
-	const body = `{"data":{"coownerAccount":{"trusteeCouncil":{"accountingCurrent":{"allocations":[
+// The RGDD query is the one source of accounting expenses: it carries Foncia's
+// own id for every line, and credits come back already negative in
+// `toAllocate` (unlike the old getBuildingAccountingCurrent query, which had a
+// Debit/Credit union and no id at all).
+func TestGetBuildingAccountingRGDD(t *testing.T) {
+	const body = `{"data":{"coownerAccount":{"trusteeCouncil":{"pastAccountingRGDD":{"allocations":[
 	  {"name":"CHARGES GENERALES","expenseTypes":[{"name":"CONTRAT D'ENTRETIEN","expenses":[
-	    {"invoiceId":"inv1","label":"a debit","date":"2024-03-01T00:00:00.000Z","piece":{"hashFile":"h1"},
-	     "amount":{"value":1250,"currency":"EUR","__typename":"Debit"}},
-	    {"invoiceId":"inv2","label":"a credit","date":"","piece":{"hashFile":""},
-	     "amount":{"value":300,"currency":"EUR","__typename":"Credit"}}
+	    {"id":"e1","invoiceId":"inv1","label":"a debit","date":"2024-03-01T00:00:00.000Z","piece":{"hashFile":"h1"},
+	     "toAllocate":{"value":1250,"currency":"EUR"}},
+	    {"id":"e2","invoiceId":null,"label":"a credit","date":"","piece":null,
+	     "toAllocate":{"value":-300,"currency":"EUR"}}
 	  ]}]}
 	]}}}}}`
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -423,15 +425,37 @@ func TestGetBuildingAccountingCurrent_creditsAreNegative(t *testing.T) {
 	}))
 	t.Cleanup(s.Close)
 
-	expenses, err := GetBuildingAccountingCurrent(context.Background(), s.Client(), s.URL, "account-uuid")
+	expenses, err := GetBuildingAccountingRGDD(context.Background(), s.Client(), s.URL, "account-uuid", "period-1")
 	require.NoError(t, err)
 	require.Len(t, expenses, 2)
+	assert.Equal(t, "e1", expenses[0].ID)
+	assert.Equal(t, "e2", expenses[1].ID)
 	assert.EqualValues(t, 1250, expenses[0].Amount)
 	assert.EqualValues(t, -300, expenses[1].Amount)
 	assert.Equal(t, "CHARGES GENERALES", expenses[0].AccountingAllocation)
 	assert.Equal(t, "CONTRAT D'ENTRETIEN", expenses[0].AccountingExpenseType)
 	assert.Equal(t, "2024-03-01T00:00:00Z", expenses[0].Date.UTC().Format(time.RFC3339))
 	assert.True(t, expenses[1].Date.IsZero(), "an empty date is not an error")
+	assert.Empty(t, expenses[1].HashFile, "a null piece is not an error")
+}
+
+// The expense id is the primary key of the expenses table: an expense without
+// one must fail the sync rather than land in the database as "".
+func TestGetBuildingAccountingRGDD_missingIDIsAnError(t *testing.T) {
+	const body = `{"data":{"coownerAccount":{"trusteeCouncil":{"pastAccountingRGDD":{"allocations":[
+	  {"name":"CHARGES GENERALES","expenseTypes":[{"name":"CONTRAT D'ENTRETIEN","expenses":[
+	    {"invoiceId":"inv1","label":"no id","date":"2024-03-01T00:00:00.000Z","piece":{"hashFile":"h1"},
+	     "toAllocate":{"value":1250,"currency":"EUR"}}
+	  ]}]}
+	]}}}}}`
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(s.Close)
+
+	_, err := GetBuildingAccountingRGDD(context.Background(), s.Client(), s.URL, "account-uuid", "period-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has no id")
 }
 
 func TestGetAccountUUID(t *testing.T) {

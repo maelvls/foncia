@@ -48,6 +48,7 @@ func ExtractSuppliersFromContracts(contracts []api.SupplierContractAPI) []db.Sup
 // manually afterwards.
 func ExpenseDocumentAPIToDB(e api.ExpenseDocumentAPI, src db.Source) db.ExpenseDocumentDB {
 	return db.ExpenseDocumentDB{
+		ID:        e.ID,
 		Label:     e.Label,
 		Date:      e.Date,
 		Amount:    e.Amount,

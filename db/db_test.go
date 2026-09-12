@@ -232,111 +232,6 @@ func TestUpsertAccountDocumentsWithDB(t *testing.T) {
 	assert.Empty(t, none)
 }
 
-func TestUpsertExpensesWithDB(t *testing.T) {
-	ctx := context.Background()
-	date := time.Date(2024, 6, 30, 22, 0, 0, 0, time.UTC)
-
-	expense := ExpenseDocumentDB{
-		Label: "ELECO", Amount: 79200, Date: date, Source: SourceAccounting,
-		AccountingKey: AccountingKey{Allocation: "CHARGES UNITAIRES C", ExpenseType: "CONTRAT EXTRACTEURS"},
-	}
-
-	t.Run("no expenses is a no-op", func(t *testing.T) {
-		sqlDB := openTest(t)
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB))
-	})
-
-	t.Run("syncing the same expense twice is idempotent", func(t *testing.T) {
-		sqlDB := openTest(t)
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, expense))
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, expense))
-
-		got, err := GetExpensesDB(ctx, sqlDB)
-		require.NoError(t, err)
-		require.Len(t, got, 1)
-		assert.Equal(t, expense, got[0])
-	})
-
-	t.Run("the hash file showing up on a later sync updates the row", func(t *testing.T) {
-		sqlDB := openTest(t)
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, expense))
-
-		withHash := expense
-		withHash.HashFile = "66dafe199f013b45ee991c96"
-		withHash.InvoiceID = "6615521aac44b7c09440aeaa"
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, withHash))
-
-		got, err := GetExpensesDB(ctx, sqlDB)
-		require.NoError(t, err)
-		require.Len(t, got, 1, "the expense must be updated, not inserted a second time")
-		assert.Equal(t, withHash, got[0])
-
-		// And syncing it again with the hash file must stay idempotent.
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, withHash))
-		got, err = GetExpensesDB(ctx, sqlDB)
-		require.NoError(t, err)
-		require.Len(t, got, 1)
-
-		byHash, err := GetExpensesByHashFileDB(ctx, sqlDB, string(withHash.HashFile))
-		require.NoError(t, err)
-		assert.Equal(t, []ExpenseDocumentDB{withHash}, byHash)
-
-		byInvoice, err := GetExpensesByInvoiceID(ctx, sqlDB, withHash.InvoiceID)
-		require.NoError(t, err)
-		assert.Equal(t, []ExpenseDocumentDB{withHash}, byInvoice)
-	})
-
-	t.Run("two expenses that only differ by their hash file are kept apart", func(t *testing.T) {
-		sqlDB := openTest(t)
-		a, b := expense, expense
-		a.HashFile = "66dafe199f013b45ee991c96"
-		b.HashFile = "66e2b7bd424b4b0f0ab3954b"
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, a, b))
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, a, b))
-
-		got, err := GetExpensesDB(ctx, sqlDB)
-		require.NoError(t, err)
-		assert.Len(t, got, 2)
-	})
-
-	t.Run("the same expense in two allocations is kept apart", func(t *testing.T) {
-		sqlDB := openTest(t)
-		a, b := expense, expense
-		b.AccountingKey.Allocation = "CHARGES UNITAIRES D"
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, a, b))
-
-		got, err := GetExpensesDB(ctx, sqlDB)
-		require.NoError(t, err)
-		assert.Len(t, got, 2)
-	})
-
-	t.Run("the file path is persisted", func(t *testing.T) {
-		sqlDB := openTest(t)
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, expense))
-
-		downloaded := expense
-		downloaded.FilePath = "invoices/ELECO.pdf"
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, downloaded))
-
-		got, err := GetExpensesDB(ctx, sqlDB)
-		require.NoError(t, err)
-		require.Len(t, got, 1)
-		assert.Equal(t, "invoices/ELECO.pdf", got[0].FilePath)
-		assert.Equal(t, "ELECO.pdf", got[0].Filename())
-	})
-
-	t.Run("an empty source and an empty hash file scan back without a NULL error", func(t *testing.T) {
-		sqlDB := openTest(t)
-		bare := ExpenseDocumentDB{Label: "RELIQUAT DE REPARTITION", Amount: 2, Date: date}
-		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, bare))
-
-		got, err := GetExpensesDB(ctx, sqlDB)
-		require.NoError(t, err)
-		require.Len(t, got, 1)
-		assert.Equal(t, bare, got[0])
-	})
-}
-
 func TestIsEmptyDB(t *testing.T) {
 	ctx := context.Background()
 	sqlDB := openTest(t)
@@ -345,7 +240,7 @@ func TestIsEmptyDB(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, empty)
 
-	require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, ExpenseDocumentDB{Label: "x", Date: time.Unix(0, 0).UTC()}))
+	require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, ExpenseDocumentDB{ID: "x", Label: "x", Date: time.Unix(0, 0).UTC()}))
 	empty, err = IsEmptyDB(ctx, sqlDB)
 	require.NoError(t, err)
 	assert.False(t, empty)
@@ -429,55 +324,6 @@ func TestMergeExpense(t *testing.T) {
 	assert.True(t, newFromAPI.Equal(merged), "Equal ignores the file path")
 }
 
-func TestExpenseDocumentsIndex_Match(t *testing.T) {
-	date := time.Date(2024, 6, 30, 0, 0, 0, 0, time.UTC)
-	key := AccountingKey{Allocation: "CHARGES UNITAIRES C", ExpenseType: "CONTRAT EXTRACTEURS"}
-
-	noHash := ExpenseDocumentDB{Label: "RELIQUAT", Amount: 2, Date: date, AccountingKey: key, FilePath: "reliquat.pdf"}
-	hashA := ExpenseDocumentDB{Label: "ELECO", Amount: 79200, Date: date, AccountingKey: key, HashFile: "hA", FilePath: "a.pdf"}
-	hashB := ExpenseDocumentDB{Label: "ELECO", Amount: 79200, Date: date, AccountingKey: key, HashFile: "hB", FilePath: "b.pdf"}
-
-	idx := NewExpenseDocumentsIndex([]ExpenseDocumentDB{noHash, hashA, hashB})
-
-	t.Run("matches on the hash file when there is one", func(t *testing.T) {
-		got, ok := idx.Match(ExpenseDocumentDB{Label: "ELECO", Amount: 79200, Date: date, AccountingKey: key, HashFile: "hB"})
-		require.True(t, ok)
-		assert.Equal(t, hashB, got)
-	})
-
-	t.Run("matches on (label, date, amount, key) when there is no hash file", func(t *testing.T) {
-		got, ok := idx.Match(ExpenseDocumentDB{Label: "RELIQUAT", Amount: 2, Date: date, AccountingKey: key})
-		require.True(t, ok)
-		assert.Equal(t, noHash, got)
-	})
-
-	t.Run("an expense whose hash file just appeared falls back to the tuple", func(t *testing.T) {
-		got, ok := idx.Match(ExpenseDocumentDB{Label: "RELIQUAT", Amount: 2, Date: date, AccountingKey: key, HashFile: "brand-new"})
-		require.True(t, ok)
-		assert.Equal(t, noHash, got, "must find the row that has no hash file yet")
-	})
-
-	t.Run("the allocation is part of the key", func(t *testing.T) {
-		_, ok := idx.Match(ExpenseDocumentDB{
-			Label: "RELIQUAT", Amount: 2, Date: date,
-			AccountingKey: AccountingKey{Allocation: "CHARGES UNITAIRES D", ExpenseType: "CONTRAT EXTRACTEURS"},
-		})
-		assert.False(t, ok)
-	})
-
-	t.Run("no match", func(t *testing.T) {
-		_, ok := idx.Match(ExpenseDocumentDB{Label: "INCONNU", Amount: 1, Date: date, AccountingKey: key})
-		assert.False(t, ok)
-	})
-
-	t.Run("the time zone does not change the match", func(t *testing.T) {
-		paris := time.FixedZone("CEST", 2*60*60)
-		got, ok := idx.Match(ExpenseDocumentDB{Label: "RELIQUAT", Amount: 2, Date: date.In(paris), AccountingKey: key})
-		require.True(t, ok)
-		assert.Equal(t, noHash, got)
-	})
-}
-
 func TestForeignKeysAreEnforced(t *testing.T) {
 	ctx := context.Background()
 	sqlDB := openTest(t)
@@ -486,4 +332,227 @@ func TestForeignKeysAreEnforced(t *testing.T) {
 		ID: "wo-1", MissionID: "does-not-exist", RepairDateStart: time.Unix(0, 0).UTC(), RepairDateEnd: time.Unix(0, 0).UTC(),
 	}})
 	assert.Error(t, err, "work_orders.mission_id references missions(id)")
+}
+func TestUpsertExpensesWithDB(t *testing.T) {
+	ctx := context.Background()
+	date := time.Date(2024, 6, 30, 22, 0, 0, 0, time.UTC)
+
+	expense := ExpenseDocumentDB{
+		ID:    "66dafe19a1b2c3d4e5f60718",
+		Label: "ELECO", Amount: 79200, Date: date, Source: SourceAccounting,
+		AccountingKey: AccountingKey{Allocation: "CHARGES UNITAIRES C", ExpenseType: "CONTRAT EXTRACTEURS"},
+	}
+
+	t.Run("no expenses is a no-op", func(t *testing.T) {
+		sqlDB := openTest(t)
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB))
+	})
+
+	t.Run("an expense without an id is refused", func(t *testing.T) {
+		sqlDB := openTest(t)
+		noID := expense
+		noID.ID = ""
+		err := UpsertExpensesWithDB(ctx, sqlDB, noID)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "has no id")
+	})
+
+	t.Run("syncing the same expense twice is idempotent", func(t *testing.T) {
+		sqlDB := openTest(t)
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, expense))
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, expense))
+
+		got, err := GetExpensesDB(ctx, sqlDB)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, expense, got[0])
+	})
+
+	t.Run("every field but the id is updated in place", func(t *testing.T) {
+		// Foncia relabels, re-dates and reallocates lines after the fact; the
+		// id is what ties the versions together.
+		sqlDB := openTest(t)
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, expense))
+
+		changed := expense
+		changed.Label = "ELECO - CONTRAT EXTRACTEURS 2024"
+		changed.Date = date.Add(24 * time.Hour)
+		changed.Amount = 79300
+		changed.AccountingKey.Allocation = "CHARGES UNITAIRES D"
+		changed.AccountingKey.ExpenseType = "TRAVAUX ENTRETIEN"
+		changed.Source = SourceRepairs
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, changed))
+
+		got, err := GetExpensesDB(ctx, sqlDB)
+		require.NoError(t, err)
+		require.Len(t, got, 1, "the expense must be updated, not inserted a second time")
+		assert.Equal(t, changed, got[0])
+	})
+
+	t.Run("the hash file showing up on a later sync updates the row", func(t *testing.T) {
+		sqlDB := openTest(t)
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, expense))
+
+		withHash := expense
+		withHash.HashFile = "66dafe199f013b45ee991c96"
+		withHash.InvoiceID = "6615521aac44b7c09440aeaa"
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, withHash))
+
+		got, err := GetExpensesDB(ctx, sqlDB)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, withHash, got[0])
+
+		byHash, err := GetExpensesByHashFileDB(ctx, sqlDB, string(withHash.HashFile))
+		require.NoError(t, err)
+		assert.Equal(t, []ExpenseDocumentDB{withHash}, byHash)
+
+		byInvoice, err := GetExpensesByInvoiceID(ctx, sqlDB, withHash.InvoiceID)
+		require.NoError(t, err)
+		assert.Equal(t, []ExpenseDocumentDB{withHash}, byInvoice)
+	})
+
+	t.Run("an invoice split across two allocations is two lines with two ids", func(t *testing.T) {
+		sqlDB := openTest(t)
+		a, b := expense, expense
+		a.HashFile, b.HashFile = "6615521a0ee3bdcd450363fa", "6615521a0ee3bdcd450363fa"
+		a.InvoiceID, b.InvoiceID = "6615521aac44b7c09440aeaa", "6615521aac44b7c09440aeaa"
+		b.ID = "64850e80f7df27ce148231fc"
+		b.AccountingKey.Allocation = "CHARGES UNITAIRES D"
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, a, b))
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, a, b))
+
+		got, err := GetExpensesDB(ctx, sqlDB)
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+
+		byHash, err := GetExpensesByHashFileDB(ctx, sqlDB, string(a.HashFile))
+		require.NoError(t, err)
+		assert.Len(t, byHash, 2, "both lines share the PDF")
+	})
+
+	t.Run("the file path is persisted", func(t *testing.T) {
+		sqlDB := openTest(t)
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, expense))
+
+		downloaded := expense
+		downloaded.FilePath = "invoices/ELECO.pdf"
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, downloaded))
+
+		got, err := GetExpensesDB(ctx, sqlDB)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "invoices/ELECO.pdf", got[0].FilePath)
+		assert.Equal(t, "ELECO.pdf", got[0].Filename())
+	})
+
+	t.Run("an empty source and an empty hash file scan back without a NULL error", func(t *testing.T) {
+		sqlDB := openTest(t)
+		bare := ExpenseDocumentDB{ID: "6aa37115444a8644bdf6434d", Label: "RELIQUAT DE REPARTITION", Amount: 2, Date: date}
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, bare))
+
+		got, err := GetExpensesDB(ctx, sqlDB)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, bare, got[0])
+	})
+}
+
+func TestLegacyExpenseID(t *testing.T) {
+	date := time.Date(2024, 6, 30, 0, 0, 0, 0, time.UTC)
+	key := AccountingKey{Allocation: "CHARGES UNITAIRES C", ExpenseType: "CONTRAT EXTRACTEURS"}
+	e := ExpenseDocumentDB{Label: "ELECO", Amount: 79200, Date: date, AccountingKey: key, HashFile: "hA"}
+
+	t.Run("is a 64-character hex string, unlike a 24-character Foncia id", func(t *testing.T) {
+		assert.Len(t, LegacyExpenseID(e), 64)
+	})
+
+	t.Run("ignores the id and the file path", func(t *testing.T) {
+		other := e
+		other.ID = "whatever"
+		other.FilePath = "a.pdf"
+		assert.Equal(t, LegacyExpenseID(e), LegacyExpenseID(other))
+	})
+
+	t.Run("depends on the hash file", func(t *testing.T) {
+		other := e
+		other.HashFile = "hB"
+		assert.NotEqual(t, LegacyExpenseID(e), LegacyExpenseID(other))
+	})
+
+	t.Run("depends on the allocation", func(t *testing.T) {
+		other := e
+		other.AccountingKey.Allocation = "CHARGES UNITAIRES D"
+		assert.NotEqual(t, LegacyExpenseID(e), LegacyExpenseID(other))
+	})
+
+	t.Run("the time zone does not change it", func(t *testing.T) {
+		paris := time.FixedZone("CEST", 2*60*60)
+		other := e
+		other.Date = date.In(paris)
+		assert.Equal(t, LegacyExpenseID(e), LegacyExpenseID(other))
+	})
+
+	t.Run("LegacyExpenseIDs also gives the id derived without the hash file", func(t *testing.T) {
+		withoutHash := e
+		withoutHash.HashFile = ""
+		assert.Equal(t, []string{LegacyExpenseID(e), LegacyExpenseID(withoutHash)}, LegacyExpenseIDs(e))
+		assert.Equal(t, []string{LegacyExpenseID(withoutHash)}, LegacyExpenseIDs(withoutHash), "no hash file, no second candidate")
+	})
+}
+
+func TestRekeyExpense(t *testing.T) {
+	ctx := context.Background()
+	date := time.Date(2024, 6, 30, 0, 0, 0, 0, time.UTC)
+	legacy := ExpenseDocumentDB{
+		Label: "ELECO", Amount: 79200, Date: date, Source: SourceAccounting, FilePath: "invoices/ELECO.pdf",
+		AccountingKey: AccountingKey{Allocation: "CHARGES UNITAIRES C", ExpenseType: "CONTRAT EXTRACTEURS"},
+	}
+	legacy.ID = LegacyExpenseID(legacy)
+
+	t.Run("gives the row its new id and keeps everything else", func(t *testing.T) {
+		sqlDB := openTest(t)
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, legacy))
+
+		rekeyed, err := RekeyExpense(ctx, sqlDB, legacy.ID, "66dafe19a1b2c3d4e5f60718")
+		require.NoError(t, err)
+		assert.True(t, rekeyed)
+
+		got, err := GetExpensesDB(ctx, sqlDB)
+		require.NoError(t, err)
+		want := legacy
+		want.ID = "66dafe19a1b2c3d4e5f60718"
+		assert.Equal(t, []ExpenseDocumentDB{want}, got)
+	})
+
+	t.Run("no row with the old id is not an error", func(t *testing.T) {
+		sqlDB := openTest(t)
+		rekeyed, err := RekeyExpense(ctx, sqlDB, legacy.ID, "66dafe19a1b2c3d4e5f60718")
+		require.NoError(t, err)
+		assert.False(t, rekeyed)
+	})
+
+	t.Run("a row that already has the new id is left alone, and so is the legacy row", func(t *testing.T) {
+		sqlDB := openTest(t)
+		fresh := legacy
+		fresh.ID = "66dafe19a1b2c3d4e5f60718"
+		fresh.FilePath = ""
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, legacy, fresh))
+
+		rekeyed, err := RekeyExpense(ctx, sqlDB, legacy.ID, fresh.ID)
+		require.NoError(t, err)
+		assert.False(t, rekeyed)
+
+		got, err := GetExpensesDB(ctx, sqlDB)
+		require.NoError(t, err)
+		assert.Len(t, got, 2, "neither row may be lost")
+	})
+
+	t.Run("empty ids are refused", func(t *testing.T) {
+		sqlDB := openTest(t)
+		_, err := RekeyExpense(ctx, sqlDB, "", "x")
+		require.Error(t, err)
+		_, err = RekeyExpense(ctx, sqlDB, "x", "")
+		require.Error(t, err)
+	})
 }

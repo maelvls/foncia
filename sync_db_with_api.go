@@ -97,6 +97,14 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql
 }
 
 // Returns new expenses.
+//
+// The expenses come from two places: the building's accounts, one accounting
+// period at a time through getBuildingAccountingRGDD (including the open
+// periods: the "current" accounts are just the union of the two open periods),
+// and the "comptes travaux" through getRepairBudgetDetails. Both give every line
+// Foncia's own id, which is the primary key of the expenses table, so a line
+// that Foncia relabels, re-dates or reallocates is updated in place rather than
+// stored a second time.
 func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid, invoicesDir string) ([]db.ExpenseDocumentDB, error) {
 	// Unauthenticated client just used for downloading files from AWS.
 	downloadClient := &http.Client{Timeout: 5 * time.Minute}
@@ -111,13 +119,6 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	// For now, the fetched expenses won't contain the FilePath field. It will
 	// be set later on.
 	var expensesLive []db.ExpenseDocumentDB
-	expensesFromAPI, err := api.GetBuildingAccountingCurrent(ctx, client, graphqlURL, uuid)
-	if err != nil {
-		return nil, fmt.Errorf("while getting expenses: %v", err)
-	}
-	for _, e := range expensesFromAPI {
-		expensesLive = append(expensesLive, ExpenseDocumentAPIToDB(e, db.SourceAccounting))
-	}
 	periods, err := api.GetAccountingPeriods(ctx, client, graphqlURL, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("while getting accounting periods: %v", err)
@@ -146,16 +147,54 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		}
 	}
 
-	// Let's remove duplicates. This is because the last period returned by
-	// GetBuildingAccountingRGDD overlaps with the contents of
-	// GetBuildingAccountingCurrent.
-	expensesLive = deduplicate(&expensesLive)
+	// The accounting periods don't overlap, and the API layer refuses an
+	// expense without an id, so this is only a safety net: should the same id
+	// ever be returned twice, the second copy is dropped rather than counted
+	// as new twice.
+	expensesLive = deduplicateByID(expensesLive)
 
 	expensesInDB, err := db.GetExpensesDB(ctx, sqlDB)
 	if err != nil {
 		return nil, fmt.Errorf("while getting existing expenses: %v", err)
 	}
-	expensesInDBIndex := db.NewExpenseDocumentsIndex(expensesInDB)
+	expensesInDBByID := make(map[string]db.ExpenseDocumentDB, len(expensesInDB))
+	for _, e := range expensesInDB {
+		expensesInDBByID[e.ID] = e
+	}
+
+	// Rows written before Foncia's id was used carry a legacy id derived from
+	// their contents. The first time such a row is seen again with its Foncia
+	// id, it is re-keyed so that the upsert below updates it instead of
+	// inserting a second copy. Once every row Foncia still returns has been
+	// re-keyed, this loop never re-keys anything again; the rows that Foncia
+	// no longer returns keep their legacy id.
+	for i := range expensesLive {
+		e := &expensesLive[i]
+		if _, found := expensesInDBByID[e.ID]; found {
+			continue
+		}
+		for _, legacyID := range db.LegacyExpenseIDs(*e) {
+			eDB, found := expensesInDBByID[legacyID]
+			if !found {
+				continue
+			}
+			rekeyed, err := db.RekeyExpense(ctx, sqlDB, legacyID, e.ID)
+			if err != nil {
+				return nil, err
+			}
+			if !rekeyed {
+				// Can only happen when a row already has the new id, which
+				// the map lookup above rules out; log it rather than guess.
+				logutil.Errorf("expense %q (%s) could not be re-keyed from %s to %s", e.Label, e.Date.Format(time.RFC3339), legacyID, e.ID)
+				continue
+			}
+			logutil.Infof("expense %q (%s) re-keyed from legacy id %s to Foncia id %s", e.Label, e.Date.Format(time.RFC3339), legacyID, e.ID)
+			eDB.ID = e.ID
+			delete(expensesInDBByID, legacyID)
+			expensesInDBByID[e.ID] = eDB
+			break
+		}
+	}
 
 	var newExpensesDB []db.ExpenseDocumentDB
 	// Save the invoice PDFs to disk. By "live", I mean that it's the expenses
@@ -164,7 +203,7 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		for i := range liveExpenses {
 			e := &liveExpenses[i]
 
-			if eDB, found := expensesInDBIndex.Match(*e); found {
+			if eDB, found := expensesInDBByID[e.ID]; found {
 				*e = db.Merge(eDB, *e)
 			}
 
@@ -218,32 +257,28 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 			}
 		}
 
-		var newExpenses, changedExpences []db.ExpenseDocumentDB
+		var newExpenses, changedExpenses []db.ExpenseDocumentDB
 		for _, expLive := range liveExpenses {
-			expDB, found := expensesInDBIndex.Match(expLive)
+			expDB, found := expensesInDBByID[expLive.ID]
 			if !found {
 				logutil.Debugf("found new expense %s (%s)", expLive.Label, expLive.Date)
 				newExpenses = append(newExpenses, expLive)
 				continue
 			}
 
-			// Many expenses don't have a PDF attached (= no HashFile) for a
-			// couple of weeks. That's why we want to update the HashFile if we
-			// found that it has changed.
-			//
-			// Due to a change in date formats in DB (from RFC3339 to
-			// RFC3339Nano), the date may also change as long as the HashFile is
-			// present.
-			//
-			// The Invoice ID may also change if it is set on the live API.
+			// Anything but the id can change: many expenses don't have a PDF
+			// attached (= no HashFile) for a couple of weeks, and Foncia
+			// sometimes relabels or re-dates a line after the fact. The row is
+			// updated in place, and the change is logged so that it can be
+			// traced back.
 			if !expDB.Equal(expLive) {
 				diff := cmp.Diff(expDB, expLive)
-				logutil.Debugf("found changed expense %q: %s, diff: %s", expLive.Date, expLive.Label, diff)
-				changedExpences = append(changedExpences, expLive)
+				logutil.Infof("expense %s changed (%q, %s): %s", expLive.ID, expLive.Label, expLive.Date.Format(time.RFC3339), diff)
+				changedExpenses = append(changedExpenses, expLive)
 			}
 		}
 
-		newOrChanged := append(newExpenses, changedExpences...)
+		newOrChanged := append(newExpenses, changedExpenses...)
 		err = db.UpsertExpensesWithDB(ctx, sqlDB, newOrChanged...)
 		if err != nil {
 			return fmt.Errorf("while saving expenses: %v", err)
@@ -262,14 +297,16 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 	return newExpensesDB, nil
 }
 
-func deduplicate(expenses *[]db.ExpenseDocumentDB) []db.ExpenseDocumentDB {
-	seen := make(map[db.ExpenseDocumentDB]struct{})
-	var deduped []db.ExpenseDocumentDB
-	for _, e := range *expenses {
-		if _, found := seen[e]; found {
+// deduplicateByID keeps the first expense of each id, preserving the order.
+func deduplicateByID(expenses []db.ExpenseDocumentDB) []db.ExpenseDocumentDB {
+	seen := make(map[string]struct{}, len(expenses))
+	deduped := make([]db.ExpenseDocumentDB, 0, len(expenses))
+	for _, e := range expenses {
+		if _, found := seen[e.ID]; found {
+			logutil.Errorf("expense %s (%q, %s) was returned twice by the API, keeping the first one", e.ID, e.Label, e.Date.Format(time.RFC3339))
 			continue
 		}
-		seen[e] = struct{}{}
+		seen[e.ID] = struct{}{}
 		deduped = append(deduped, e)
 	}
 	return deduped
@@ -493,33 +530,4 @@ func DoInBatches[T any](batchSize int, elmts []T, do func([]T) error) error {
 	}
 
 	return nil
-}
-
-// The `Expenses` table is a bit special because it doesn't have a unique ID I
-// can use. Some items have an `hashFile` that can be used as a unique ID, so we
-// first use this. If the `hashFile` is empty, we use the rest of the fields to
-// (date, amount, label) to identify the expense.
-type Indexer[T any] struct {
-	Index map[string]T
-}
-
-func NewIndexer[T any](elmts []T, key func(T) string) Indexer[T] {
-	index := make(map[string]T)
-	for _, e := range elmts {
-		index[key(e)] = e
-	}
-	return Indexer[T]{Index: index}
-}
-
-func (i Indexer[T]) Get(key string) (T, bool) {
-	e, found := i.Index[key]
-	return e, found
-}
-
-func (i Indexer[T]) Keys() []string {
-	var keys []string
-	for k := range i.Index {
-		keys = append(keys, k)
-	}
-	return keys
 }

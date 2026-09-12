@@ -278,7 +278,7 @@ func TestMigrateProductionDatabase(t *testing.T) {
 	})
 
 	// This is the test that matters most. The backfilled expenses.id has to be
-	// byte-for-byte what expenseID computes, or the next sync inserts a second
+	// byte-for-byte what LegacyExpenseID computes, or the next sync inserts a second
 	// copy of all 2021 expenses instead of updating them.
 	t.Run("re-upserting the migrated expenses does not duplicate them", func(t *testing.T) {
 		before, err := GetExpensesDB(ctx, sqlDB)
@@ -290,7 +290,7 @@ func TestMigrateProductionDatabase(t *testing.T) {
 		after, err := GetExpensesDB(ctx, sqlDB)
 		require.NoError(t, err)
 		assert.Len(t, after, prodRowCounts["expenses"],
-			"the ids derived by the migration must match expenseID")
+			"the ids derived by the migration must match LegacyExpenseID")
 	})
 }
 
@@ -299,7 +299,7 @@ func TestMigratedExpenseIDMatchesExpenseID(t *testing.T) {
 
 	// Build a database in the *old* shape, insert an expense the way the old
 	// code did (no id column at all), migrate, then upsert the same expense
-	// again. If the backfilled id disagreed with expenseID, we would end up
+	// again. If the backfilled id disagreed with LegacyExpenseID, we would end up
 	// with two rows.
 	path := filepath.Join(t.TempDir(), "old.sqlite")
 	raw, err := sql.Open("sqlite", "file:"+path)
@@ -330,7 +330,7 @@ func TestMigratedExpenseIDMatchesExpenseID(t *testing.T) {
 
 	var id string
 	require.NoError(t, sqlDB.QueryRow("SELECT id FROM expenses;").Scan(&id))
-	assert.Equal(t, expenseID(got[0]), id, "the backfilled id must be what expenseID computes")
+	assert.Equal(t, LegacyExpenseID(got[0]), id, "the backfilled id must be what LegacyExpenseID computes")
 
 	// The next sync sees the same expense again.
 	require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, got[0]))

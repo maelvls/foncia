@@ -90,6 +90,7 @@ func seedExpenseWithFile(t *testing.T, sqlDB *sql.DB, hashFile, invoiceID, filen
 	require.NoError(t, os.WriteFile(filePath, []byte(contents), 0o600))
 
 	err := db.UpsertExpensesWithDB(t.Context(), sqlDB, db.ExpenseDocumentDB{
+		ID:            "66eda634f0a1b2c3d4e5f607",
 		Label:         "SARL SMF SERVICES - CONTRAT MAINTENANCE",
 		Amount:        db.Amount(41049), // 410,49 €
 		Date:          time.Date(2024, 9, 20, 16, 43, 33, 0, time.UTC),
@@ -197,6 +198,7 @@ func TestDLHandler(t *testing.T) {
 		const hash = "66eda6344b41c38804f77fc2"
 		sqlDB := openTestDB(t)
 		err := db.UpsertExpensesWithDB(t.Context(), sqlDB, db.ExpenseDocumentDB{
+			ID:       "66eda634f0a1b2c3d4e5f608",
 			Label:    "EXPENSE WITHOUT A FILE ON DISK",
 			Amount:   db.Amount(1000),
 			Date:     time.Date(2024, 9, 20, 16, 43, 33, 0, time.UTC),

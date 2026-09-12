@@ -1059,11 +1059,21 @@ func GetCouncilMissionSuppliersAPI(ctx context.Context, client *http.Client, gra
 }
 
 type ExpenseDocumentAPI struct {
+	// Foncia's own ID for this expense line, e.g. "6aa37115444a8644bdf6434d".
+	// Always set. It is unique per line: an invoice split across two
+	// allocations shows up as two expenses with two different IDs, even though
+	// they share the same InvoiceID and HashFile. It is stable across calls,
+	// and it is the primary key of the expenses table.
+	//
+	// It is only available through getBuildingAccountingRGDD and
+	// getRepairBudgetDetails. The getBuildingAccountingCurrent query, which
+	// this program used to call, has no `id` field on its expense type; it is
+	// no longer used since its content is exactly the union of the two open
+	// accounting periods, which getBuildingAccountingRGDD serves with IDs.
+	ID string
+
 	// Only set when a document is attached. E.g., "64850e805e5793033297f476".
-	// We use that as an ID for the expense document since we don't have any
-	// other way. Note that the API sometimes returns expense documents that
-	// don't have an invoice ID. If you are using this as an ID, you should skip
-	// those.
+	// Note that the same invoice ID can be shared by several expense lines.
 	InvoiceID string
 	Label     string      // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
 	Amount    db.Amount   // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
@@ -1187,158 +1197,6 @@ func getFilenameFromURL(fileURL string) (string, error) {
 	}, filename)
 
 	return filename, nil
-}
-
-// This query is light and doesn't need to be paginated.
-func GetBuildingAccountingCurrent(ctx context.Context, client *http.Client, graphqlURL, accountUUID string) ([]ExpenseDocumentAPI, error) {
-	const getBuildingAccountingCurrentQuery = `
-		query getBuildingAccountingCurrent($uuid: EncodedID!) {
-		  coownerAccount(uuid: $uuid) {
-		    uuid
-		    trusteeCouncil {
-		      bankBalance {value currency}
-		      accountingCurrent {
-		        id
-		        openingDate
-		        closingDate
-		        previousTotal {value currency}
-		        votedTotal {value currency}
-		        total {value currency}
-		        nextVotedTotal {value currency}
-		        allocations {
-				  id
-				  name
-				  code
-				  previousTotal {value currency}
-				  votedTotal {value currency}
-				  total {value currency}
-				  nextVotedTotal {value currency}
-				  expenseTypes {
-					id
-					allocationId
-					name
-					code
-					previousTotal {value currency}
-					votedTotal {value currency}
-					total {value currency}
-					nextVotedTotal {value currency}
-					expenses {
-					  invoiceId
-					  piece {
-						id
-						hashFile
-						category
-					  }
-					  label
-					  date
-					  amount {
-						... on Debit {
-						  value
-						  currency
-						  __typename
-						}
-						... on Credit {
-						  value
-						  currency
-						  __typename
-						}
-					  }
-					  isFromPreviousPeriod
-					}
-				  }
-		        }
-		      }
-		    }
-		  }
-		}`
-	var getBuildingAccountingCurrentResp struct {
-		CoownerAccount struct {
-			TrusteeCouncil struct {
-				BankBalance       amount `json:"bankBalance"`
-				AccountingCurrent struct {
-					ID             string `json:"id"`
-					OpeningDate    Time   `json:"openingDate"`
-					ClosingDate    Time   `json:"closingDate"`
-					PreviousTotal  amount `json:"previousTotal"`
-					VotedTotal     amount `json:"votedTotal"`
-					Total          amount `json:"total"`
-					NextVotedTotal amount `json:"nextVotedTotal"`
-					Allocations    []struct {
-						ID             string `json:"id"`
-						Name           string `json:"name"`
-						Code           string `json:"code"`
-						PreviousTotal  amount `json:"previousTotal"`
-						VotedTotal     amount `json:"votedTotal"`
-						Total          amount `json:"total"`
-						NextVotedTotal amount `json:"nextVotedTotal"`
-						ExpenseTypes   []struct {
-							AllocationID   string `json:"allocationId"`
-							Name           string `json:"name"`
-							Code           string `json:"code"`
-							PreviousTotal  amount `json:"previousTotal"`
-							VotedTotal     amount `json:"votedTotal"`
-							Total          amount `json:"total"`
-							NextVotedTotal amount `json:"nextVotedTotal"`
-							Expenses       []struct {
-								// For some reason, expenses don't have an ID.
-								// The invoice ID is sometimes empty... but we
-								// use that since we have no other way.
-								InvoiceID string `json:"invoiceId"`
-								Piece     struct {
-									ID       string `json:"id"`
-									HashFile string `json:"hashFile"`
-									Category string `json:"category"`
-								} `json:"piece"`
-								Label string `json:"label"`
-								Date  Time   `json:"date"`
-								// This is a union type, "Debit" or "Credit".
-								Amount struct {
-									amount
-									Typename string `json:"__typename"`
-								} `json:"amount"`
-								IsFromPreviousPeriod bool `json:"isFromPreviousPeriod"`
-							} `json:"expenses"`
-						} `json:"expenseTypes"`
-					} `json:"allocations"`
-				} `json:"accountingCurrent"`
-			} `json:"trusteeCouncil"`
-		} `json:"coownerAccount"`
-	}
-
-	err := DoGraphQL(ctx, client, graphqlURL, getBuildingAccountingCurrentQuery, map[string]any{
-		"uuid": accountUUID,
-	}, &getBuildingAccountingCurrentResp)
-	if err != nil {
-		return nil, fmt.Errorf("error while querying getBuildingAccountingCurrentResp: %w", err)
-	}
-
-	var expenses []ExpenseDocumentAPI
-	for _, allocation := range getBuildingAccountingCurrentResp.CoownerAccount.TrusteeCouncil.AccountingCurrent.Allocations {
-		for _, expenseType := range allocation.ExpenseTypes {
-			for _, expense := range expenseType.Expenses {
-				var value int
-				switch expense.Amount.Typename {
-				case "Credit":
-					value = -expense.Amount.Value
-				case "Debit":
-					value = expense.Amount.Value
-				default:
-					return nil, fmt.Errorf("was expecting typename 'Credit' or 'Debit', but got %q for expense %+v", expense.Amount.Typename, expense)
-				}
-				expenses = append(expenses, ExpenseDocumentAPI{
-					HashFile:              db.HashFile(expense.Piece.HashFile),
-					InvoiceID:             expense.InvoiceID,
-					Label:                 expense.Label,
-					Date:                  expense.Date.Time,
-					Amount:                db.Amount(value),
-					AccountingAllocation:  allocation.Name,
-					AccountingExpenseType: expenseType.Name,
-				})
-			}
-		}
-	}
-
-	return expenses, nil
 }
 
 type AccountingPeriodAPI struct {
@@ -1495,6 +1353,7 @@ func GetBuildingAccountingRGDD(ctx context.Context, client *http.Client, graphql
 							Vat          amount `json:"vat"`
 							Recoverable  amount `json:"recoverable"`
 							Expenses     []struct {
+								ID        string `json:"id"`
 								Label     string `json:"label"`
 								Date      Time   `json:"date"`
 								InvoiceID string `json:"invoiceId"`
@@ -1526,7 +1385,14 @@ func GetBuildingAccountingRGDD(ctx context.Context, client *http.Client, graphql
 	for _, allocation := range getBuildingAccountingRGDDResp.CoownerAccount.TrusteeCouncil.PastAccountingRGDD.Allocations {
 		for _, expenseType := range allocation.ExpenseTypes {
 			for _, expense := range expenseType.Expenses {
+				// The ID is the primary key of the expenses table. An empty
+				// one would make every such expense collide on the empty
+				// string, so it is better to fail the sync loudly.
+				if expense.ID == "" {
+					return nil, fmt.Errorf("expense %q (%s) of accounting period %s has no id", expense.Label, expense.Date.Time, accountingPeriodID)
+				}
 				expenses = append(expenses, ExpenseDocumentAPI{
+					ID:                    expense.ID,
 					InvoiceID:             expense.InvoiceID, // May be empty.
 					HashFile:              db.HashFile(expense.Piece.HashFile),
 					Label:                 expense.Label,
@@ -1799,7 +1665,13 @@ func GetRepairBudgetDetails(ctx context.Context, client *http.Client, graphqlURL
 	for _, allocation := range details.Allocations {
 		for _, expenseType := range allocation.ExpenseTypes {
 			for _, expense := range expenseType.Expenses {
+				// Same reasoning as in GetBuildingAccountingRGDD: the ID is
+				// the primary key, an empty one must not reach the database.
+				if expense.ID == "" {
+					return nil, fmt.Errorf("expense %q (%s) of repair budget %s has no id", expense.Label, expense.Date, budgetID)
+				}
 				expenses = append(expenses, ExpenseDocumentAPI{
+					ID:                    expense.ID,
 					InvoiceID:             expense.InvoiceID, // May be empty.
 					HashFile:              expense.HashFile,
 					Label:                 expense.Label,

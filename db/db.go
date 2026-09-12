@@ -566,9 +566,9 @@ func (a Amount) String() string {
 	return fmt.Sprintf("%s%d,%02d €", sign, a/100, a%100)
 }
 
-// Foncia's API doesn't return an ID for the expenses returned by
-// getBuildingAccountingCurrent, so the `id` column is derived in Go, see
-// expenseID.
+// An expense is one line of the building's accounts, or of a "compte travaux".
+// It is keyed on Foncia's own id for the line (see ID); every other field may
+// change from one sync to the next and is updated in place.
 //
 // Sometimes, the invoice ID and piece.hashFile are empty, but we still want to
 // keep track of the item.
@@ -622,6 +622,17 @@ func (a Amount) String() string {
 // Also, an invoiceID and HashFile may be re-used across multiple items. See
 // AccountingKey for an example.
 type ExpenseDocumentDB struct {
+	// Primary key. Foncia's own id for the expense line, e.g.
+	// "6aa37115444a8644bdf6434d": unique per line (an invoice split across two
+	// allocations is two lines with two ids), stable across calls, and
+	// returned by getBuildingAccountingRGDD and getRepairBudgetDetails.
+	//
+	// Rows written before Foncia's id was used carry a legacy id instead, a
+	// 64-character hash of their contents (see LegacyExpenseID). The sync
+	// re-keys such a row to its Foncia id the first time it sees the expense
+	// again; a row Foncia no longer returns keeps its legacy id forever.
+	ID string
+
 	Label  string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
 	Amount Amount    // Example: 1234567890, which means "1234567,90 €". Negative = credit, positive = debit.
 	Date   time.Time // May not be unique. Example: "2024-07-01T21:59:59.000Z".
@@ -670,9 +681,8 @@ func Merge(oldFromDB, newFromAPI ExpenseDocumentDB) ExpenseDocumentDB {
 
 // Expenses can come from two different sources:
 //
-//	GetBuildingAccountingCurrent: "accounting"
-//	GetBuildingAccountingRGDD:    "accounting"
-//	GetBuildingAccountingRepairs: "repairs"
+//	GetBuildingAccountingRGDD: "accounting" (one call per accounting period)
+//	GetRepairBudgetDetails:    "repairs"    (one call per "compte travaux")
 type Source string
 
 const (
@@ -742,11 +752,10 @@ func (a AccountingKey) String() string {
 	return fmt.Sprintf("%s - %s", a.Allocation, a.ExpenseType)
 }
 
-type ExpenseDocumentID string
-
-// expenseKey is the identifying tuple of an expense, ignoring the hash file.
-// The separator is a NUL byte so that it can't appear in any of the fields.
-func expenseKey(e ExpenseDocumentDB) string {
+// legacyExpenseKey is the tuple that used to identify an expense before Foncia's
+// own id was used, ignoring the hash file. The separator is a NUL byte so that
+// it can't appear in any of the fields. Only LegacyExpenseID needs it.
+func legacyExpenseKey(e ExpenseDocumentDB) string {
 	return strings.Join([]string{
 		e.Label,
 		formatTime(e.Date),
@@ -756,13 +765,21 @@ func expenseKey(e ExpenseDocumentDB) string {
 	}, "\x00")
 }
 
-// expenseID is the deterministic primary key of an expense. Foncia's API
-// doesn't return an ID for the expenses returned by
-// getBuildingAccountingCurrent, so we derive one from (label, date, amount,
-// allocation, expense type, hash file).
+// LegacyExpenseID is the primary key that expenses had before Foncia's own id
+// was used (see ExpenseDocumentDB.ID): a hash of (label, date, amount,
+// allocation, expense type, hash file), derived in Go because the API query in
+// use at the time had no id. Migration 2 backfilled it on every row, so it is
+// still the id of every row that has not been re-keyed since.
 //
-// The hash file is part of the key because two otherwise identical expenses can
-// only be told apart by their hash file, e.g.:
+// It is kept for two reasons: migration 2 must keep deriving exactly the same
+// ids forever, and the sync uses it to recognise a row stored under the old
+// scheme so that it can give it its Foncia id instead of inserting a copy (see
+// RekeyExpense). A row that Foncia no longer returns keeps its legacy id for
+// good; the two kinds are easy to tell apart, a legacy id is 64 hex characters
+// and a Foncia id 24.
+//
+// The hash file is part of it because, before Foncia's id was used, two
+// otherwise identical expenses could only be told apart by their hash file:
 //
 //   - piece: {hashFile: 66dafe199f013b45ee991c96}
 //     label: ELECO
@@ -773,88 +790,33 @@ func expenseKey(e ExpenseDocumentDB) string {
 //     date: "2024-06-30T00:00:00.000Z"
 //     amount: {value: 79200}
 //
-// The hash file may also appear on a later sync for an expense that didn't have
-// one; UpsertExpensesWithDB takes care of that case, see there.
-func expenseID(e ExpenseDocumentDB) string {
-	sum := sha256.Sum256([]byte(expenseKey(e) + "\x00" + string(e.HashFile)))
+// A row stored before its hash file showed up has the id derived WITHOUT the
+// hash file, so a caller looking for the legacy row of an expense that has a
+// hash file must try both, see LegacyExpenseIDs.
+func LegacyExpenseID(e ExpenseDocumentDB) string {
+	sum := sha256.Sum256([]byte(legacyExpenseKey(e) + "\x00" + string(e.HashFile)))
 	return hex.EncodeToString(sum[:])
 }
 
-// See the ExpenseDocumentsIndex type for why an invoice ID or a hash file
-// cannot be used alone to identify an expense.
-//
-// Note that an invoice ID or HashFile may be re-used across multiple items, so
-// the label, date, and amount must always be used in the index. For example:
-//
-//	[
-//	  {
-//	    "invoiceId": null,
-//	    "piece": {"hashFile": "65ae69fed44f299a134fee0f"},
-//	    "label": "Honoraires Forfaitaires du 01/01/2024 au 09/01/2024",
-//	    "date": "2024-01-22T13:13:21.524Z",
-//	    "amount": { "value": 15618, "currency": "EUR", "__typename": "Debit" }
-//	  },
-//	  {
-//	    "invoiceId": null,
-//	    "piece": {"hashFile": "65ae69fed44f299a134fee0f"},
-//	    "label": "Honoraires Forfaitaires du 10/01/2024 au 31/01/2024",
-//	    "date": "2024-01-22T13:13:21.524Z",
-//	    "amount": { "value": 39016, "currency": "EUR", "__typename": "Debit" }
-//	  }
-//	]
-//
-// I have never found a case where the invoice ID is set but not the hash file.
-// Thus, the invoice ID isn't used to identify the expenses; the hash file is
-// used if it exists, and (label, date, amount, allocation, expense type)
-// otherwise. Note that the hash file may appear later on, so the item must be
-// updated in the database when the hash file starts appearing for a given
-// (label, date, amount, allocation, expense type).
-type ExpenseDocumentsIndex struct {
-	Elements                     []ExpenseDocumentDB
-	ByLabelDateAmountKey         map[string]int
-	ByLabelDateAmountKeyHashfile map[string]int
+// LegacyExpenseIDs returns the legacy ids under which the given expense may
+// have been stored: with its hash file, and, when it has one, without it (the
+// row may predate the hash file showing up on the API).
+func LegacyExpenseIDs(e ExpenseDocumentDB) []string {
+	ids := []string{LegacyExpenseID(e)}
+	if e.HashFile != "" {
+		withoutHash := e
+		withoutHash.HashFile = ""
+		ids = append(ids, LegacyExpenseID(withoutHash))
+	}
+	return ids
 }
 
-func NewExpenseDocumentsIndex(expenses []ExpenseDocumentDB) ExpenseDocumentsIndex {
-	index := ExpenseDocumentsIndex{
-		Elements:                     expenses,
-		ByLabelDateAmountKey:         make(map[string]int),
-		ByLabelDateAmountKeyHashfile: make(map[string]int),
-	}
-	for i, e := range expenses {
-		if e.HashFile != "" {
-			index.ByLabelDateAmountKeyHashfile[expenseID(e)] = i
-			continue
-		}
-		index.ByLabelDateAmountKey[expenseKey(e)] = i
-	}
-	return index
-}
-
-// Match returns the expense stored in the index that matches the given partial
-// expense. The hash file is used when it is set, and the (label, date, amount,
-// allocation, expense type) tuple is used as a fallback so that an expense that
-// only later got a hash file still matches.
-func (idx ExpenseDocumentsIndex) Match(partial ExpenseDocumentDB) (ExpenseDocumentDB, bool) {
-	if partial.HashFile != "" {
-		if i, ok := idx.ByLabelDateAmountKeyHashfile[expenseID(partial)]; ok {
-			return idx.Elements[i], true
-		}
-	}
-
-	if i, ok := idx.ByLabelDateAmountKey[expenseKey(partial)]; ok {
-		return idx.Elements[i], true
-	}
-
-	return ExpenseDocumentDB{}, false
-}
-
-const expenseColumns = "invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type"
+const expenseColumns = "id, invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type"
 
 func scanExpense(rows *sql.Rows) (ExpenseDocumentDB, error) {
 	var e ExpenseDocumentDB
 	var date string
-	err := rows.Scan(&e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile,
+	err := rows.Scan(&e.ID, &e.InvoiceID, &e.Label, &e.Amount, &date, &e.FilePath, &e.HashFile,
 		&e.Source, &e.AccountingKey.Allocation, &e.AccountingKey.ExpenseType)
 	if err != nil {
 		return ExpenseDocumentDB{}, err
@@ -878,27 +840,26 @@ func GetExpensesByInvoiceID(ctx context.Context, db *sql.DB, invoiceID string) (
 	return queryAll(ctx, db, "SELECT "+expenseColumns+" FROM expenses WHERE invoice_id = ?", scanExpense, invoiceID)
 }
 
-// promoteExpense takes an expense row that was stored without a hash file and
-// gives it the hash file that just showed up in the API, along with the new
-// primary key that goes with it. "OR IGNORE" covers the case where the row with
-// the new key already exists, in which case upsertExpense below just updates
-// it.
-const promoteExpense = `UPDATE OR IGNORE expenses SET id = ?, hash_file = ? WHERE id = ? AND hash_file = '';`
-
+// Every column but the id can change: Foncia relabels, re-dates and reallocates
+// lines after the fact, and a hash file typically shows up a couple of weeks
+// after the line. Keying on Foncia's id is what lets those changes update the
+// row instead of creating a second one.
 const upsertExpense = `INSERT INTO expenses (id, invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		invoice_id = excluded.invoice_id,
+		label = excluded.label,
+		amount = excluded.amount,
+		date = excluded.date,
 		file_path = excluded.file_path,
 		hash_file = excluded.hash_file,
-		source = excluded.source;`
+		source = excluded.source,
+		accounting_allocation = excluded.accounting_allocation,
+		accounting_expense_type = excluded.accounting_expense_type;`
 
-// UpsertExpensesWithDB inserts the expenses, and updates the ones that already
-// exist. Only invoice_id, file_path, hash_file and source can change; the other
-// columns are part of the primary key.
-//
-// An expense that was first seen without a hash file and later comes back with
-// one is updated in place rather than inserted a second time.
+// UpsertExpensesWithDB inserts the expenses, and updates in place the ones whose
+// id already exists. The id must be set; the sync gets it from Foncia (see
+// ExpenseDocumentDB.ID).
 func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDocumentDB) error {
 	if len(expense) == 0 {
 		return nil
@@ -906,17 +867,11 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 
 	return inTx(ctx, db, func(tx *sql.Tx) error {
 		for _, e := range expense {
-			if e.HashFile != "" {
-				withoutHash := e
-				withoutHash.HashFile = ""
-				_, err := tx.ExecContext(ctx, promoteExpense, expenseID(e), e.HashFile, expenseID(withoutHash))
-				if err != nil {
-					return fmt.Errorf("while attaching the hash file to expense %q: %w", e.Label, err)
-				}
+			if e.ID == "" {
+				return fmt.Errorf("expense %q (%s) has no id", e.Label, formatTime(e.Date))
 			}
-
 			_, err := tx.ExecContext(ctx, upsertExpense,
-				expenseID(e), e.InvoiceID, e.Label, int(e.Amount), formatTime(e.Date),
+				e.ID, e.InvoiceID, e.Label, int(e.Amount), formatTime(e.Date),
 				e.FilePath, e.HashFile, e.Source, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType)
 			if err != nil {
 				return fmt.Errorf("while upserting expense %q: %w", e.Label, err)
@@ -925,6 +880,29 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 		}
 		return nil
 	})
+}
+
+// RekeyExpense changes the primary key of one expense row. It is how a row
+// stored under a legacy id (see LegacyExpenseID) gets its Foncia id the first
+// time the sync sees that expense with an id, so that the upsert that follows
+// updates the row instead of inserting a second copy.
+//
+// It reports whether a row was actually re-keyed. Nothing happens when no row
+// has the old id, or when a row already has the new one (the legacy row is then
+// left alone rather than colliding with it).
+func RekeyExpense(ctx context.Context, db *sql.DB, oldID, newID string) (bool, error) {
+	if oldID == "" || newID == "" {
+		return false, fmt.Errorf("re-keying expense %q to %q: both ids must be set", oldID, newID)
+	}
+	res, err := db.ExecContext(ctx, `UPDATE OR IGNORE expenses SET id = ? WHERE id = ?;`, newID, oldID)
+	if err != nil {
+		return false, fmt.Errorf("while re-keying expense %s to %s: %w", oldID, newID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // -----------------------------------------------------------------------------

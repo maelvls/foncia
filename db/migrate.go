@@ -28,7 +28,7 @@ var migrationsFS embed.FS
 // migration is one step from user_version N-1 to N. It carries EITHER raw SQL
 // (the common case, read from migrations/NNNN_name.sql) OR a Go function, for
 // the steps SQL cannot express: normalising timestamps through time.Parse, and
-// deriving the expense primary key with the very same expenseID that the sync
+// deriving the expense primary key with the very same LegacyExpenseID that the sync
 // uses.
 type migration struct {
 	version int    // Strictly increasing, starting at 1.
@@ -328,12 +328,19 @@ func normaliseTimestamp(table, column, raw string) string {
 	return formatTime(time.Time{})
 }
 
+// legacyExpenseColumns is the column list of the expenses table as it was before
+// migration 2 gave it an id, frozen here because the migration must keep reading
+// exactly these columns no matter how expenseColumns evolves.
+const legacyExpenseColumns = "invoice_id, label, amount, date, file_path, hash_file, source, accounting_allocation, accounting_expense_type"
+
 // backfillExpenseIDs adds the `id` column to the old expenses table and fills it
-// with expenseID, the very function the sync uses. Getting this wrong would not
-// break anything visibly; it would just make the next sync insert a duplicate of
-// every single expense.
+// with LegacyExpenseID, which was the function the sync used at the time. It has
+// to keep deriving exactly the same ids: the sync recognises a row stored under
+// a legacy id by recomputing it (see RekeyExpense), and getting this wrong would
+// make the next sync insert a duplicate of every single expense instead of
+// re-keying them.
 //
-// It cannot be done in SQL: expenseID hashes formatTime(date), and formatTime
+// It cannot be done in SQL: LegacyExpenseID hashes formatTime(date), and formatTime
 // re-renders the date in UTC RFC3339Nano, which SQLite's string functions cannot
 // reproduce.
 func backfillExpenseIDs(ctx context.Context, tx *sql.Tx) error {
@@ -356,7 +363,7 @@ func backfillExpenseIDs(ctx context.Context, tx *sql.Tx) error {
 	var ids []row
 	seen := make(map[string]int64)
 
-	rows, err := tx.QueryContext(ctx, "SELECT rowid, "+expenseColumns+" FROM expenses;")
+	rows, err := tx.QueryContext(ctx, "SELECT rowid, "+legacyExpenseColumns+" FROM expenses;")
 	if err != nil {
 		return fmt.Errorf("while reading the expenses: %w", err)
 	}
@@ -377,7 +384,7 @@ func backfillExpenseIDs(ctx context.Context, tx *sql.Tx) error {
 			return fmt.Errorf("while parsing the date of expense rowid %d: %w", rowid, err)
 		}
 
-		id := expenseID(e)
+		id := LegacyExpenseID(e)
 		if other, dup := seen[id]; dup {
 			// Keeping the first one matches what the sync does: the second
 			// upsert of an identical expense updates the row instead of adding
