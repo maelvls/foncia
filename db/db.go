@@ -630,7 +630,9 @@ type ExpenseDocumentDB struct {
 	// Rows written before Foncia's id was used carry a legacy id instead, a
 	// 64-character hash of their contents (see LegacyExpenseID). The sync
 	// re-keys such a row to its Foncia id the first time it sees the expense
-	// again; a row Foncia no longer returns keeps its legacy id forever.
+	// again, and removes the legacy rows that are merely an older version of
+	// a line stored under its Foncia id (see DeleteSupersededLegacyExpenses).
+	// A row Foncia no longer returns keeps its legacy id forever.
 	ID string
 
 	Label  string    // Example: "MADAME-OU CHANNA ENTRETIEN PARTIES COMMUNES 03/2024". May not be unique.
@@ -880,6 +882,69 @@ func UpsertExpensesWithDB(ctx context.Context, db *sql.DB, expense ...ExpenseDoc
 		}
 		return nil
 	})
+}
+
+// supersededLegacyExpenses selects the rows stored under a legacy id (see
+// LegacyExpenseID) that are an older version of a line that also exists under
+// its Foncia id: same PDF (hash file), same date, same amount, same source and
+// same allocation. Only the label or the expense type differ, which is what
+// Foncia edits after the fact (a relabel, or the "R"/"NR" suffix added to a
+// whole category), and what used to produce a second row under the legacy key.
+//
+// The rule is deliberately narrow. A legacy row whose date or amount moved, or
+// that has no PDF, or whose twin sits in another allocation (an invoice split
+// across buildings shares its PDF), is not touched: it might be a distinct
+// line that Foncia has since dropped, and this database is its only record.
+//
+// A legacy id is 64 hex characters (a SHA-256), a Foncia id 24.
+const supersededLegacyExpenses = `
+	SELECT ` + expenseColumns + ` FROM expenses x
+	WHERE length(x.id) = 64 AND x.hash_file != ''
+	  AND EXISTS (SELECT 1 FROM expenses y
+	              WHERE length(y.id) = 24
+	                AND y.hash_file = x.hash_file
+	                AND y.date = x.date
+	                AND y.amount = x.amount
+	                AND y.source = x.source
+	                AND y.accounting_allocation = x.accounting_allocation)
+	ORDER BY x.date, x.label;`
+
+// DeleteSupersededLegacyExpenses removes the legacy rows that are an older
+// version of a line stored under its Foncia id (see supersededLegacyExpenses
+// for the exact rule) and returns them, so that the caller can log what went.
+// It is idempotent, and a no-op once no legacy row has a Foncia twin.
+func DeleteSupersededLegacyExpenses(ctx context.Context, db *sql.DB) ([]ExpenseDocumentDB, error) {
+	var deleted []ExpenseDocumentDB
+	err := inTx(ctx, db, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, supersededLegacyExpenses)
+		if err != nil {
+			return fmt.Errorf("while selecting the superseded legacy expenses: %w", err)
+		}
+		for rows.Next() {
+			e, err := scanExpense(rows)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("while scanning a superseded legacy expense: %w", err)
+			}
+			deleted = append(deleted, e)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+
+		for _, e := range deleted {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM expenses WHERE id = ? AND length(id) = 64;`, e.ID); err != nil {
+				return fmt.Errorf("while deleting the superseded legacy expense %s (%q): %w", e.ID, e.Label, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return deleted, nil
 }
 
 // RekeyExpense changes the primary key of one expense row. It is how a row

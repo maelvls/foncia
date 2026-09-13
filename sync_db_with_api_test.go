@@ -188,6 +188,52 @@ func TestSyncExpensesWithDB(t *testing.T) {
 		assert.Equal(t, db.HashFile("64b50b500f443f809d4ea649"), expensesInDB[0].HashFile, "the hash file must have been attached")
 	})
 
+	t.Run("an old version of a relabelled line is removed once the current one is stored", func(t *testing.T) {
+		// Under the legacy scheme, the label was part of the key, so a
+		// relabel produced a second row. The old row cannot be re-keyed (its
+		// label differs from the live one), so the live line is stored as a
+		// new row, and the old one, now merely an older version of it (same
+		// PDF, date, amount, allocation), is removed.
+		sqlDB := withRealDB(t)
+		old := db.ExpenseDocumentDB{
+			InvoiceID:     "69b0e9bf444a8644bdf64100",
+			Label:         "EDF - FACTURE DU  - 10/03/26",
+			Date:          withDate("2026-03-11T04:04:17.000Z"),
+			HashFile:      "69b0e9bf1cd42db8fae28fb3",
+			Amount:        db.Amount(10000), // What the mock server answers.
+			Source:        "accounting",
+			AccountingKey: db.AccountingKey{Allocation: "CHARGES GENERALES", ExpenseType: "ELECTRICITE"},
+			FilePath:      "invoices/EDF.pdf",
+		}
+		old.ID = db.LegacyExpenseID(old)
+		// A legacy row that must NOT be touched: same PDF, but a different
+		// amount (a genuine second line, e.g. a split invoice), and a legacy
+		// row without any twin at all.
+		other := old
+		other.Amount = 100
+		other.ID = db.LegacyExpenseID(other)
+		alone := old
+		alone.HashFile = "69b0e9bf1cd42db8fae28000"
+		alone.ID = db.LegacyExpenseID(alone)
+		require.NoError(t, db.UpsertExpensesWithDB(t.Context(), sqlDB, old, other, alone))
+
+		srv := withMockServer(t, withRGDDResp([]map[string]any{
+			with("69b0e9c0444a8644bdf64101", "EDF - FACTURE DU 10/03/2026 BAT D", "2026-03-11T04:04:17.000Z", "69b0e9bf1cd42db8fae28fb3", "69b0e9bf444a8644bdf64100"),
+		}))
+		newExpenses, err := syncExpensesWithDB(t.Context(), srv.Client(), sqlDB, srv.URL+"/graphql", "fake", "not-used")
+		require.NoError(t, err)
+		assert.Len(t, newExpenses, 1, "the relabelled line is new from the sync's point of view")
+
+		expensesInDB, err := db.GetExpensesDB(t.Context(), sqlDB)
+		require.NoError(t, err)
+		var ids []string
+		for _, e := range expensesInDB {
+			ids = append(ids, e.ID)
+		}
+		assert.ElementsMatch(t, []string{"69b0e9c0444a8644bdf64101", other.ID, alone.ID}, ids,
+			"the old version must be gone, the current one stored, and the two unrelated legacy rows kept")
+	})
+
 	t.Run("the same id returned twice is stored once", func(t *testing.T) {
 		sqlDB := withRealDB(t)
 		srv := withMockServer(t, withRGDDResp([]map[string]any{

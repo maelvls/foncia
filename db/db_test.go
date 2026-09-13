@@ -556,3 +556,94 @@ func TestRekeyExpense(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+func TestDeleteSupersededLegacyExpenses(t *testing.T) {
+	ctx := context.Background()
+	date := time.Date(2026, 3, 11, 4, 4, 17, 0, time.UTC)
+	key := AccountingKey{Allocation: "CHARGES GENERALES", ExpenseType: "ELECTRICITE"}
+	current := ExpenseDocumentDB{
+		ID: "69b0e9c0444a8644bdf64101", Label: "EDF - FACTURE DU 10/03/2026 BAT D", Date: date, Amount: 53843,
+		HashFile: "69b0e9bf1cd42db8fae28fb3", Source: SourceAccounting,
+		AccountingKey: AccountingKey{Allocation: "CHARGES GENERALES", ExpenseType: "ELECTRICITE R"},
+	}
+	legacy := func(mutate func(e *ExpenseDocumentDB)) ExpenseDocumentDB {
+		e := ExpenseDocumentDB{
+			Label: "EDF - FACTURE DU  - 10/03/26", Date: date, Amount: 53843,
+			HashFile: "69b0e9bf1cd42db8fae28fb3", Source: SourceAccounting, AccountingKey: key,
+		}
+		mutate(&e)
+		e.ID = LegacyExpenseID(e)
+		return e
+	}
+	ids := func(t *testing.T, sqlDB *sql.DB) []string {
+		got, err := GetExpensesDB(ctx, sqlDB)
+		require.NoError(t, err)
+		var ids []string
+		for _, e := range got {
+			ids = append(ids, e.ID)
+		}
+		return ids
+	}
+
+	t.Run("a relabelled or re-typed legacy twin is removed and returned", func(t *testing.T) {
+		sqlDB := openTest(t)
+		relabelled := legacy(func(e *ExpenseDocumentDB) {})
+		retyped := legacy(func(e *ExpenseDocumentDB) { e.Label = current.Label })
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, current, relabelled, retyped))
+
+		deleted, err := DeleteSupersededLegacyExpenses(ctx, sqlDB)
+		require.NoError(t, err)
+		var deletedIDs []string
+		for _, e := range deleted {
+			deletedIDs = append(deletedIDs, e.ID)
+		}
+		assert.ElementsMatch(t, []string{relabelled.ID, retyped.ID}, deletedIDs)
+		assert.Equal(t, []string{current.ID}, ids(t, sqlDB))
+
+		// Idempotent.
+		deleted, err = DeleteSupersededLegacyExpenses(ctx, sqlDB)
+		require.NoError(t, err)
+		assert.Empty(t, deleted)
+	})
+
+	t.Run("nothing is removed when there is no Foncia twin", func(t *testing.T) {
+		sqlDB := openTest(t)
+		a := legacy(func(e *ExpenseDocumentDB) {})
+		b := legacy(func(e *ExpenseDocumentDB) { e.Label = "another old version" })
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, a, b))
+
+		deleted, err := DeleteSupersededLegacyExpenses(ctx, sqlDB)
+		require.NoError(t, err)
+		assert.Empty(t, deleted)
+		assert.Len(t, ids(t, sqlDB), 2)
+	})
+
+	t.Run("a different date, amount, source or allocation, or no PDF, is kept", func(t *testing.T) {
+		sqlDB := openTest(t)
+		kept := []ExpenseDocumentDB{
+			legacy(func(e *ExpenseDocumentDB) { e.Date = date.Add(24 * time.Hour) }),
+			legacy(func(e *ExpenseDocumentDB) { e.Amount = 53842 }),
+			legacy(func(e *ExpenseDocumentDB) { e.Source = SourceRepairs }),
+			legacy(func(e *ExpenseDocumentDB) { e.AccountingKey.Allocation = "CHARGES BATIMENT D" }),
+			legacy(func(e *ExpenseDocumentDB) { e.HashFile = "" }),
+		}
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, append(kept, current)...))
+
+		deleted, err := DeleteSupersededLegacyExpenses(ctx, sqlDB)
+		require.NoError(t, err)
+		assert.Empty(t, deleted)
+		assert.Len(t, ids(t, sqlDB), 6)
+	})
+
+	t.Run("rows with a Foncia id are never removed, even when identical", func(t *testing.T) {
+		sqlDB := openTest(t)
+		twin := current
+		twin.ID = "69b0e9c0444a8644bdf64102"
+		require.NoError(t, UpsertExpensesWithDB(ctx, sqlDB, current, twin))
+
+		deleted, err := DeleteSupersededLegacyExpenses(ctx, sqlDB)
+		require.NoError(t, err)
+		assert.Empty(t, deleted)
+		assert.Len(t, ids(t, sqlDB), 2)
+	})
+}

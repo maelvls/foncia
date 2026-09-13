@@ -294,6 +294,23 @@ func syncExpensesWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB,
 		return newExpensesDB, err
 	}
 
+	// Now that every live line is stored under its Foncia id, the legacy rows
+	// that are merely an older version of one of them (a relabel, a renamed
+	// expense type) are redundant: the current version is in the database, and
+	// keying on Foncia's id means such edits no longer create rows. Each
+	// removed row is logged in full, so the old label is still in the logs.
+	superseded, err := db.DeleteSupersededLegacyExpenses(ctx, sqlDB)
+	if err != nil {
+		return newExpensesDB, fmt.Errorf("while removing the superseded legacy expenses: %w", err)
+	}
+	for _, e := range superseded {
+		logutil.Infof("removed superseded legacy expense %s: %s %s %s (%s / %s, hash file %s, %s)",
+			e.ID, e.Date.Format("2006-01-02"), e.Amount, e.Label, e.AccountingKey.Allocation, e.AccountingKey.ExpenseType, e.HashFile, e.Source)
+	}
+	if len(superseded) > 0 {
+		logutil.Infof("removed %d superseded legacy expenses", len(superseded))
+	}
+
 	return newExpensesDB, nil
 }
 
