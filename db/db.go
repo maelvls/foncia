@@ -171,6 +171,45 @@ func SaveMissionsToDB(ctx context.Context, db *sql.DB, missions ...MissionDB) er
 	})
 }
 
+// MarkWorkOrdersSynced records that the work orders of the given missions were
+// just fetched from Foncia. See MissionIDsDueForWorkOrderRefresh.
+func MarkWorkOrdersSynced(ctx context.Context, db *sql.DB, at time.Time, missionIDs ...string) error {
+	if len(missionIDs) == 0 {
+		return nil
+	}
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		for _, id := range missionIDs {
+			if _, err := tx.ExecContext(ctx, `UPDATE missions SET work_orders_synced_at = ? WHERE id = ?;`, formatTime(at), id); err != nil {
+				return fmt.Errorf("while recording the work order sync of mission %s: %w", id, err)
+			}
+		}
+		return nil
+	})
+}
+
+// MissionIDsDueForWorkOrderRefresh returns the missions that are still open on
+// Foncia's side, the ones whose work orders were fetched the longest ago first
+// (never-fetched ones, i.e. the zero time, come first of all).
+//
+// Getting the work orders costs one API call per mission and Foncia
+// rate-limits, so the sync only refreshes a few of them per run, taken from the
+// head of this list: a work order added to a mission that is otherwise
+// unchanged, which is the common case, is then picked up within a few hours.
+//
+// FINISHED and CLOSE missions are left out: their work orders are fetched one
+// last time when the mission reaches that status, since a status change is
+// itself a reason to refetch.
+func MissionIDsDueForWorkOrderRefresh(ctx context.Context, db *sql.DB) ([]string, error) {
+	return queryAll(ctx, db,
+		`SELECT id FROM missions WHERE status NOT IN ('FINISHED', 'CLOSE')
+		 ORDER BY work_orders_synced_at ASC, started_at DESC, id ASC;`,
+		func(rows *sql.Rows) (string, error) {
+			var id string
+			err := rows.Scan(&id)
+			return id, err
+		})
+}
+
 const workOrderInsert = `INSERT INTO work_orders (id, mission_id, number, label, repair_date_start, repair_date_end, supplier_id, supplier_name, supplier_activity) VALUES `
 
 const workOrderOnConflict = ` ON CONFLICT(id) DO UPDATE SET

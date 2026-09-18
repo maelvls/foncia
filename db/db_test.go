@@ -647,3 +647,45 @@ func TestDeleteSupersededLegacyExpenses(t *testing.T) {
 		assert.Len(t, ids(t, sqlDB), 2)
 	})
 }
+
+func TestMissionIDsDueForWorkOrderRefresh(t *testing.T) {
+	ctx := context.Background()
+	sqlDB := openTest(t)
+	started := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, SaveMissionsToDB(ctx, sqlDB,
+		MissionDB{ID: "open-old", Status: "OPEN", StartedAt: started},
+		MissionDB{ID: "open-recent", Status: "OPEN", StartedAt: started.Add(24 * time.Hour)},
+		MissionDB{ID: "in-progress", Status: "WORK_IN_PROGRESS", StartedAt: started},
+		MissionDB{ID: "finished", Status: "FINISHED", StartedAt: started},
+		MissionDB{ID: "closed", Status: "CLOSE", StartedAt: started},
+	))
+
+	t.Run("never-synced open missions come out, the most recent mission first", func(t *testing.T) {
+		due, err := MissionIDsDueForWorkOrderRefresh(ctx, sqlDB)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"open-recent", "in-progress", "open-old"}, due,
+			"FINISHED and CLOSE are left out; ties are broken by start date, then id")
+	})
+
+	t.Run("a synced mission goes to the back of the queue", func(t *testing.T) {
+		now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+		require.NoError(t, MarkWorkOrdersSynced(ctx, sqlDB, now, "open-recent"))
+		require.NoError(t, MarkWorkOrdersSynced(ctx, sqlDB, now.Add(-time.Hour), "in-progress"))
+
+		due, err := MissionIDsDueForWorkOrderRefresh(ctx, sqlDB)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"open-old", "in-progress", "open-recent"}, due)
+	})
+
+	t.Run("updating a mission does not reset when its work orders were synced", func(t *testing.T) {
+		require.NoError(t, SaveMissionsToDB(ctx, sqlDB, MissionDB{ID: "open-recent", Status: "OPEN", Label: "relabelled", StartedAt: started.Add(24 * time.Hour)}))
+
+		due, err := MissionIDsDueForWorkOrderRefresh(ctx, sqlDB)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"open-old", "in-progress", "open-recent"}, due)
+	})
+
+	t.Run("no mission is a no-op", func(t *testing.T) {
+		require.NoError(t, MarkWorkOrdersSynced(ctx, sqlDB, time.Now()))
+	})
+}

@@ -1,0 +1,11 @@
+-- When the work orders of a mission were last fetched from Foncia.
+--
+-- Getting the work orders costs one API call per mission, and Foncia
+-- rate-limits after a few hundred calls, so they cannot all be refreshed on
+-- every sync. The sync refreshes the missions whose work orders were fetched
+-- the longest ago first, a few per run; this column is what orders them.
+--
+-- The default is the zero time (what formatTime renders for time.Time{}), so
+-- every existing mission counts as "never refreshed" and gets its turn first.
+-- ADD COLUMN is enough: no table rebuild, the table stays STRICT.
+ALTER TABLE missions ADD COLUMN work_orders_synced_at TEXT NOT NULL DEFAULT '0001-01-01T00:00:00Z';

@@ -49,6 +49,12 @@ var (
 	syncPeriod = flag.Duration("sync-period", 10*time.Minute, "Period at which to sync with the live API.")
 	readOnly   = flag.Bool("read-only", false, "Disable synchronization with the live API.")
 
+	// Work orders cost one API call per mission and Foncia rate-limits, so the
+	// missions that did not change only get theirs refreshed a few at a time.
+	// With the defaults (10 every 10 minutes), the ~200 missions that are still
+	// open are all refreshed every 3 to 4 hours.
+	workOrdersRefreshBudget = flag.Int("work-orders-refresh-budget", 10, "Number of unchanged, still open missions whose work orders are fetched again on each sync, the ones refreshed the longest ago first. New and changed missions always get theirs fetched and don't count. 0 disables the periodic refresh.")
+
 	// The general assembly documents are always indexed so that they show up in
 	// the UI, but they aren't downloaded by default: some of the convocations
 	// weigh tens of megabytes, and there are more than a hundred of them. When
@@ -420,7 +426,7 @@ func authFetchSave(ctx context.Context, client *http.Client, sqlDB *sql.DB, uuid
 		errs = append(errs, fmt.Errorf("while syncing the account documents: %w", err))
 	}
 
-	newMissions, err := syncLiveMissionsWithDB(ctx, client, sqlDB, graphqlURL, uuid)
+	newMissions, err := syncLiveMissionsWithDB(ctx, client, sqlDB, graphqlURL, uuid, *workOrdersRefreshBudget)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("while syncing the missions: %w", err))
 	}

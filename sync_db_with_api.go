@@ -16,8 +16,23 @@ import (
 	"github.com/maelvls/foncia/logutil"
 )
 
-// Returns the new items.
-func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid string) ([]db.MissionDB, error) {
+// Returns the new missions, i.e. the ones that were not in the database yet.
+//
+// The list of missions is cheap (a couple of paginated calls return all of
+// them with their status, label and description), but the work orders cost one
+// call per mission, and Foncia rate-limits after a few hundred calls. So:
+//
+//   - a mission that is new, or whose status, label or any other field changed,
+//     is saved and its work orders are fetched right away;
+//   - among the missions that did not change, `workOrdersRefreshBudget` of the
+//     ones still open on Foncia's side get their work orders fetched again, the
+//     ones fetched the longest ago first. A work order added to an otherwise
+//     unchanged mission, which is the common case, is thus picked up after a
+//     few runs rather than never.
+//
+// Nothing is ever deleted: a mission or a work order that Foncia stops
+// returning stays in the database.
+func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql.DB, graphqlURL, uuid string, workOrdersRefreshBudget int) ([]db.MissionDB, error) {
 	missions, _, err := api.GetMissionsAPI(ctx, client, graphqlURL, uuid, api.MissionsCursor{})
 	if err != nil {
 		return nil, fmt.Errorf("while getting interventions: %v", err)
@@ -27,73 +42,114 @@ func syncLiveMissionsWithDB(ctx context.Context, client *http.Client, sqlDB *sql
 	if err != nil {
 		return nil, fmt.Errorf("while getting existing missions: %v", err)
 	}
-	existsInDB := make(map[string]struct{})
-	for _, item := range missionsInDB {
-		existsInDB[item.ID] = struct{}{}
+	inDB := make(map[string]db.MissionDB, len(missionsInDB))
+	knownWorkOrders := make(map[string]struct{})
+	for _, m := range missionsInDB {
+		for _, wo := range m.WorkOrders {
+			knownWorkOrders[wo.ID] = struct{}{}
+		}
+		m.WorkOrders = nil // Only the mission's own fields are compared.
+		inDB[m.ID] = m
 	}
-	var newMissions []db.MissionDB
+
+	// What to fetch the work orders of, in that order: the new missions first
+	// (they are the ones that get notified), then the changed ones, then the
+	// periodic refresh.
+	type item struct {
+		mission db.MissionDB
+		isNew   bool
+	}
+	var newOnes, changed []item
+	live := make(map[string]db.MissionDB, len(missions))
 	for _, m := range missions {
-		_, already := existsInDB[m.ID]
-		if already {
+		mDB := MissionAPIToDB(m)
+		if _, dup := live[mDB.ID]; dup {
 			continue
 		}
-		newMissions = append(newMissions, MissionAPIToDB(m))
-		logutil.Debugf("found new mission: %+v", m)
+		live[mDB.ID] = mDB
+
+		old, found := inDB[mDB.ID]
+		switch {
+		case !found:
+			logutil.Debugf("found new mission: %+v", m)
+			newOnes = append(newOnes, item{mission: mDB, isNew: true})
+		case !cmp.Equal(old, mDB):
+			logutil.Infof("mission %s (%q) changed: %s", mDB.ID, mDB.Label, cmp.Diff(old, mDB))
+			changed = append(changed, item{mission: mDB})
+		}
+	}
+	queue := append(newOnes, changed...)
+	queued := make(map[string]struct{}, len(queue))
+	for _, it := range queue {
+		queued[it.mission.ID] = struct{}{}
 	}
 
-	// Since HTTP request per new mission is made, and there may be 200-300
-	// missions, let's do them in small batches so that we can save to DB
-	// regularly so we don't lose all the work if the program crashes (takes a
-	// lot of time partly because the Raspberry Pi's disk is slow, partly because
-	// there are 200-300 HTTP calls to be made).
-	batchSize := 1
-	i := 0
-	var savedMissions []db.MissionDB
-	err = DoInBatches(batchSize, newMissions, func(batchMissions []db.MissionDB) error {
-		i++
-		var batchWorkOrders []db.WorkOrderDB
+	if workOrdersRefreshBudget > 0 {
+		due, err := db.MissionIDsDueForWorkOrderRefresh(ctx, sqlDB)
+		if err != nil {
+			return nil, fmt.Errorf("while listing the missions due for a work order refresh: %v", err)
+		}
+		budget := workOrdersRefreshBudget
+		for _, id := range due {
+			if budget == 0 {
+				break
+			}
+			// A mission that Foncia no longer returns cannot be refreshed,
+			// and one that is already queued doesn't need to be.
+			m, isLive := live[id]
+			if _, already := queued[id]; already || !isLive {
+				continue
+			}
+			queue = append(queue, item{mission: m})
+			budget--
+		}
+	}
 
-		// Let's update each mission with its work orders.
-		for i, mission := range batchMissions {
+	// One HTTP request per mission is made, and on a first run there may be
+	// several hundreds of them, so let's save to the DB after each one: we
+	// don't want to lose all the work if the program crashes or gets
+	// rate-limited half-way (the Raspberry Pi's disk is slow, too).
+	var savedNewMissions []db.MissionDB
+	err = DoInBatches(1, queue, func(batch []item) error {
+		for _, it := range batch {
+			mission := it.mission
 			orders, err := api.GetWorkOrdersAPI(ctx, client, graphqlURL, uuid, mission.ID)
 			if err != nil {
 				return fmt.Errorf("while getting work orders from API: %v", err)
 			}
-
-			var missionWorkOrders []db.WorkOrderDB
 			for _, wo := range orders {
-				missionWorkOrders = append(missionWorkOrders, WorkOrderAPIToDB(wo, mission.ID))
+				mission.WorkOrders = append(mission.WorkOrders, WorkOrderAPIToDB(wo, mission.ID))
+				if _, known := knownWorkOrders[wo.ID]; !known && !it.isNew {
+					logutil.Infof("mission %s (%q) has a new work order: %s %q", mission.ID, mission.Label, wo.Number, wo.Label)
+				}
 			}
-			batchMissions[i].WorkOrders = missionWorkOrders
 
-			batchWorkOrders = append(batchWorkOrders, missionWorkOrders...)
+			// Missions first: work_orders.mission_id is a foreign key onto
+			// missions.id, and foreign keys are enforced, so inserting the
+			// work orders first would be rejected.
+			if err := db.SaveMissionsToDB(ctx, sqlDB, mission); err != nil {
+				return fmt.Errorf("while saving missions: %v", err)
+			}
+			if err := db.SaveWorkOrdersToDB(ctx, sqlDB, mission.WorkOrders); err != nil {
+				return fmt.Errorf("while saving work orders: %v", err)
+			}
+			if err := db.MarkWorkOrdersSynced(ctx, sqlDB, time.Now(), mission.ID); err != nil {
+				return err
+			}
+
+			if it.isNew {
+				savedNewMissions = append(savedNewMissions, mission)
+			}
 		}
-
-		// Missions first: work_orders.mission_id is a foreign key onto
-		// missions.id, and foreign keys are enforced now, so inserting the work
-		// orders first would be rejected.
-		logutil.Debugf("saving %d missions to DB", len(batchMissions))
-		err = db.SaveMissionsToDB(ctx, sqlDB, batchMissions...)
-		if err != nil {
-			return fmt.Errorf("while saving missions: %v", err)
-		}
-
-		logutil.Debugf("saving work orders for %d missions to DB", len(batchMissions))
-		err = db.SaveWorkOrdersToDB(ctx, sqlDB, batchWorkOrders)
-		if err != nil {
-			return fmt.Errorf("while saving work orders: %v", err)
-		}
-
-		savedMissions = append(savedMissions, batchMissions...)
 		return nil
 	})
 	if err != nil {
-		// The batches before the failing one are already in the database.
+		// The missions before the failing one are already in the database.
 		// Hand them back so that the caller can still notify about them.
-		return savedMissions, err
+		return savedNewMissions, err
 	}
 
-	return savedMissions, nil
+	return savedNewMissions, nil
 }
 
 // Returns new expenses.
