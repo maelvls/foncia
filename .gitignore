@@ -1,5 +1,6 @@
 # Build output.
 /foncia
+/dist/
 __debug_*
 
 # Secrets: .envrc holds a real password.

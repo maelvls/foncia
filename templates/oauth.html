@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>Autoriser {{.Client}}</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+	body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+	button { font-size: 1rem; padding: 0.5rem 1.2rem; margin-right: 0.5rem; cursor: pointer; }
+	.allow { font-weight: bold; }
+	small { color: #666; }
+</style>
+</head>
+<body>
+	<h1>Autoriser {{.Client}} ?</h1>
+	<p><strong>{{.Client}}</strong> demande à lire le suivi de Terra Nostra 2 en ton nom
+	(<strong>{{.Email}}</strong>) : interventions, factures, rapports de visite,
+	documents d'assemblée générale et liste des copropriétaires. Il ne peut rien modifier.</p>
+	<p>Après ton accord, tu seras renvoyé vers <strong>{{.Dest}}</strong>.</p>
+	<form method="POST" action="{{.Action}}">
+		{{range $k, $vs := .Params}}{{range $vs}}<input type="hidden" name="{{$k}}" value="{{.}}">
+		{{end}}{{end}}
+		<button class="allow" type="submit" name="action" value="allow">Autoriser</button>
+		<button type="submit" name="action" value="deny">Refuser</button>
+	</form>
+	<p><small>L'accès dure tant que {{.Client}} s'en sert (au plus 30 jours sans l'utiliser).
+	Pour le couper avant, retire le connecteur dans {{.Client}}.</small></p>
+</body>
+</html>

@@ -111,33 +111,22 @@ téléchargé: /Users/me/Downloads/ag/Convocation.AGO.15.01.2025.pdf
 
 ## Deploy
 
+The image is alpine with poppler-utils (`pdftotext`, for the MCP server) and a
+binary cross-compiled outside of Docker, since compiling modernc.org/sqlite on
+the Pi takes ages:
+
 ```bash
-KO_DOCKER_REPO=ghcr.io/maelvls/foncia KO_DEFAULTBASEIMAGE=alpine \
-  ko build . --bare --tarball /tmp/out.tar --push=false --platform linux/arm64
-ssh pi docker load </tmp/out.tar
+make dist
+ssh pi 'rm -rf /tmp/foncia-build && mkdir -p /tmp/foncia-build/dist'
+scp Dockerfile pi:/tmp/foncia-build/
+scp dist/foncia-linux-arm64 pi:/tmp/foncia-build/dist/
+# --network host: otherwise apk can't resolve anything (the Pi's DNS is
+# Pi-hole on 127.0.0.1).
+ssh pi docker build --network host -t ghcr.io/maelvls/foncia:latest /tmp/foncia-build
 ssh pi bash -lc vls.dev/foncia/deploy
 ```
 
-with `vls.dev/foncia/deploy`:
-
-```bash
-docker container inspect foncia >/dev/null 2>/dev/null && docker rm -f foncia || true
-docker run -d --restart=always --name foncia -p 8080:8080 \
-  -v $HOME/foncia.sqlite:/foncia.sqlite \
-  -v $HOME/foncia_invoices:/invoices \
-  -v $HOME/foncia-header.html:/foncia-header.html \
-  -v $HOME/foncia_invoices:/invoices \
-  -e FONCIA_PASSWORD=REDACTED \
-  -e FONCIA_USERNAME=REDACTED \
-  ghcr.io/maelvls/foncia:latest \
-  --debug \
-  --db /foncia.sqlite \
-  --ntfy-topic REDACTED \
-  --basepath "/foncia" \
-  --baseurl https://suivi-foncia \
-  --header-file /foncia-header.html \
-  serve
-```
+`vls.dev/foncia/deploy` is in https://github.com/maelvls/vls.dev.
 
 ### Who?
 
@@ -145,6 +134,61 @@ docker run -d --restart=always --name foncia -p 8080:8080 \
 ssh pi docker logs caddy 2>&1 | grep '^{' | jq --slurp '.[]|select(.logger=="security")|"\(.ts|strftime("%Y-%m-%d %H:%M:%S"))\t\(.msg)\t\(.user.email)"' -r | grep -vE 'successfully configured OAuth 2.0|provisioned app instance|provisioning app instance' | uniq
 ssh pi docker logs caddy 2>&1 >/dev/null --follow | grep '"logger":"security"'
 docker logs caddy --follow 2>&1 | grep '^{' | jq 'select(.logger == "security")'
+```
+
+## MCP server for Claude, ChatGPT and Grok
+
+With `--mcp`, `/mcp` is an MCP server (Streamable HTTP, stateless) with four
+read-only tools:
+
+| Tool            | What it does                                                                 |
+|-----------------|------------------------------------------------------------------------------|
+| `search`        | Missions, expenses, visit reports and general assembly documents, newest first; every word of the query must match, accents ignored. Filters by type and date. |
+| `read_document` | The text of a PDF, page by page, with `pdftotext`. A general assembly document that isn't on disk yet is downloaded first, like a click in the web UI. |
+| `list_coowners` | The co-owners, their address, apartment and parking spaces (live from Foncia). |
+| `sync_status`   | When the last sync happened, and how many items there are.                  |
+
+The assistants connect with OAuth 2.1, and foncia is the authorization server
+(`http_oauth.go`): protected resource metadata (RFC 9728), server metadata
+(RFC 8414), dynamic client registration (RFC 7591), authorization code with
+PKCE S256, access tokens valid for an hour and refresh tokens that rotate,
+valid for 30 days. Only the SHA-256 of the codes and tokens is stored, in the
+`oauth_clients` and `oauth_tokens` tables.
+
+foncia has no login of its own: the co-owner approves the assistant on
+`/oauth/authorize`, which must be behind the reverse proxy's login, and the
+proxy gives their email in `--auth-header`. The other endpoints are called by
+the assistants' servers without the co-owner's cookie, so the proxy must let
+them through. With Caddy and caddy-security:
+
+```caddyfile
+@foncia-mcp path /mcp /oauth/token /oauth/register /.well-known/oauth-authorization-server /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/*
+route @foncia-mcp {
+	reverse_proxy :8080
+}
+route {
+	authorize with suivi-terra-nostra-2-policy # inject headers with claims
+	reverse_proxy :8080
+}
+```
+
+```bash
+foncia --mcp --auth-header X-Token-User-Email --baseurl https://suivi-terra-nostra-2.vls.dev serve
+```
+
+To add it: in Claude, Settings → Connectors → Add custom connector; in
+ChatGPT, Settings → Apps & Connectors → Create (developer mode); in Grok,
+Connectors → New Connector → Custom. The URL is
+`https://suivi-terra-nostra-2.vls.dev/mcp`, no client ID: the assistant
+registers itself, then the browser shows the Google login and the consent
+page.
+
+To cut someone's access before their refresh token expires, delete their
+tokens; removing them from the proxy's list only stops them from approving
+new assistants:
+
+```sql
+DELETE FROM oauth_tokens WHERE email = 'someone@example.com';
 ```
 
 ## Restricting who can see the pages
