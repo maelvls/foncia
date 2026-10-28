@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -13,46 +14,12 @@ import (
 
 func coownersEndpoint(client *http.Client, uuid string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		coowners, err := api.GetCouncilCoowners(r.Context(), client, graphqlURL, uuid)
+		coownersData, err := fetchCoowners(r.Context(), client, uuid)
 		if err != nil {
 			logutil.Errorf("while getting coowners: %v", err)
 			http.Error(w, "erreur interne, voir les logs du serveur", http.StatusInternalServerError)
 			return
 		}
-
-		var coownersData []coownerRow
-		for _, coowner := range coowners {
-			apartment := ""
-			parking := []string{}
-			for _, lot := range coowner.Units {
-				m, found := lotByNumber[lot]
-				if !found {
-					logutil.Errorf("unknown lot %d for coowner %s", lot, coowner.DisplayName)
-					continue
-				}
-
-				switch {
-				case strings.HasPrefix(m.Type, "T"):
-					apartment = m.Description
-				case strings.HasPrefix(m.Type, "Parking"):
-					parking = append(parking, m.Description)
-				default:
-					logutil.Errorf("unknown lot type %s for lot %d", m.Type, m.Lot)
-				}
-			}
-
-			coownersData = append(coownersData, coownerRow{
-				Name:      coowner.DisplayName,
-				Address:   fmt.Sprintf("%s %s %s %s", coowner.Address1, coowner.Address2, coowner.ZipCode, coowner.City),
-				Apartment: apartment,
-				Parking:   parking,
-			})
-		}
-
-		// Sort by Apartment before rendering.
-		sort.Slice(coownersData, func(i, j int) bool {
-			return coownersData[i].Apartment < coownersData[j].Apartment
-		})
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		err = coownersTmpl.Execute(w, coownersData)
@@ -63,11 +30,57 @@ func coownersEndpoint(client *http.Client, uuid string) http.HandlerFunc {
 	}
 }
 
+// fetchCoowners asks Foncia for the co-owners and resolves their lots into an
+// apartment and parking spaces, sorted by apartment. It is shared by the
+// /coowners page and the MCP list_coowners tool.
+func fetchCoowners(ctx context.Context, client *http.Client, uuid string) ([]coownerRow, error) {
+	coowners, err := api.GetCouncilCoowners(ctx, client, graphqlURL, uuid)
+	if err != nil {
+		return nil, err
+	}
+
+	var coownersData []coownerRow
+	for _, coowner := range coowners {
+		apartment := ""
+		parking := []string{}
+		for _, lot := range coowner.Units {
+			m, found := lotByNumber[lot]
+			if !found {
+				logutil.Errorf("unknown lot %d for coowner %s", lot, coowner.DisplayName)
+				continue
+			}
+
+			switch {
+			case strings.HasPrefix(m.Type, "T"):
+				apartment = m.Description
+			case strings.HasPrefix(m.Type, "Parking"):
+				parking = append(parking, m.Description)
+			default:
+				logutil.Errorf("unknown lot type %s for lot %d", m.Type, m.Lot)
+			}
+		}
+
+		coownersData = append(coownersData, coownerRow{
+			Name:      coowner.DisplayName,
+			Address:   fmt.Sprintf("%s %s %s %s", coowner.Address1, coowner.Address2, coowner.ZipCode, coowner.City),
+			Apartment: apartment,
+			Parking:   parking,
+		})
+	}
+
+	// Sort by Apartment before rendering.
+	sort.Slice(coownersData, func(i, j int) bool {
+		return coownersData[i].Apartment < coownersData[j].Apartment
+	})
+
+	return coownersData, nil
+}
+
 type coownerRow struct {
-	Name      string
-	Address   string
-	Apartment string
-	Parking   []string
+	Name      string   `json:"name"`
+	Address   string   `json:"address"`
+	Apartment string   `json:"apartment"` // Example: "C02". Empty when the co-owner only has parking spaces.
+	Parking   []string `json:"parking"`   // Example: ["44", "45"].
 }
 
 var coownersTmpl = template.Must(template.New("coowners").Parse(coownersHTML))

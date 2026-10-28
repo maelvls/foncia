@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"html/template"
 	"net"
@@ -54,8 +55,9 @@ func logRequests(next http.Handler) http.Handler {
 // Serve the HTTP UI. This func is blocking and can be unblocked by cancelling
 // the context. The `basePath` should always start with a slash and not end with
 // a slash. If you want to given an empty base path, don't give "/". Instead,
-// give "".
-func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client *http.Client, uuid, basePath, invoicesDir string, lastSync func() (time.Time, error), htmlHeader string) error {
+// give "". The baseURL is used by the MCP server (--mcp) for its OAuth issuer
+// and for the links it hands out.
+func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client *http.Client, uuid, basePath, baseURL, invoicesDir string, lastSync func() (time.Time, error), htmlHeader string) error {
 	if basePath != "" && !strings.HasPrefix(basePath, "/") {
 		return fmt.Errorf("base path must start with a slash or be an empty string")
 	}
@@ -95,6 +97,23 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	err = addHandlers(subMux, db, client, uuid, basePath, invoicesDir, lastSync)
 	if err != nil {
 		return fmt.Errorf("while adding handlers: %w", err)
+	}
+	if *mcpFlag {
+		mcpHandler := newMCPHandler(mcpServer{
+			sqlDB:       db,
+			client:      client,
+			uuid:        uuid,
+			invoicesDir: invoicesDir,
+			baseURL:     baseURL + basePath,
+			lastSync:    lastSync,
+		})
+		addOAuthHandlers(rootMux, subMux, oauthServer{
+			sqlDB:      db,
+			issuer:     baseURL + basePath,
+			basePath:   basePath,
+			userHeader: *authHeader,
+		}, logRequests(mcpHandler))
+		logutil.Infof("MCP server on %s%s/mcp, co-owners identified by the %s header on /oauth/authorize", baseURL, basePath, *authHeader)
 	}
 
 	mountPath := basePath
@@ -153,60 +172,25 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 		hashFile := r.PathValue("hash")
 		fileNameInURL := r.PathValue("filename")
 
-		lookup, known := documentLookups[typ]
-		if !known {
+		if _, known := documentLookups[typ]; !known {
 			logutil.Errorf("invalid download type %q in %q", typ, r.URL.Path)
 			http.Error(w, "not found: URL must be of the form /dl/(invoice|invoiceid|contract|doc)/<id>[/<filename>]", http.StatusNotFound)
 			return
 		}
 
-		filePathReal, err := lookup(r.Context(), sqlDB, hashFile)
-		if err != nil {
-			logutil.Errorf("while looking up %s %q: %v", typ, hashFile, err)
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-
-		// The PDF isn't necessarily on disk: unless --download-ag-documents is
-		// set, the general assembly documents are only indexed, not downloaded,
-		// since some of the convocations weigh tens of megabytes. We used to
-		// send the browser to the pre-signed URL that Foncia hands out, but
-		// that makes the link depend on the API being reachable and on our
-		// token still being valid; when the token had expired, the link simply
-		// answered "not found". Let's download the PDF instead, remember where
-		// we put it, and serve it from disk from now on.
-		if typ == "doc" && (filePathReal == "" || !fileExists(filePathReal)) {
-			// Two browsers clicking the same never-downloaded document at once
-			// would otherwise write the same .part file concurrently. Let the
-			// second one wait and then find the file already on disk.
-			unlock := downloadLocks.Lock(hashFile)
-			defer unlock()
-
-			doc, err := db.GetAccountDocumentByHashFileDB(r.Context(), sqlDB, hashFile)
-			if err != nil {
-				logutil.Errorf("while getting account document %q: %v", hashFile, err)
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			if doc.FilePath != "" && fileExists(doc.FilePath) {
-				filePathReal = doc.FilePath
-			} else {
-				filePathReal, err = downloadAccountDocument(r.Context(), sqlDB, client, invoicesDir, doc)
-				if err != nil {
-					logutil.Errorf("while downloading the document %s: %v", hashFile, err)
-					http.Error(w, "not found", http.StatusNotFound)
-					return
-				}
-			}
-		}
-
+		filePathReal, err := resolveDocument(r.Context(), sqlDB, client, invoicesDir, typ, hashFile)
+		switch {
 		// path.Base("") returns ".", and http.Redirect cleans that away, which
 		// means an empty file path used to make us redirect to the very URL
 		// that was requested: an infinite redirect loop. Let's tell the truth
 		// instead.
-		if filePathReal == "" {
+		case errors.Is(err, errNotDownloaded):
 			logutil.Errorf("no file on disk for %q", r.URL.Path)
 			http.Error(w, "not found: this file hasn't been downloaded yet", http.StatusNotFound)
+			return
+		case err != nil:
+			logutil.Errorf("while looking up %s %q: %v", typ, hashFile, err)
+			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 

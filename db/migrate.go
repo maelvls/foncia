@@ -54,6 +54,11 @@ var migrations = []migration{
 		// migrations/0002_strict_schema.sql, which this function executes.
 		fn: migrateToStrictSchema,
 	},
+	{
+		version: 3,
+		name:    "oauth",
+		sql:     migrationSQL("0003_oauth.sql"),
+	},
 }
 
 // migrationSQL reads an embedded migration. It panics rather than returning an

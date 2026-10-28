@@ -36,7 +36,8 @@ var (
 	serveBaseURL   = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications. If empty, --addr is used.")
 	dbPath         = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
 	allowedUsers   = flag.String("allowed-users", "", "Comma-separated list of email addresses allowed to use the web UI, matched against --auth-header. Empty (the default) means no check is done in this process and access control is left entirely to the reverse proxy.")
-	authHeader     = flag.String("auth-header", "X-Forwarded-Email", "Header set by the authenticating reverse proxy, used by --allowed-users. The proxy must strip this header from incoming requests.")
+	authHeader     = flag.String("auth-header", "X-Forwarded-Email", "Header set by the authenticating reverse proxy, used by --allowed-users and by /oauth/authorize (see --mcp). The proxy must strip this header from incoming requests.")
+	mcpFlag        = flag.Bool("mcp", false, "Serve an MCP server on /mcp for Claude, ChatGPT, Grok..., with its own OAuth 2.1 authorization server. The reverse proxy must log the users in on /oauth/authorize and give their email in --auth-header, and let /mcp, /oauth/token, /oauth/register and /.well-known/oauth-* through without a login. The links and the OAuth issuer use --baseurl.")
 	ntfyTopic      = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/.")
 	invoicesDir    = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
 	htmlHeaderFile = flag.String("header-file", "", "File containing an HTML header to be added to the top of the page. Can contain Go template syntax. The template is executed with the following data: {BasePath, SyncStatus, NtfyTopic, Items, Version}.")
@@ -283,7 +284,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			defer cancel(nil)
-			err := ServeHTTP(ctx, sqlDB, httpListen, client, uuid, *serveBasePath, *invoicesDir, readLastSync, htmlHeader)
+			err := ServeHTTP(ctx, sqlDB, httpListen, client, uuid, *serveBasePath, serveBaseURL, *invoicesDir, readLastSync, htmlHeader)
 			if err != nil {
 				cancel(err)
 			}
