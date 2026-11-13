@@ -1,0 +1,114 @@
+{{define "head"}}
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+	:root {
+		--border: #e3e3e8; --bg-alt: #f7f7fa; --text: #26262b; --muted: #6b6b76;
+		--accent: #5b3fd6; --ok: #1f7a3a; --ok-bg: #dff3e5;
+		--warn: #8a6100; --warn-bg: #fdf0cc; --danger: #c02626;
+	}
+	* { box-sizing: border-box; }
+	body {
+		font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+		color: var(--text); margin: 0 auto; padding: 0 16px 48px; max-width: 1240px;
+		font-size: 15px; line-height: 1.4;
+	}
+	a { color: var(--accent); }
+	h1 { font-size: 1.35rem; margin: 18px 0 12px; }
+	h2 { font-size: 1.05rem; margin: 28px 0 10px; }
+	h2 small, h1 small { color: var(--muted); font-weight: normal; font-size: .85rem; }
+	small, .muted { color: var(--muted); }
+	nav.sections {
+		display: flex; gap: 4px; flex-wrap: wrap; align-items: center;
+		border-bottom: 1px solid var(--border); padding: 10px 0 0;
+	}
+	nav.sections a {
+		padding: 8px 12px; text-decoration: none; color: var(--muted);
+		border-bottom: 2px solid transparent; margin-bottom: -1px;
+	}
+	nav.sections a.actif { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+	nav.sections .qui { margin-left: auto; font-size: .8rem; color: var(--muted); padding: 8px 0; }
+
+	.scroll { overflow-x: auto; }
+	table { border-collapse: collapse; width: 100%; font-size: .87rem; }
+	th {
+		text-align: left; padding: 8px; color: var(--muted); font-size: .75rem;
+		text-transform: uppercase; letter-spacing: .02em; border-bottom: 1px solid var(--border); white-space: nowrap;
+	}
+	td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+	tbody tr:hover td { background: var(--bg-alt); }
+	td.num, th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+	td small { display: block; }
+	tr.sous td:first-child { padding-left: 28px; color: var(--muted); }
+	tr.total td { font-weight: 600; border-top: 2px solid var(--border); }
+
+	.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: .75rem; font-weight: 600; white-space: nowrap; }
+	.badge.en_cours, .badge.a_demander, .badge.demande { background: var(--warn-bg); color: var(--warn); }
+	.badge.levee, .badge.rembourse { background: var(--ok-bg); color: var(--ok); }
+	.badge.abandonne, .badge.neutre { background: var(--bg-alt); color: var(--muted); }
+
+	.btn, button.btn {
+		display: inline-block; padding: 7px 13px; background: var(--accent); color: #fff; border: 1px solid var(--accent);
+		border-radius: 6px; text-decoration: none; font: inherit; font-size: .9rem; cursor: pointer;
+	}
+	.btn.secondaire { background: #fff; color: var(--accent); }
+	.btn.danger { background: #fff; color: var(--danger); border-color: var(--danger); }
+	button.lien { background: none; border: none; color: var(--muted); font: inherit; font-size: .8rem; cursor: pointer; padding: 0; text-decoration: underline; }
+	.barre-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+	.flash { padding: 8px 12px; background: var(--ok-bg); color: var(--ok); border-radius: 6px; margin: 12px 0; }
+
+	.cartes { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 12px 0; }
+	.carte { border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+	.carte .titre { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .02em; }
+	.carte .valeur { font-size: 1.3rem; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+	.jauge { height: 8px; background: var(--bg-alt); border-radius: 4px; overflow: hidden; margin-top: 6px; min-width: 60px; }
+	.jauge span { display: block; height: 100%; background: var(--accent); }
+	.jauge.depasse span { background: var(--danger); }
+
+	.mois { display: grid; grid-template-columns: repeat(12, 1fr); gap: 6px; align-items: end; height: 150px; margin: 8px 0 4px; }
+	.mois .col { display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
+	.mois .col span { display: block; background: var(--accent); border-radius: 3px 3px 0 0; min-height: 1px; }
+	.mois-noms { display: grid; grid-template-columns: repeat(12, 1fr); gap: 6px; font-size: .72rem; color: var(--muted); text-align: center; }
+
+	form.grille { display: grid; grid-template-columns: 190px 1fr; gap: 9px 14px; max-width: 820px; }
+	form.grille label { padding-top: 7px; color: var(--muted); font-size: .9rem; }
+	input[type=text], input[type=number], input[type=date], input[type=search], input[type=url], textarea, select {
+		font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 5px; width: 100%; background: #fff;
+	}
+	textarea { min-height: 4.2em; resize: vertical; }
+	form.grille .aide { grid-column: 2; font-size: .8rem; color: var(--muted); margin-top: -4px; }
+	form.grille .actions { grid-column: 1 / -1; display: flex; gap: 8px; justify-content: space-between; margin-top: 8px; flex-wrap: wrap; }
+	form.ligne { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+	form.ligne > * { flex: 1 1 160px; }
+	form.ligne > button, form.ligne > .court { flex: 0 0 auto; width: auto; }
+	form.inline { display: inline; }
+
+	dl.fiche { display: grid; grid-template-columns: 190px 1fr; gap: 6px 14px; margin: 8px 0; }
+	dl.fiche dt { color: var(--muted); font-size: .9rem; }
+	dl.fiche dd { margin: 0; white-space: pre-wrap; }
+	.deux { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+	details.bloc { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+	details.bloc > summary { cursor: pointer; color: var(--accent); }
+	.piece, .commentaire { padding: 9px 0; border-bottom: 1px solid var(--border); }
+	.piece .tete, .commentaire .tete { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+	.piece .montant { margin-left: auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
+	.commentaire p, .piece p { margin: 4px 0 0; white-space: pre-wrap; }
+	@media (max-width: 720px) {
+		.deux { grid-template-columns: 1fr; gap: 0; }
+		form.grille, dl.fiche { grid-template-columns: 1fr; gap: 4px; }
+		form.grille .aide, form.grille .actions { grid-column: 1; }
+		dl.fiche dt { margin-top: 8px; }
+	}
+</style>
+{{end}}
+
+{{define "nav"}}
+<nav class="sections">
+	<a href="{{.BasePath}}/affaires" {{if eq .Section "affaires"}}class="actif"{{end}}>Affaires</a>
+	<a href="{{.BasePath}}/comptes" {{if eq .Section "comptes"}}class="actif"{{end}}>Comptes</a>
+	<a href="{{.BasePath}}/remboursements" {{if eq .Section "remboursements"}}class="actif"{{end}}>Remboursements</a>
+	<a href="{{.BasePath}}/">Factures et ordres de service</a>
+	<span class="qui">{{.User}}</span>
+</nav>
+{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
+{{end}}

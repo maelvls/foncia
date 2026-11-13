@@ -1,0 +1,65 @@
+{{define "affaires"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>Affaires du conseil syndical</title>
+{{template "head"}}
+</head>
+<body>
+{{template "nav" .}}
+
+<div class="barre-actions">
+	<h1 style="margin: 8px auto 8px 0">Affaires du conseil syndical</h1>
+	<a href="{{.BasePath}}/affaires/new" class="btn">Nouvelle affaire</a>
+</div>
+
+<h2>En cours <small>({{len .EnCours}})</small></h2>
+{{template "affaires_table" tableAffaires .BasePath .EnCours}}
+
+<h2>Levées <small>({{len .Leves}})</small></h2>
+{{template "affaires_table" tableAffaires .BasePath .Leves}}
+</body>
+</html>
+{{end}}
+
+{{define "affaires_table"}}
+<div class="scroll">
+<table>
+	<thead>
+		<tr>
+			<th>N°</th><th>Affaire</th><th>Foncia (action)</th><th>En charge</th>
+			<th>Suivi</th><th>Observations</th><th>Dossier</th>
+		</tr>
+	</thead>
+	<tbody>
+		{{range .Lignes}}
+		<tr id="affaire-{{.ID}}">
+			<td class="num">{{.Numero}}</td>
+			<td>
+				<a href="{{$.BasePath}}/affaires/{{.ID}}"><strong>{{.Titre}}</strong></a>
+				{{if .Localisation}}<small>{{.Localisation}}</small>{{end}}
+				{{if .LienDevis}}<small>Devis : {{.LienDevis}}</small>{{end}}
+			</td>
+			<td>{{.ActionFoncia}}</td>
+			<td>{{.Responsable}}</td>
+			<td>
+				{{if .DateSignalement}}<small>Signalé : {{.DateSignalement}}</small>{{end}}
+				{{range .Relances}}<small>Relance : {{.Date}}{{if .Note}} ({{.Note}}){{end}}</small>{{end}}
+				{{if .DateLevee}}<small>Levé : {{.DateLevee}}</small>{{end}}
+			</td>
+			<td>
+				{{if .ObsCopro}}<small><strong>Copro :</strong> {{.ObsCopro}}</small>{{end}}
+				{{if .ObsSyndic}}<small><strong>Syndic :</strong> {{.ObsSyndic}}</small>{{end}}
+			</td>
+			<td>
+				{{if .Stats.Commentaires}}<small>{{.Stats.Commentaires}} commentaire{{if gt .Stats.Commentaires 1}}s{{end}}</small>{{end}}
+				{{if .Stats.Liens}}<small>{{.Stats.Liens}} pièce{{if gt .Stats.Liens 1}}s{{end}}</small>{{end}}
+				{{if .Stats.Engage}}<small>{{.Stats.Engage}} facturés</small>{{end}}
+			</td>
+		</tr>
+		{{else}}
+		<tr><td colspan="7" class="muted">Aucune affaire.</td></tr>
+		{{end}}
+	</tbody>
+</table>
+</div>
+{{end}}

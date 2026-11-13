@@ -85,6 +85,13 @@ func TestMigrate(t *testing.T) {
 		assert.Equal(t, []string{
 			"idx_account_documents_category",
 			"idx_account_documents_hash_file",
+			"idx_affaires_commentaires_affaire_id",
+			"idx_affaires_liens_affaire_id",
+			"idx_affaires_liens_ref",
+			"idx_affaires_liens_unique",
+			"idx_affaires_numero",
+			"idx_affaires_relances_affaire_id",
+			"idx_affaires_statut",
 			"idx_contract_documents_hash_file",
 			"idx_contract_documents_supplier_id",
 			"idx_expenses_hash_file",
@@ -92,6 +99,7 @@ func TestMigrate(t *testing.T) {
 			"idx_missions_started_at",
 			"idx_oauth_tokens_email",
 			"idx_oauth_tokens_expires_at",
+			"idx_remboursements_statut",
 			"idx_work_orders_mission_id",
 			"idx_work_orders_supplier_id",
 		}, indexNames(t, sqlDB), "idx_entries_started_at must have been renamed")
