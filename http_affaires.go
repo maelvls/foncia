@@ -518,7 +518,7 @@ func parseAffaireForm(r *http.Request) (db.AffaireDB, error) {
 	numStr := strings.TrimSpace(r.FormValue("numero"))
 	num, err := strconv.Atoi(numStr)
 	if err != nil || num < 1 {
-		return db.AffaireDB{}, fmt.Errorf("N° invalide : %q", numStr)
+		return db.AffaireDB{}, fmt.Errorf("numéro invalide : %q", numStr)
 	}
 	titre := strings.TrimSpace(r.FormValue("titre"))
 	if titre == "" {
