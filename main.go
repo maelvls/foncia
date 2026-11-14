@@ -111,7 +111,7 @@ func main() {
 			"  %s [flags] <command>\n"+
 			"\n"+
 			"Commands:\n"+
-			"  serve, list, comptes-travaux, convocations, rm-last-expense, rm-last-mission, token, version\n"+
+			"  serve, list, comptes-travaux, convocations, import-affaires, import-remboursements, rm-last-expense, rm-last-mission, token, version\n"+
 			"\n"+
 			"Flags:\n", os.Args[0])
 		flag.CommandLine.PrintDefaults()
@@ -334,6 +334,24 @@ func main() {
 
 		username, password := getCreds()
 		ConvocationsCmd(ctx, username, password, search, *outDir, *withAll, *asJSON)
+	case "import-affaires":
+		args := flag.Args()[1:]
+		if len(args) != 1 {
+			logutil.Errorf("usage: %s import-affaires <path/to/affaires.json>", os.Args[0])
+			os.Exit(1)
+		}
+		sqlDB := openDB()
+		defer sqlDB.Close()
+		ImportAffairesCmd(ctx, sqlDB, args[0])
+	case "import-remboursements":
+		args := flag.Args()[1:]
+		if len(args) != 1 {
+			logutil.Errorf("usage: %s import-remboursements <path/to/remboursements.json>", os.Args[0])
+			os.Exit(1)
+		}
+		sqlDB := openDB()
+		defer sqlDB.Close()
+		ImportRemboursementsCmd(ctx, sqlDB, args[0])
 	case "rm-last-expense":
 		sqlDB := openDB()
 		defer sqlDB.Close()

@@ -1,0 +1,105 @@
+{{define "depenses"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>Dépenses</title>
+{{template "head"}}
+</head>
+<body>
+{{template "nav" .}}
+
+<p><a href="{{.BasePath}}/comptes{{if not .F.Tout}}?exercice={{.F.Exercice}}{{end}}">← Comptes{{if not .F.Tout}} {{.F.Exercice | exercice}}{{end}}</a></p>
+<h1>Dépenses <small>{{.N}} ligne{{if gt .N 1}}s{{end}} · {{.Debits}} dépensés{{if .Credits}} · {{.Credits}} encaissés{{end}}</small></h1>
+
+<form method="GET" action="{{.BasePath}}/comptes/depenses" class="ligne">
+	<input type="search" name="q" value="{{.F.Q}}" placeholder="Chercher : libellé, fournisseur, montant…">
+	<select name="exercice" class="court">
+		<option value="tous">Tous les exercices</option>
+		{{range .Exercices}}<option value="{{.}}" {{if and (not $.F.Tout) (eq . $.F.Exercice)}}selected{{end}}>{{. | exercice}}</option>{{end}}
+	</select>
+	<select name="source" class="court">
+		<option value="">Tous les comptes</option>
+		<option value="accounting" {{if eq .F.Source "accounting"}}selected{{end}}>Compte courant</option>
+		<option value="repairs" {{if eq .F.Source "repairs"}}selected{{end}}>Comptes travaux</option>
+	</select>
+	{{if .F.Allocation}}<input type="hidden" name="allocation" value="{{.F.Allocation}}">{{end}}
+	{{if .F.Nature}}<input type="hidden" name="nature" value="{{.F.Nature}}">{{end}}
+	{{if .F.Fournisseur}}<input type="hidden" name="fournisseur" value="{{.F.Fournisseur}}">{{end}}
+	<button class="btn secondaire">Filtrer</button>
+</form>
+{{if or .F.Allocation .F.Nature .F.Fournisseur}}
+<p>
+	{{if .F.Fournisseur}}<span class="badge neutre">Fournisseur : {{.F.Fournisseur}}</span>{{end}}
+	{{if .F.Allocation}}<span class="badge neutre">Catégorie : {{.F.Allocation}}</span>{{end}}
+	{{if .F.Nature}}<span class="badge neutre">Nature : {{.F.Nature}}</span>{{end}}
+	<a href="{{.BasePath}}/comptes/depenses?exercice={{if .F.Tout}}tous{{else}}{{.F.Exercice}}{{end}}">retirer ces filtres</a>
+</p>
+{{end}}
+{{if .Tronque}}<p class="muted">Seules les {{len .Lignes}} lignes les plus récentes sont affichées ; les totaux portent sur les {{.N}}.</p>{{end}}
+
+<div class="scroll">
+<table>
+	<thead><tr><th>Date</th><th>Libellé</th><th>Catégorie</th><th class="num">Montant</th><th>Affaires</th></tr></thead>
+	<tbody>
+		{{range .Lignes}}
+		<tr>
+			<td>{{.Local.Format "02/01/2006"}}</td>
+			<td>
+				<a href="{{$.BasePath}}/comptes/depenses/{{.ID}}">{{.Label}}</a>
+				<small>{{.Fournisseur}}{{if .Href}} · <a href="{{.Href}}">facture PDF</a>{{end}}{{if .Doublons}} · publiée {{len .IDs}} fois par Foncia, comptée une fois{{end}}</small>
+			</td>
+			<td><small>{{.AccountingKey.Allocation}}</small><small>{{.Nature}}</small>{{if eq (print .Source) "repairs"}}<small>compte travaux</small>{{end}}</td>
+			<td class="num">{{if .Debit}}{{.Amount}}{{else}}<span style="color: var(--ok)">+{{.Abs}}</span>{{end}}</td>
+			<td>
+				{{range .Affaires}}<small><a href="{{$.BasePath}}/affaires/{{.ID}}">n°{{.Numero}} {{.Titre}}</a></small>{{end}}
+			</td>
+		</tr>
+		{{else}}
+		<tr><td colspan="5" class="muted">Aucune dépense ne correspond.</td></tr>
+		{{end}}
+	</tbody>
+</table>
+</div>
+</body>
+</html>
+{{end}}
+
+{{define "depense"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>{{.D.Label}}</title>
+{{template "head"}}
+</head>
+<body>
+{{template "nav" .}}
+
+<p><a href="{{.BasePath}}/comptes/depenses?exercice={{.D.Exercice}}">← Dépenses {{.D.Exercice | exercice}}</a></p>
+<h1>{{.D.Label}}</h1>
+
+<dl class="fiche">
+	<dt>{{if .D.Debit}}Montant payé{{else}}Montant encaissé{{end}}</dt><dd><strong>{{.D.Abs}}</strong></dd>
+	<dt>Date</dt><dd>{{.D.Local.Format "02/01/2006"}}</dd>
+	<dt>Fournisseur</dt><dd><a href="{{.BasePath}}/comptes/depenses?exercice=tous&fournisseur={{.D.Fournisseur}}">{{.D.Fournisseur}}</a></dd>
+	<dt>Catégorie</dt><dd>{{.D.AccountingKey.Allocation}} — {{.D.Nature}}</dd>
+	<dt>Compte</dt><dd>{{if eq (print .D.Source) "repairs"}}Compte travaux{{else}}Compte courant{{end}}</dd>
+	<dt>Facture</dt><dd>{{if .Href}}<a href="{{.Href}}">ouvrir le PDF</a>{{else}}pas de PDF{{end}}</dd>
+	{{if .D.Doublons}}<dt>Publications</dt><dd>Foncia a publié cette dépense {{len .D.IDs}} fois ; elle n'est comptée qu'une fois.</dd>{{end}}
+</dl>
+
+<h2>Affaires liées <small>({{len .Liees}})</small></h2>
+{{range .Liees}}
+<p><a href="{{$.BasePath}}/affaires/{{.ID}}">n°{{.Numero}} {{.Titre}}</a> <span class="badge {{.Statut}}">{{if eq (print .Statut) "levee"}}Levée{{else}}En cours{{end}}</span></p>
+{{else}}
+<p class="muted">Cette dépense n'est rattachée à aucune affaire.</p>
+{{end}}
+
+<form method="POST" action="{{.BasePath}}/comptes/depenses/{{.D.ID}}/lier" class="ligne">
+	<select name="affaire_id" required>
+		<option value="">Rattacher à l'affaire…</option>
+		{{range .Affaires}}<option value="{{.ID}}">n°{{.Numero}} {{.Titre}}{{if eq (print .Statut) "levee"}} (levée){{end}}</option>{{end}}
+	</select>
+	<input type="text" name="note" placeholder="Note (facultatif)">
+	<button class="btn">Rattacher</button>
+</form>
+</body>
+</html>
+{{end}}

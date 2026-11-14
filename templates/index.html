@@ -39,6 +39,13 @@
 <body>
 	<h1>Suivi des factures et ordres de service de la copro TERRA NOSTRA 2</h1>
 
+	<p>
+		Conseil syndical :
+		<a href="{{.BasePath}}/affaires">affaires en cours</a> ·
+		<a href="{{.BasePath}}/comptes">comptes</a> ·
+		<a href="{{.BasePath}}/remboursements">remboursements</a>
+	</p>
+
 	{{ template "header" . }}
 
     <form action="{{.BasePath}}/" method="GET">

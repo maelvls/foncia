@@ -292,6 +292,9 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 
 	mux.HandleFunc("GET /coowners", coownersEndpoint(client, uuid))
 
+	addAffairesHandlers(mux, sqlDB, basePath)
+	addComptesHandlers(mux, sqlDB, basePath)
+
 	return nil
 }
 

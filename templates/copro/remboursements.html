@@ -1,0 +1,122 @@
+{{define "remboursements"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>Remboursements</title>
+{{template "head"}}
+</head>
+<body>
+{{template "nav" .}}
+
+<div class="barre-actions">
+	<h1 style="margin: 8px auto 8px 0">Achats avancés pour la copropriété</h1>
+	<a href="{{.BasePath}}/remboursements/new" class="btn">Ajouter un achat</a>
+</div>
+
+<div class="cartes">
+	<div class="carte">
+		<div class="titre">En attente de remboursement</div>
+		<div class="valeur">{{.TotalAttente}}</div>
+		<small>{{len .EnAttente}} achat{{if gt (len .EnAttente) 1}}s{{end}}</small>
+	</div>
+	<div class="carte">
+		<div class="titre">Déjà remboursé</div>
+		<div class="valeur">{{.TotalRembourse}}</div>
+	</div>
+</div>
+
+<h2>En attente <small>({{len .EnAttente}})</small></h2>
+{{template "remboursements_table" tableRemboursements .BasePath .EnAttente}}
+
+<h2>Remboursés ou abandonnés <small>({{len .Autres}})</small></h2>
+{{template "remboursements_table" tableRemboursements .BasePath .Autres}}
+</body>
+</html>
+{{end}}
+
+{{define "remboursements_table"}}
+<div class="scroll">
+<table>
+	<thead><tr><th>Achat</th><th>Objet</th><th>Avancé par</th><th class="num">Montant</th><th>Statut</th><th>Suivi</th></tr></thead>
+	<tbody>
+		{{range .Lignes}}
+		<tr id="remboursement-{{.ID}}">
+			<td>{{.DateAchatFrench}}</td>
+			<td><a href="{{$.BasePath}}/remboursements/{{.ID}}">{{.Objet}}</a><small>{{.Vendeur}}</small></td>
+			<td>{{.Demandeur}}</td>
+			<td class="num">{{.Montant}}</td>
+			<td><span class="badge {{.Statut}}">{{.Statut.French}}</span></td>
+			<td>
+				{{if .DateDemande}}<small>Demandé : {{.DateDemande}}</small>{{end}}
+				{{if .DateRemboursement}}<small>Remboursé : {{.DateRemboursement}}</small>{{end}}
+				{{if .Preuve}}<small>Preuve : {{.Preuve}}</small>{{end}}
+				{{if .Detail}}<small>{{.Detail}}</small>{{end}}
+			</td>
+		</tr>
+		{{else}}
+		<tr><td colspan="6" class="muted">Rien ici.</td></tr>
+		{{end}}
+	</tbody>
+</table>
+</div>
+{{end}}
+
+{{define "remboursement_edit"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>{{if .IsNew}}Ajouter un achat{{else}}{{.R.Objet}}{{end}}</title>
+{{template "head"}}
+</head>
+<body>
+{{template "nav" .}}
+
+<p><a href="{{.BasePath}}/remboursements">← Tous les achats</a></p>
+<h1>{{if .IsNew}}Ajouter un achat à se faire rembourser{{else}}{{.R.Objet}}{{end}}</h1>
+
+<form method="POST" action="{{.BasePath}}/remboursements/{{if .IsNew}}new{{else}}{{.R.ID}}{{end}}" class="grille">
+	<label for="objet">Objet</label>
+	<input id="objet" type="text" name="objet" value="{{.R.Objet}}" required placeholder="6 BAES, étiquette C02…">
+
+	<label for="vendeur">Vendeur</label>
+	<input id="vendeur" type="text" name="vendeur" value="{{.R.Vendeur}}">
+
+	<label for="montant">Montant (€)</label>
+	<input id="montant" type="text" name="montant" inputmode="decimal" required value="{{if .R.Montant}}{{.R.Montant.Input}}{{end}}" placeholder="39,85">
+
+	<label for="date_achat">Date d'achat</label>
+	<input id="date_achat" type="date" name="date_achat" value="{{.R.DateAchat}}">
+
+	<label for="demandeur">Avancé par</label>
+	<input id="demandeur" type="text" name="demandeur" value="{{.R.Demandeur}}">
+
+	<label for="statut">Statut</label>
+	<select id="statut" name="statut">
+		<option value="a_demander" {{if eq (print .R.Statut) "a_demander"}}selected{{end}}>À demander au syndic</option>
+		<option value="demande" {{if eq (print .R.Statut) "demande"}}selected{{end}}>Demandé, en attente</option>
+		<option value="rembourse" {{if eq (print .R.Statut) "rembourse"}}selected{{end}}>Remboursé</option>
+		<option value="abandonne" {{if eq (print .R.Statut) "abandonne"}}selected{{end}}>Abandonné (ne sera pas demandé)</option>
+	</select>
+
+	<label for="date_demande">Demande</label>
+	<input id="date_demande" type="text" name="date_demande" value="{{.R.DateDemande}}" placeholder="Email du 23/07/2025">
+
+	<label for="date_remboursement">Remboursement</label>
+	<input id="date_remboursement" type="text" name="date_remboursement" value="{{.R.DateRemboursement}}" placeholder="18/08/2025, par virement">
+
+	<label for="preuve">Preuve</label>
+	<input id="preuve" type="text" name="preuve" value="{{.R.Preuve}}" placeholder="Ticket, lien vers la facture…">
+
+	<label for="detail">Détail</label>
+	<textarea id="detail" name="detail">{{.R.Detail}}</textarea>
+
+	<div class="actions">
+		<button type="submit" class="btn">Enregistrer</button>
+		{{if not .IsNew}}
+		<button type="submit" formaction="{{.BasePath}}/remboursements/{{.R.ID}}/delete" formnovalidate class="btn danger"
+			onclick="return confirm('Supprimer cet achat ?')">Supprimer</button>
+		{{end}}
+	</div>
+	{{if not .IsNew}}<div class="aide">Saisi par {{.R.CreatedBy}} le {{jour .R.CreatedAt}}, modifié le {{jour .R.UpdatedAt}}.</div>{{end}}
+</form>
+</body>
+</html>
+{{end}}

@@ -1,0 +1,151 @@
+{{define "comptes"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>Comptes {{.C.Nom}}</title>
+{{template "head"}}
+</head>
+<body>
+{{template "nav" .}}
+
+<div class="barre-actions">
+	<h1 style="margin: 8px auto 8px 0">Comptes {{.C.Nom}} <small>exercice du 1er juillet au 30 juin</small></h1>
+	{{range .C.Exercices}}
+		{{if eq . $.C.Exercice}}<strong>{{. | exercice}}</strong>{{else}}<a href="{{$.BasePath}}/comptes?exercice={{.}}">{{. | exercice}}</a>{{end}}
+	{{end}}
+</div>
+
+<div class="cartes">
+	<div class="carte">
+		<div class="titre">Compte courant, dépensé</div>
+		<div class="valeur">{{.C.Courant}}</div>
+		<small>{{.C.CourantPrec}} sur tout l'exercice {{.C.Precedent}}</small>
+		<small><a href="{{.BasePath}}/comptes/depenses?exercice={{.C.Exercice}}&source=accounting">voir les lignes</a></small>
+	</div>
+	<div class="carte">
+		<div class="titre">Compte courant, encaissé</div>
+		<div class="valeur">{{.C.CourantCredits}}</div>
+		<small>indemnités d'assurance, avoirs, régularisations</small>
+	</div>
+	<div class="carte">
+		<div class="titre">Comptes travaux, dépensé</div>
+		<div class="valeur">{{.C.Travaux}}</div>
+		<small>{{.C.TravauxCredits}} encaissés (appels, indemnités, transferts)</small>
+		<small><a href="{{.BasePath}}/comptes/depenses?exercice={{.C.Exercice}}&source=repairs">voir les lignes</a></small>
+	</div>
+	<div class="carte">
+		<div class="titre">Remboursements en attente</div>
+		<div class="valeur">{{.Attente}}</div>
+		<small><a href="{{.BasePath}}/remboursements">{{.AttenteN}} achat{{if gt .AttenteN 1}}s{{end}} avancé{{if gt .AttenteN 1}}s{{end}} par des copropriétaires</a></small>
+	</div>
+</div>
+
+<h2>Budget {{.C.Nom}} <small>comparé aux dépenses du compte courant</small></h2>
+{{if .ABudget}}
+<div class="carte">
+	<strong>{{.C.Courant}}</strong> dépensés sur <strong>{{.Budget.Montant}}</strong> votés ({{.BudgetPct}} %) —
+	{{if .BudgetDepasse}}<strong style="color: var(--danger)">dépassement de {{.BudgetReste | positif}}</strong>{{else}}reste {{.BudgetReste}}{{end}}
+	<div class="jauge {{if .BudgetDepasse}}depasse{{end}}"><span style="width: {{.BudgetPct}}%"></span></div>
+	{{if .Budget.Note}}<p style="white-space: pre-wrap; margin: 8px 0 0">{{.Budget.Note}}</p>{{end}}
+	<small>Saisi par {{.Budget.UpdatedBy}} le {{jour .Budget.UpdatedAt}}.</small>
+</div>
+{{else}}
+<p class="muted">Aucun budget saisi pour {{.C.Nom}}.</p>
+{{end}}
+<details class="bloc">
+	<summary>{{if .ABudget}}Modifier le budget{{else}}Saisir le budget voté{{end}}</summary>
+	<form method="POST" action="{{.BasePath}}/comptes/budget" class="grille">
+		<input type="hidden" name="exercice" value="{{.C.Exercice}}">
+		<label for="montant">Budget voté (€)</label>
+		<input id="montant" type="text" name="montant" inputmode="decimal" required value="{{if .ABudget}}{{.Budget.Montant.Input}}{{end}}" placeholder="55 000">
+		<label for="note">Note</label>
+		<textarea id="note" name="note" placeholder="Résolution de l'AG, hypothèses…">{{.Budget.Note}}</textarea>
+		<div class="actions"><button class="btn">Enregistrer le budget</button></div>
+	</form>
+</details>
+
+<h2>Compte courant, dépenses par mois</h2>
+<div class="mois">
+	{{range .C.Mois}}<div class="col" title="{{.Nom}} : {{.Debits}}"><span style="height: {{.Pct}}%"></span></div>{{end}}
+</div>
+<div class="mois-noms">{{range .C.Mois}}<span>{{.Nom}}</span>{{end}}</div>
+
+<div class="deux">
+<section>
+	<h2>Compte courant par catégorie <small>clés de répartition et natures de Foncia</small></h2>
+	<div class="scroll">
+	<table>
+		<thead><tr><th>Catégorie</th><th class="num">{{.C.Nom}}</th><th class="num">{{.C.Precedent}}</th><th></th></tr></thead>
+		<tbody>
+			{{range .C.Categories}}
+			<tr>
+				<td><a href="{{$.BasePath}}/comptes/depenses?{{.Query}}"><strong>{{.Nom}}</strong></a>{{if .Credits}}<small>{{.Credits}} encaissés</small>{{end}}</td>
+				<td class="num"><strong>{{.Debits}}</strong></td>
+				<td class="num muted">{{.Precedent}}</td>
+				<td><div class="jauge"><span style="width: {{.Pct}}%"></span></div></td>
+			</tr>
+			{{range .Natures}}
+			<tr class="sous">
+				<td><a href="{{$.BasePath}}/comptes/depenses?{{.Query}}">{{.Nom}}</a>{{if .Credits}}<small>{{.Credits}} encaissés</small>{{end}}</td>
+				<td class="num">{{.Debits}}</td>
+				<td class="num muted">{{.Precedent}}</td>
+				<td></td>
+			</tr>
+			{{end}}
+			{{else}}
+			<tr><td colspan="4" class="muted">Aucune dépense sur cet exercice.</td></tr>
+			{{end}}
+		</tbody>
+	</table>
+	</div>
+
+	{{if .C.TravauxLots}}
+	<h2>Comptes travaux</h2>
+	<div class="scroll">
+	<table>
+		<thead><tr><th>Clé de répartition</th><th class="num">Dépensé</th><th class="num">Encaissé</th></tr></thead>
+		<tbody>
+			{{range .C.TravauxLots}}
+			<tr>
+				<td><a href="{{$.BasePath}}/comptes/depenses?{{.Query}}">{{.Nom}}</a><small>{{.N}} ligne{{if gt .N 1}}s{{end}}</small></td>
+				<td class="num">{{.Debits}}</td>
+				<td class="num">{{.Credits}}</td>
+			</tr>
+			{{end}}
+		</tbody>
+	</table>
+	</div>
+	{{end}}
+</section>
+
+<section>
+	<h2>Par fournisseur <small>les deux comptes, déduit du nom des factures</small></h2>
+	<div class="scroll">
+	<table>
+		<thead><tr><th>Fournisseur</th><th class="num">{{.C.Nom}}</th><th class="num">{{.C.Precedent}}</th><th></th></tr></thead>
+		<tbody>
+			{{range .C.Fournisseurs}}
+			<tr>
+				<td><a href="{{$.BasePath}}/comptes/depenses?{{.Query}}">{{.Nom}}</a><small>{{.N}} ligne{{if gt .N 1}}s{{end}}{{if .Credits}} · {{.Credits}} encaissés{{end}}</small></td>
+				<td class="num">{{.Debits}}</td>
+				<td class="num muted">{{.Precedent}}</td>
+				<td><div class="jauge"><span style="width: {{.Pct}}%"></span></div></td>
+			</tr>
+			{{else}}
+			<tr><td colspan="4" class="muted">Aucune dépense sur cet exercice.</td></tr>
+			{{end}}
+		</tbody>
+	</table>
+	</div>
+</section>
+</div>
+
+<p class="muted">
+	Les montants viennent de la comptabilité publiée par Foncia. Foncia publie chaque dépense plusieurs fois
+	(comptes en cours, puis répartition de l'exercice clos, et libellés réécrits) : {{.C.Doublons}} copie{{if gt .C.Doublons 1}}s{{end}}
+	ont été écartées sur cet exercice, en rapprochant les lignes par facture, montant et catégorie.
+	Les comptes travaux n'ont pas de facture jointe et sont rapprochés par montant : leurs totaux sont à contrôler
+	avec les annexes comptables de l'assemblée générale.
+</p>
+</body>
+</html>
+{{end}}

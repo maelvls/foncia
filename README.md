@@ -247,3 +247,38 @@ being held in Go string literals.
 Logs go to stderr through `logutil`, which is a thin `log/slog` handler that
 prints `level: message`. Colours turn themselves off when stderr is not a
 terminal or when `NO_COLOR` is set, so container logs stay readable.
+
+## Conseil syndical: affaires, comptes, remboursements
+
+Three pages for what the conseil syndical used to keep in spreadsheets, served
+by `serve` next to the rest and behind the same reverse proxy. What people
+write is signed with the e-mail the proxy gives in `--auth-header`.
+
+- `/affaires`: the désordres and other subjects the conseil follows. Each
+  affaire is a dossier: its fiche, a thread of comments, and what is attached
+  to it — invoices, Foncia documents, work orders, remboursements, e-mails and
+  links. The invoices attached to an affaire add up to what it has cost.
+- `/comptes`: for each exercise (1st of July to 30th of June), what was spent
+  from the day-to-day account against the budget entered there, by category,
+  by supplier and by month, and the works accounts apart. Every total links to
+  the expenses behind it.
+- `/remboursements`: what co-owners paid out of pocket for the copropriété and
+  whether the syndic paid it back.
+
+The expenses table holds most expenses several times: Foncia publishes each one
+in the current accounts and again in the breakdown of the closed exercise, and
+rewrites labels after the fact. The accounts pages merge those copies (same
+invoice file, amount and category) before adding anything up; see
+`prepareDepenses` in `comptes.go`. The works accounts have no invoice file, so
+their copies are matched by amount alone and their totals are the least
+certain.
+
+To load the spreadsheets once, into empty tables:
+
+```bash
+foncia import-affaires affaires.json
+foncia import-remboursements remboursements.json
+```
+
+The JSON shapes are documented in `cmd_import.go`. Keep those files out of the
+repository: they name people.
