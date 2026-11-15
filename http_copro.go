@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"embed"
+	"fmt"
 	"html/template"
 	"net/http"
 	"net/url"
@@ -25,6 +26,24 @@ var coproTmpl = template.Must(template.New("copro").Funcs(template.FuncMap{
 	"jour":     func(t time.Time) string { return t.In(paris).Format("02/01/2006") },
 	"exercice": nomExercice,
 	"positif":  func(a db.Amount) db.Amount { return max(a, -a) },
+	"taille":   taille,
+	"brainCtx": func(basePath string, e brainEtat) any {
+		return struct {
+			brainEtat
+			BasePath string
+		}{e, basePath}
+	},
+	"chemin": url.PathEscape,
+	// The "message" sub-template shows one collected message, in the lists
+	// and in the dossier of an affaire (where it can be detached).
+	"messageCtx": func(basePath, affaireID string, s db.SourceDB, lienID string) any {
+		return struct {
+			BasePath  string
+			AffaireID string
+			LienID    string
+			S         db.SourceDB
+		}{basePath, affaireID, lienID, s}
+	},
 	"tableRemboursements": func(basePath string, lignes []db.RemboursementDB) any {
 		return struct {
 			BasePath string
@@ -41,12 +60,29 @@ var coproTmpl = template.Must(template.New("copro").Funcs(template.FuncMap{
 	},
 }).ParseFS(coproFS, "templates/copro/*.html"))
 
+// taille is a file size for humans.
+func taille(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return strings.Replace(fmt.Sprintf("%.1f Mo", float64(n)/(1<<20)), ".", ",", 1)
+	case n >= 1<<10:
+		return fmt.Sprintf("%d ko", n>>10)
+	}
+	return fmt.Sprintf("%d o", n)
+}
+
 // page is embedded in the data of every template.
 type page struct {
 	BasePath string
 	User     string
 	Section  string
 	Flash    string
+
+	// For the administrators (--admin-users) only: the collected messages
+	// still to sort and Claude's propositions waiting for a decision.
+	Admin         bool
+	NATrier       int
+	NPropositions int
 }
 
 const utilisateurInconnu = "inconnu"
@@ -64,10 +100,44 @@ func currentUser(r *http.Request) string {
 type copro struct {
 	sqlDB    *sql.DB
 	basePath string
+	baseURL  string  // With the base path; for the share links.
+	partage  partage // The key of the share links; zero in the pages that make none.
+	brain    brainTrigger
 }
 
 func (c copro) page(r *http.Request, section string) page {
-	return page{BasePath: c.basePath, User: currentUser(r), Section: section, Flash: r.URL.Query().Get("flash")}
+	p := page{BasePath: c.basePath, User: currentUser(r), Section: section, Flash: r.URL.Query().Get("flash")}
+	if isAdmin(r) {
+		p.Admin = true
+		if n, err := db.CountSources(r.Context(), c.sqlDB); err == nil {
+			p.NATrier = n[db.SourceATrier]
+		} else {
+			logutil.Errorf("counting sources: %v", err)
+		}
+		if n, err := db.CountPropositionsEnAttente(r.Context(), c.sqlDB); err == nil {
+			p.NPropositions = n
+		} else {
+			logutil.Errorf("counting propositions: %v", err)
+		}
+	}
+	return p
+}
+
+// isAdmin tells whether the user sees the messages still to sort and the
+// propositions (--admin-users). Without any authenticating proxy (local runs,
+// tests), there is nobody to hide them from.
+func isAdmin(r *http.Request) bool {
+	u := currentUser(r)
+	list := strings.TrimSpace(*adminUsers)
+	if list == "" {
+		return u == utilisateurInconnu
+	}
+	for _, a := range strings.Split(list, ",") {
+		if strings.EqualFold(strings.TrimSpace(a), u) {
+			return true
+		}
+	}
+	return false
 }
 
 // render executes into a buffer first so that a template that fails halfway

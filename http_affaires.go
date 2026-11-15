@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -43,6 +44,7 @@ type pieceView struct {
 	Montant     db.Amount
 	AMontant    bool
 	Introuvable bool // The row it pointed to is gone.
+	Fichier     *db.FichierDB
 }
 
 type dossierData struct {
@@ -52,6 +54,14 @@ type dossierData struct {
 	Engage       db.Amount
 	NFactures    int
 	Commentaires []db.AffaireCommentaireDB
+	// The messages attached to the affaire, oldest first: the story of the
+	// affaire as it was told in the e-mails and on WhatsApp.
+	Messages []messageVue
+}
+
+type messageVue struct {
+	db.SourceDB
+	LienID string // To detach it.
 }
 
 type candidat struct {
@@ -234,7 +244,14 @@ func (c copro) affaireDossier(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := dossierData{page: c.page(r, "affaires"), A: a, Commentaires: commentaires}
+	var sourceIDs []string
+	lienDeSource := map[string]string{}
 	for _, l := range liens {
+		if l.Kind == db.LienSource {
+			sourceIDs = append(sourceIDs, l.Ref)
+			lienDeSource[l.Ref] = l.ID
+			continue
+		}
 		p, err := c.resoudre(ctx, l)
 		if err != nil {
 			c.fail(w, "resolving lien", err)
@@ -245,6 +262,16 @@ func (c copro) affaireDossier(w http.ResponseWriter, r *http.Request) {
 			data.NFactures++
 		}
 		data.Pieces = append(data.Pieces, p)
+	}
+	if len(sourceIDs) > 0 {
+		sources, err := db.GetSources(ctx, c.sqlDB, db.SourcesFilter{IDs: sourceIDs})
+		if err != nil {
+			c.fail(w, "get sources", err)
+			return
+		}
+		for i := len(sources) - 1; i >= 0; i-- { // GetSources is newest first.
+			data.Messages = append(data.Messages, messageVue{SourceDB: sources[i], LienID: lienDeSource[sources[i].ID]})
+		}
 	}
 	c.render(w, "affaire", data)
 }
@@ -277,6 +304,14 @@ func (c copro) resoudre(ctx context.Context, l db.AffaireLienDB) (pieceView, err
 			p.Href = c.basePath + "/remboursements/" + rb.ID
 			p.Montant, p.AMontant = rb.Montant, true
 		}
+	case db.LienFichier:
+		var f db.FichierDB
+		if f, err = db.GetFichier(ctx, c.sqlDB, l.Ref); err == nil {
+			p.Href = c.basePath + "/fichiers/" + f.SHA256 + "/" + url.PathEscape(f.Nom)
+			p.Fichier = &f
+		}
+	case db.LienSource:
+		p.Href = c.basePath + "/sources/" + l.Ref
 	default:
 		p.Href = l.URL
 	}
@@ -333,7 +368,7 @@ func (c copro) lienChercher(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind := db.LienKind(r.URL.Query().Get("kind"))
-	if !kind.HasRef() {
+	if !kind.Searchable() {
 		renderErr(w, http.StatusBadRequest, "On ne peut chercher que des factures, des documents, des ordres de service ou des remboursements.")
 		return
 	}
@@ -457,7 +492,7 @@ func (c copro) lienCreate(w http.ResponseWriter, r *http.Request) {
 		Auteur:    currentUser(r),
 	}
 	switch {
-	case l.Kind.HasRef():
+	case l.Kind.Searchable():
 		l.Ref = r.FormValue("ref")
 		titre, err := c.titreLien(ctx, l.Kind, l.Ref)
 		if errors.Is(err, sql.ErrNoRows) {

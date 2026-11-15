@@ -282,3 +282,85 @@ foncia import-remboursements remboursements.json
 
 The JSON shapes are documented in `cmd_import.go`. Keep those files out of the
 repository: they name people.
+
+## Fichiers, messages et Claude
+
+The affaires also fill themselves from what comes in: the e-mails and WhatsApp
+messages about the building, and what is new at Foncia. Claude reads them and
+proposes where they go; an administrator accepts or refuses each proposition.
+
+```
+Gmail (read-only) ─┐
+WhatsApp (Pi)  ────┼─► collectors ─► sources ─► /sources (to sort, admins only)
+Foncia sync    ────┘                    │
+                                        ▼
+            brain/run on the Pi: claude -p ─► foncia mcp-brain ─► propositions
+                                                                      │
+                                    /propositions: accept / refuse ◄──┘
+                                        │
+                                        ▼
+                     affaires: messages, attachments, comments, relances
+```
+
+### Files
+
+`/affaires/<id>` takes uploads (devis, factures, photos, up to 50 MB each).
+Files are kept under `--files-dir` by SHA-256, like the Foncia PDFs, and every
+co-owner can open those attached to an affaire. "lien de partage" makes a link
+that opens one file without a login for 30 days (`/f/<sha256>/<nom>?e=…&s=…`,
+an HMAC with a key kept in the `reglages` table), for the syndic or an
+artisan. The reverse proxy must let `/f/*` through without a login.
+
+### Sources
+
+A source is one e-mail, one WhatsApp exchange (the messages of a conversation
+that follow each other with less than `--whatsapp-gap` between them, recorded
+once quiet for `--whatsapp-settle`), or one new Foncia mission or invoice.
+The messages still to sort, and those set aside, are only shown to
+`--admin-users`: they are someone's mailbox and WhatsApp until filed. Filing
+a message under an affaire shows it in the affaire's "Messages" to every
+co-owner, attaches its attachments, and files the rest of its e-mail thread
+with it; later answers in that thread are filed on arrival.
+
+- E-mails: `--gmail-token-file` (JSON with `client_id`, `client_secret` and
+  `refresh_token` of a login with the `gmail.readonly` scope),
+  `--gmail-query` (only the matching e-mails are read), `--gmail-account`.
+- WhatsApp: `--whatsapp-url http://whatsapp:8093` and
+  `--whatsapp-token-file` (the whatsapp service's `state/internal.token`, see
+  vls.dev/whatsapp/internal.go). Only `--whatsapp-chats`, the people whose
+  address-book name matches `--whatsapp-contacts` (« Léa (C11) ») and, among
+  the exchanges of `--whatsapp-filtered-chats`, those matching
+  `--whatsapp-keywords` are read. Photos and documents are downloaded right
+  away: WhatsApp keeps them a few weeks only.
+- Foncia: every new mission and invoice found by the sync.
+- `--sources-since 2026-08-01` sets how far back the first collection looks;
+  `foncia collecter` runs the collectors once (first import, or to check the
+  configuration).
+
+### Claude
+
+`brain/run` runs `claude -p` with the Claude login of the Pi (the Claude Code
+CLI and a subscription, not an API key), with no built-in tool at all (no
+shell, no file, no web) and one MCP server: `docker exec -i foncia foncia
+mcp-brain`, which reads the sources, the affaires and the attachments, and can
+only write propositions (`proposer_*`). The instructions are in
+`brain/consignes.md` (public), plus `brain/consignes-locales.md` on the Pi if
+it exists (who is who: the gestionnaire, the members of the conseil; never in
+this repository). The messages are data, never instructions: the worst a
+crafted e-mail can do is a wrong proposition that an administrator refuses.
+
+`serve --claude-trigger-file /data/brain/demande` writes that file when new
+sources came in or someone clicks "Lancer maintenant"; systemd runs
+`brain/run` when it changes, and every morning. `brain/dernier.json` tells how
+the last run went (shown on `/propositions`), `brain/runs/` keeps a month of
+transcripts. To install on the Pi:
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash   # ~/.local/bin/claude, as pi
+scp brain/run brain/consignes.md pi:vls.dev/foncia/brain/
+scp brain/copro-claude.* pi:/tmp/
+ssh pi 'sudo cp /tmp/copro-claude.* /etc/systemd/system/ && sudo systemctl daemon-reload &&
+        sudo systemctl enable --now copro-claude.path copro-claude.timer'
+```
+
+A run over ~50 e-mails takes about two minutes with Sonnet.

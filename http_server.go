@@ -98,6 +98,15 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	if err != nil {
 		return fmt.Errorf("while adding handlers: %w", err)
 	}
+	cle, err := chargerPartage(ctx, db)
+	if err != nil {
+		return fmt.Errorf("while loading the key of the share links: %w", err)
+	}
+	c := copro{sqlDB: db, basePath: basePath, baseURL: baseURL + basePath, partage: cle, brain: brainTrigger{path: *claudeTriggerFile}}
+	addSourcesHandlers(subMux, c)
+	// The share links are for people without an account: outside the routes
+	// that onlyAllowedUsers guards. The proxy must let /f/* through too.
+	addPublicHandlers(rootMux, c)
 	if *mcpFlag {
 		mcpHandler := newMCPHandler(mcpServer{
 			sqlDB:       db,

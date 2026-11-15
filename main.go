@@ -111,7 +111,7 @@ func main() {
 			"  %s [flags] <command>\n"+
 			"\n"+
 			"Commands:\n"+
-			"  serve, list, comptes-travaux, convocations, import-affaires, import-remboursements, rm-last-expense, rm-last-mission, token, version\n"+
+			"  serve, collecter, mcp-brain, list, comptes-travaux, convocations, import-affaires, import-remboursements, rm-last-expense, rm-last-mission, token, version\n"+
 			"\n"+
 			"Flags:\n", os.Args[0])
 		flag.CommandLine.PrintDefaults()
@@ -222,6 +222,19 @@ func main() {
 						}
 						goto sleep
 					}
+					{
+						// What's new at Foncia is sorted into the affaires
+						// like the messages.
+						n, err := sourcesFoncia(ctx, sqlDB, serveBaseURL+*serveBasePath, newMissions, newExpenses)
+						if err != nil {
+							logutil.Errorf("while recording the Foncia novelties as sources: %v", err)
+						}
+						if n > 0 {
+							if err := (brainTrigger{path: *claudeTriggerFile}).demander(fmt.Sprintf("%d nouveauté(s) Foncia", n)); err != nil {
+								logutil.Errorf("asking Claude to run: %v", err)
+							}
+						}
+					}
 					for _, e := range newMissions {
 						logutil.Infof("new mission: %s", e.Label)
 						err := ntfy(*ntfyTopic, ntfyMsg{
@@ -263,6 +276,14 @@ func main() {
 			logutil.Infof("running in read-only mode, skipping synchronization")
 		}
 
+		// The e-mails and WhatsApp messages about the building.
+		collecteurs, err := collecteursConfigures(ctx, sqlDB)
+		if err != nil {
+			logutil.Errorf("%v", err)
+			os.Exit(1)
+		}
+		go collecterEnBoucle(ctx, sqlDB, brainTrigger{path: *claudeTriggerFile}, collecteurs)
+
 		var htmlHeader string
 		if *htmlHeaderFile != "" {
 			htmlHeader, err = readHeaderFile(*htmlHeaderFile)
@@ -293,6 +314,41 @@ func main() {
 		wg.Wait()
 		if ctx.Err() != nil {
 			logutil.Errorf("%v", context.Cause(ctx))
+			os.Exit(1)
+		}
+	case "mcp-brain":
+		// Claude's MCP server on stdin/stdout, for the runner of brain/.
+		// The logs go to stderr; stdout is the protocol.
+		sqlDB := openDB()
+		defer sqlDB.Close()
+		if err := runBrainMCP(ctx, sqlDB, *invoicesDir); err != nil && ctx.Err() == nil {
+			logutil.Errorf("mcp-brain: %v", err)
+			os.Exit(1)
+		}
+	case "collecter":
+		// Runs the configured collectors once, for a first import or to
+		// check the configuration. Doesn't ask Claude to run.
+		sqlDB := openDB()
+		defer sqlDB.Close()
+		collecteurs, err := collecteursConfigures(ctx, sqlDB)
+		if err != nil {
+			logutil.Errorf("%v", err)
+			os.Exit(1)
+		}
+		if len(collecteurs) == 0 {
+			logutil.Errorf("nothing to collect: give --gmail-token-file or --whatsapp-url")
+			os.Exit(1)
+		}
+		failed := false
+		for _, c := range collecteurs {
+			n, err := c.collecter(ctx)
+			fmt.Printf("%s : %d nouveau(x) message(s)\n", c.nom(), n)
+			if err != nil {
+				logutil.Errorf("%s: %v", c.nom(), err)
+				failed = true
+			}
+		}
+		if failed {
 			os.Exit(1)
 		}
 	case "list":

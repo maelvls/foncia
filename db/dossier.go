@@ -28,12 +28,14 @@ const (
 	LienRemboursement LienKind = "remboursement"
 	LienEmail         LienKind = "email"
 	LienURL           LienKind = "lien"
+	LienFichier       LienKind = "fichier" // ref = fichiers.sha256
+	LienSource        LienKind = "source"  // ref = sources.id
 )
 
 // Valid tells whether k is one of the kinds the schema accepts.
 func (k LienKind) Valid() bool {
 	switch k {
-	case LienDepense, LienDocument, LienMission, LienRemboursement, LienEmail, LienURL:
+	case LienDepense, LienDocument, LienMission, LienRemboursement, LienEmail, LienURL, LienFichier, LienSource:
 		return true
 	}
 	return false
@@ -41,6 +43,12 @@ func (k LienKind) Valid() bool {
 
 // HasRef tells whether links of this kind point to a row of another table.
 func (k LienKind) HasRef() bool {
+	return k == LienDepense || k == LienDocument || k == LienMission || k == LienRemboursement || k == LienFichier || k == LienSource
+}
+
+// Searchable tells whether the "rattacher" page can look rows of this kind
+// up. Files and sources are attached from their own pages.
+func (k LienKind) Searchable() bool {
 	return k == LienDepense || k == LienDocument || k == LienMission || k == LienRemboursement
 }
 
@@ -58,6 +66,10 @@ func (k LienKind) French() string {
 		return "E-mail"
 	case LienURL:
 		return "Lien"
+	case LienFichier:
+		return "Fichier"
+	case LienSource:
+		return "Message"
 	}
 	return string(k)
 }

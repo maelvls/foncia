@@ -93,6 +93,15 @@
 	.piece .tete, .commentaire .tete { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 	.piece .montant { margin-left: auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
 	.commentaire p, .piece p { margin: 4px 0 0; white-space: pre-wrap; }
+	.message { padding: 10px 0; border-bottom: 1px solid var(--border); }
+	.message .tete { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+	.message .texte { white-space: pre-wrap; margin: 6px 0 0; max-height: 22em; overflow: auto; font-size: .9rem; }
+	.message details > summary { cursor: pointer; color: var(--muted); font-size: .85rem; }
+	.pj { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+	.pj a { font-size: .82rem; border: 1px solid var(--border); border-radius: 5px; padding: 2px 7px; text-decoration: none; }
+	.pj img { max-height: 90px; border-radius: 4px; display: block; }
+	.citation { border-left: 3px solid var(--border); padding: 2px 0 2px 10px; color: var(--muted); white-space: pre-wrap; margin: 6px 0; }
+	.badge.proposee { background: #ece8fb; color: var(--accent); }
 	@media (max-width: 720px) {
 		.deux { grid-template-columns: 1fr; gap: 0; }
 		form.grille, dl.fiche { grid-template-columns: 1fr; gap: 4px; }
@@ -108,6 +117,10 @@
 	<a href="{{.BasePath}}/comptes" {{if eq .Section "comptes"}}class="actif"{{end}}>Comptes</a>
 	<a href="{{.BasePath}}/remboursements" {{if eq .Section "remboursements"}}class="actif"{{end}}>Remboursements</a>
 	<a href="{{.BasePath}}/">Factures et ordres de service</a>
+	{{if .Admin}}
+	<a href="{{.BasePath}}/sources" {{if eq .Section "sources"}}class="actif"{{end}}>À trier{{if .NATrier}} <span class="badge en_cours">{{.NATrier}}</span>{{end}}</a>
+	<a href="{{.BasePath}}/propositions" {{if eq .Section "propositions"}}class="actif"{{end}}>Propositions{{if .NPropositions}} <span class="badge en_cours">{{.NPropositions}}</span>{{end}}</a>
+	{{end}}
 	<span class="qui">{{.User}}</span>
 </nav>
 {{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
