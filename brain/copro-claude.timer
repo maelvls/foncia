@@ -1,0 +1,12 @@
+# A daily pass, in case a trigger was missed (the Pi rebooted mid-run, the
+# Claude login had expired…).
+[Unit]
+Description=Passage quotidien de Claude sur les messages du suivi Terra Nostra 2
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+Persistent=true
+Unit=copro-claude.service
+
+[Install]
+WantedBy=timers.target

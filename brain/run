@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# Runs Claude over the messages to sort, with the Claude Code CLI and the
+# Claude login of the Pi (a Max subscription, not an API key). Started by
+# copro-claude.service whenever foncia writes the trigger file (new messages,
+# or "Lancer maintenant" on /propositions), and every few hours by the timer.
+#
+# Claude gets no built-in tool (no shell, no file, no web): only the MCP
+# server of `foncia mcp-brain`, run inside the foncia container, which reads
+# and can only PROPOSE. See README.md, "Claude".
+#
+# Environment (copro-claude.service sets them):
+#   COPRO_STATE      the directory foncia sees as /data/brain: trigger file,
+#                    dernier.json, runs/
+#   CLAUDE_BIN       the claude binary
+#   CLAUDE_CONFIG_DIR  where the Claude login is
+#   COPRO_MODEL      sonnet by default
+
+set -uo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+state=${COPRO_STATE:-$here}
+claude=${CLAUDE_BIN:-claude}
+model=${COPRO_MODEL:-sonnet}
+container=${COPRO_CONTAINER:-foncia}
+mkdir -p "$state/runs"
+
+# A run is long (a minute or two); a trigger written during it would be
+# lost by systemd. So: run, then run again if a trigger came in meanwhile.
+for round in 1 2 3; do
+  debut=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  python3 - "$state/dernier.json" "$debut" <<'EOF'
+import json, sys
+path, debut = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d["debut"] = debut
+with open(path + ".tmp", "w") as f:
+    json.dump(d, f, ensure_ascii=False)
+import os
+os.replace(path + ".tmp", path)
+EOF
+
+  mcp=$(printf '{"mcpServers":{"copro":{"type":"stdio","command":"docker","args":["exec","-i","%s","/usr/local/bin/foncia","--db","/data/foncia.sqlite","--invoices-dir","/data/invoices","--files-dir","/data/fichiers","--baseurl","https://suivi-terra-nostra-2.vls.dev","mcp-brain"]}}}' "$container")
+
+  # consignes.md is in the (public) repository; consignes-locales.md, next to
+  # the state, may add who is who (the gestionnaire, the members of the
+  # conseil) and is not.
+  consignes=$(cat "$here/consignes.md")
+  if [[ -f "$state/consignes-locales.md" ]]; then
+    consignes+=$'\n\n'$(cat "$state/consignes-locales.md")
+  fi
+
+  out="$state/runs/$stamp.json"
+  err="$state/runs/$stamp.err"
+  timeout 20m "$claude" -p "Traite les messages à trier." \
+    --system-prompt "$consignes" \
+    --model "$model" \
+    --tools "" \
+    --strict-mcp-config --mcp-config "$mcp" \
+    --allowedTools "mcp__copro" \
+    --permission-mode dontAsk \
+    --setting-sources "" \
+    --no-session-persistence \
+    --output-format json \
+    --max-turns 120 \
+    >"$out" 2>"$err"
+  rc=$?
+
+  python3 - "$state/dernier.json" "$debut" "$rc" "$out" "$err" <<'EOF'
+import json, sys, datetime, os
+path, debut, rc, out, err = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
+d = {"debut": debut, "fin": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "ok": False, "resume": "", "erreur": ""}
+try:
+    with open(out) as f:
+        r = json.load(f)
+    d["ok"] = rc == 0 and not r.get("is_error", False)
+    d["resume"] = (r.get("result") or "").strip().splitlines()[0][:300] if r.get("result") else ""
+    if not d["ok"]:
+        d["erreur"] = (r.get("result") or r.get("subtype") or "échec")[:300]
+    cost = r.get("total_cost_usd")
+    if cost is not None:
+        d["cout_equivalent_usd"] = cost
+    d["tours"] = r.get("num_turns")
+except Exception as e:
+    try:
+        with open(err) as f:
+            tail = f.read().strip().splitlines()[-3:]
+    except Exception:
+        tail = []
+    d["erreur"] = ("code %d : " % rc) + (" / ".join(tail) or str(e))[:300]
+with open(path + ".tmp", "w") as f:
+    json.dump(d, f, ensure_ascii=False)
+os.replace(path + ".tmp", path)
+print(json.dumps(d, ensure_ascii=False))
+EOF
+
+  # Keep a month of runs.
+  find "$state/runs" -type f -mtime +30 -delete 2>/dev/null
+
+  trigger="$state/demande"
+  if [[ ! -e "$trigger" ]] || [[ $(date -u -r "$trigger" +%Y-%m-%dT%H:%M:%SZ) < "$debut" ]]; then
+    break
+  fi
+  echo "a new trigger came in during the run, running again" >&2
+done

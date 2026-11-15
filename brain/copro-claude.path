@@ -1,0 +1,11 @@
+# foncia writes this file when new messages came in or when somebody clicks
+# "Lancer maintenant" (--claude-trigger-file /data/brain/demande).
+[Unit]
+Description=Demande de passage de Claude sur les messages du suivi Terra Nostra 2
+
+[Path]
+PathModified=/home/pi/vls.dev/foncia/brain/demande
+Unit=copro-claude.service
+
+[Install]
+WantedBy=multi-user.target

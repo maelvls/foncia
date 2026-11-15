@@ -54,6 +54,12 @@
 		<small>
 			{{if .Introuvable}}N'existe plus dans les données d'origine · {{end}}
 			{{if .Fiche}}<a href="{{.Fiche}}">détail de la dépense</a> · {{end}}
+			{{with .Fichier}}{{taille .Taille}} ·
+			<form method="POST" action="{{$.BasePath}}/fichiers/{{.SHA256}}/partager" class="inline">
+				<input type="hidden" name="retour" value="/affaires/{{$.A.ID}}#pieces">
+				<button class="lien" title="Un lien qui s'ouvre sans connexion pendant 30 jours, pour le syndic ou une entreprise">lien de partage</button>
+			</form> ·
+			{{end}}
 			ajouté par {{.Auteur}} le {{jour .CreatedAt}} ·
 			<form method="POST" action="{{$.BasePath}}/affaires/{{$.A.ID}}/liens/{{.ID}}/delete" class="inline">
 				<button class="lien">détacher</button>
@@ -63,6 +69,18 @@
 	{{else}}
 	<p class="muted">Rien n'est encore rattaché à cette affaire.</p>
 	{{end}}
+
+	<details class="bloc" {{if not .Pieces}}open{{end}}>
+		<summary>Ajouter des fichiers (devis, factures, photos)</summary>
+		<form method="POST" action="{{.BasePath}}/affaires/{{.A.ID}}/fichiers" enctype="multipart/form-data" class="grille">
+			<label for="fichiers">Fichiers</label>
+			<input id="fichiers" type="file" name="fichiers" multiple required>
+			<label for="fichiers_note">Note</label>
+			<input id="fichiers_note" type="text" name="note" placeholder="Devis reçu le …, photo de …">
+			<div class="aide">Gardés sur le serveur du suivi, jusqu'à 50 Mo par fichier. Chaque fichier peut ensuite être envoyé par un lien de partage.</div>
+			<div class="actions"><button class="btn">Ajouter</button></div>
+		</form>
+	</details>
 
 	<details class="bloc" {{if not .Pieces}}open{{end}}>
 		<summary>Rattacher une facture, un document Foncia, un ordre de service ou un remboursement</summary>
@@ -133,6 +151,13 @@
 	</form>
 </section>
 </div>
+
+<section id="messages">
+	<h2>Messages <small>({{len .Messages}}) · e-mails, WhatsApp et nouveautés Foncia rattachés, du plus ancien au plus récent</small></h2>
+	{{range .Messages}}{{template "message" (messageCtx $.BasePath $.A.ID .SourceDB .LienID)}}{{else}}
+	<p class="muted">Aucun message rattaché.{{if $.Admin}} Les e-mails et messages WhatsApp collectés arrivent dans <a href="{{$.BasePath}}/sources">À trier</a>.{{end}}</p>
+	{{end}}
+</section>
 </body>
 </html>
 {{end}}

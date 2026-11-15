@@ -1,0 +1,26 @@
+# Claude sorts the messages collected by foncia (see README.md, "Claude").
+# Installed on the Pi with:
+#
+#   sudo cp brain/copro-claude.{service,path,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now copro-claude.path copro-claude.timer
+[Unit]
+Description=Claude trie les messages du suivi Terra Nostra 2
+After=docker.service
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+# The directory that the foncia container sees as /data/brain.
+Environment=COPRO_STATE=/home/pi/vls.dev/foncia/brain
+Environment=CLAUDE_BIN=/home/pi/.local/bin/claude
+# The Claude login of the Pi (claude auth login, Max subscription); the
+# accueil watchdog warns before it expires.
+Environment=CLAUDE_CONFIG_DIR=/home/pi/vls.dev/openclaw/state/claude
+Environment=COPRO_MODEL=sonnet
+ExecStart=/home/pi/vls.dev/foncia/brain/run
+# The Pi has little memory: Claude Code takes ~300-400 MB while it runs.
+MemoryMax=900M
+Nice=10
+TimeoutStartSec=70min

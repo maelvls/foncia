@@ -99,13 +99,18 @@ func TestMigrate(t *testing.T) {
 			"idx_missions_started_at",
 			"idx_oauth_tokens_email",
 			"idx_oauth_tokens_expires_at",
+			"idx_propositions_etat",
 			"idx_remboursements_statut",
+			"idx_sources_etat_date",
+			"idx_sources_fichiers_sha256",
+			"idx_sources_fil",
 			"idx_work_orders_mission_id",
 			"idx_work_orders_supplier_id",
 		}, indexNames(t, sqlDB), "idx_entries_started_at must have been renamed")
-		for _, table := range []string{"oauth_clients", "oauth_tokens"} {
+		for _, table := range []string{"oauth_clients", "oauth_tokens", "fichiers", "sources", "sources_fichiers", "propositions", "reglages", "affaires_liens"} {
 			assert.Contains(t, tableSQL(t, sqlDB, table), "STRICT", "%s must be STRICT", table)
 		}
+		assert.Contains(t, tableSQL(t, sqlDB, "affaires_liens"), "'fichier', 'source'")
 	})
 
 	t.Run("migrating twice is a no-op", func(t *testing.T) {

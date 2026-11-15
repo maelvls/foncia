@@ -66,6 +66,26 @@ type mcpServer struct {
 	lastSync    func() (time.Time, error)
 }
 
+var readOnlyTool = &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: new(false)}
+
+// addFonciaReadTools adds search and read_document, which both the /mcp
+// server and Claude's server (mcp_brain.go) have.
+func addFonciaReadTools(server *mcp.Server, s mcpServer) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "search",
+		Title:       "Chercher dans le suivi Foncia",
+		Description: "Search the missions (interventions), expenses (invoices, credits) and documents (visit reports, general assembly documents) of the building, newest first. Every word of the query must appear, case and accent insensitive, in the title, description, supplier, accounting key or file name. The text is in French, mostly upper case.",
+		Annotations: readOnlyTool,
+	}, s.search)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "read_document",
+		Title:       "Lire un document",
+		Description: "Return the text of a PDF (invoice, contract, visit report, general assembly document) found with search. Long documents are returned in several parts: call again with offset set to next_offset. Scanned PDFs have no text; give the user the url instead.",
+		Annotations: readOnlyTool,
+	}, s.readDocument)
+}
+
 // newMCPHandler returns the handler for /mcp. It doesn't check who is asking:
 // see oauthServer.requireToken.
 func newMCPHandler(s mcpServer) http.Handler {
@@ -75,21 +95,7 @@ func newMCPHandler(s mcpServer) http.Handler {
 		Version: version,
 	}, &mcp.ServerOptions{Instructions: mcpInstructions})
 
-	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: new(false)}
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "search",
-		Title:       "Chercher dans le suivi Foncia",
-		Description: "Search the missions (interventions), expenses (invoices, credits) and documents (visit reports, general assembly documents) of the building, newest first. Every word of the query must appear, case and accent insensitive, in the title, description, supplier, accounting key or file name. The text is in French, mostly upper case.",
-		Annotations: readOnly,
-	}, s.search)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "read_document",
-		Title:       "Lire un document",
-		Description: "Return the text of a PDF (invoice, contract, visit report, general assembly document) found with search. Long documents are returned in several parts: call again with offset set to next_offset. Scanned PDFs have no text; give the user the url instead.",
-		Annotations: readOnly,
-	}, s.readDocument)
+	addFonciaReadTools(server, s)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_coowners",
@@ -102,7 +108,7 @@ func newMCPHandler(s mcpServer) http.Handler {
 		Name:        "sync_status",
 		Title:       "État de la synchro",
 		Description: "Tell when the data was last synchronized with Foncia, whether that failed, and how many items of each type there are.",
-		Annotations: readOnly,
+		Annotations: readOnlyTool,
 	}, s.syncStatus)
 
 	// Stateless: there is no session to keep between two requests, which
