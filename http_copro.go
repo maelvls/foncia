@@ -157,6 +157,7 @@ type copro struct {
 	brain    brainTrigger
 	carnet   carnetFunc   // The address book of WhatsApp, for the residents; nil without a whatsapp service.
 	coowners coownersFunc // The co-owners according to Foncia, for the residents; nil without Foncia.
+	push     *pusher      // The notifications of the site (push.go); nil in the pages that send none.
 }
 
 func (c copro) page(r *http.Request, section string) page {

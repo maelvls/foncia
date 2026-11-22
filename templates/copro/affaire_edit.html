@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
 <title>{{if .IsNew}}Nouvelle affaire{{else}}Modifier l'affaire n°{{.A.Numero}}{{end}}</title>
-{{template "head"}}
+{{template "head" .}}
 <style>
 	.relance { display: grid; grid-template-columns: 1fr 2fr auto; gap: 8px; margin-bottom: 6px; }
 </style>
