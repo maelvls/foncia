@@ -81,7 +81,14 @@ func TestResidentsHTTP(t *testing.T) {
 		// Not t.Cleanup: by then the context of the test is cancelled.
 		defer func() { require.NoError(t, db.DeleteResident(t.Context(), sqlDB, id)) }()
 
-		for _, chemin := range []string{"/residents", "/residents/export.csv", "/residents/new", "/residents/" + id} {
+		// The page itself is everybody's, for the co-owners it lists: without
+		// the people, their numbers, or the tools to change them.
+		status, body := getAs(t, client, membre, srv.URL+"/residents")
+		assert.Equal(t, http.StatusOK, status)
+		for _, interdit := range []string{"Charlie Secret", "06 00 00 00 13", "D13", "/residents/new", "/residents/export.csv", "/residents/import", "Aucun résident connu"} {
+			assert.NotContains(t, body, interdit)
+		}
+		for _, chemin := range []string{"/residents/export.csv", "/residents/new", "/residents/" + id} {
 			status, body := getAs(t, client, membre, srv.URL+chemin)
 			assert.Equal(t, http.StatusForbidden, status, chemin)
 			assert.NotContains(t, body, "Charlie Secret", chemin)
@@ -93,15 +100,15 @@ func TestResidentsHTTP(t *testing.T) {
 			})
 			assert.Equal(t, http.StatusForbidden, status, chemin)
 		}
-		status, _ := envoyerContacts(t, client, membre, srv.URL+"/residents/import", vcardExport)
+		status, _ = envoyerContacts(t, client, membre, srv.URL+"/residents/import", vcardExport)
 		assert.Equal(t, http.StatusForbidden, status)
 
-		// Nothing moved, and the others don't even see the link.
+		// Nothing moved. The link is named after what each one finds there.
 		assert.Len(t, residentsParNom(t, sqlDB), 1)
-		_, body := getAs(t, client, membre, srv.URL+"/affaires")
-		assert.NotContains(t, body, "/residents")
+		_, body = getAs(t, client, membre, srv.URL+"/affaires")
+		assert.Contains(t, body, `href="/residents" >Copropriétaires</a>`)
 		_, body = getAs(t, client, admin, srv.URL+"/affaires")
-		assert.Contains(t, body, `href="/residents"`)
+		assert.Contains(t, body, `href="/residents" >Résidents</a>`)
 	})
 
 	t.Run("an empty directory lists every apartment", func(t *testing.T) {

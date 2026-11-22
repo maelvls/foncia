@@ -1,44 +1,67 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/maelvls/foncia/api"
 	"github.com/maelvls/foncia/logutil"
 )
 
-func coownersEndpoint(c copro, client *http.Client, uuid string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		coownersData, err := fetchCoowners(r.Context(), client, uuid)
-		if err != nil {
-			c.fail(w, "while getting coowners", err)
-			return
-		}
+// The co-owners, as Foncia knows them: the name on the title deed (a person, a
+// couple, an SCI), their postal address, their apartment and their parking
+// spaces. They are shown on /residents, apartment by apartment, above the
+// people who live there (http_residents.go); /coowners was their own page and
+// now leads there.
 
-		// Into a buffer first, so that a template that fails halfway isn't
-		// served as a truncated 200.
-		var buf bytes.Buffer
-		err = coownersTmpl.Execute(&buf, struct {
-			page
-			Lignes []coownerRow
-		}{c.page(r, "coowners"), coownersData})
-		if err != nil {
-			c.fail(w, "executing the co-owners template", err)
-			return
+// coownersFunc gives the co-owners. nil when there is no Foncia to ask (the
+// tests of the other pages).
+type coownersFunc func(ctx context.Context) ([]coownerRow, error)
+
+// coownersTTL is how long an answer of Foncia is kept. The co-owners change a
+// few times a year, and a page that asks Foncia each time it is shown is
+// slow, and blank the day Foncia is down.
+const coownersTTL = time.Hour
+
+// coownersEnCache asks at most once per ttl, and keeps serving the last
+// answer when the next one fails.
+func coownersEnCache(fetch coownersFunc, ttl time.Duration) coownersFunc {
+	var (
+		mu    sync.Mutex
+		rows  []coownerRow
+		quand time.Time
+	)
+	return func(ctx context.Context) ([]coownerRow, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !quand.IsZero() && time.Since(quand) < ttl {
+			return rows, nil
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = buf.WriteTo(w)
+		// Not the context of the request: somebody closing the tab must not
+		// make the next visitor wait for Foncia again.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		frais, err := fetch(ctx)
+		if err != nil {
+			if quand.IsZero() {
+				return nil, err
+			}
+			logutil.Errorf("co-owners: Foncia didn't answer, serving those of %s: %v", quand.In(paris).Format("02/01 15:04"), err)
+			return rows, nil
+		}
+		rows, quand = frais, time.Now()
+		return rows, nil
 	}
 }
 
 // fetchCoowners asks Foncia for the co-owners and resolves their lots into an
 // apartment and parking spaces, sorted by apartment. It is shared by the
-// /coowners page and the MCP list_coowners tool.
+// /residents page and the MCP list_coowners tool.
 func fetchCoowners(ctx context.Context, client *http.Client, uuid string) ([]coownerRow, error) {
 	coowners, err := api.GetCouncilCoowners(ctx, client, graphqlURL, uuid)
 	if err != nil {
@@ -88,8 +111,6 @@ type coownerRow struct {
 	Apartment string   `json:"apartment"` // Example: "C02". Empty when the co-owner only has parking spaces.
 	Parking   []string `json:"parking"`   // Example: ["44", "45"].
 }
-
-var coownersTmpl = avecLayout("coowners", coownersHTML)
 
 var lotMapping = []struct {
 	Lot         int

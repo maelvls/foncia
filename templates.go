@@ -15,8 +15,5 @@ var indexHTML string
 //go:embed templates/error.html
 var errorHTML string
 
-//go:embed templates/coowners.html
-var coownersHTML string
-
 //go:embed templates/oauth.html
 var oauthHTML string
