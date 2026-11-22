@@ -39,7 +39,7 @@ func debutCollecte(now time.Time) (time.Time, error) {
 func collecteursConfigures(ctx context.Context, sqlDB *sql.DB) ([]collecteur, error) {
 	var out []collecteur
 	if *gmailTokenFile != "" {
-		g, err := newGmailCollecteur(ctx, sqlDB)
+		g, err := newGmailCollecteur(sqlDB)
 		if err != nil {
 			return nil, err
 		}
@@ -74,7 +74,9 @@ func collecterEnBoucle(ctx context.Context, sqlDB *sql.DB, brain brainTrigger, c
 		total := 0
 		for _, c := range collecteurs {
 			n, err := c.collecter(ctx)
-			if err != nil {
+			// A mailbox that isn't connected is a state that /reglages
+			// shows, not an error to log every ten minutes.
+			if err != nil && !errors.Is(err, errGmailPasRelie) {
 				logutil.Errorf("collecte %s: %v", c.nom(), err)
 			}
 			if n > 0 {

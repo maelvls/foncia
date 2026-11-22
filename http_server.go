@@ -104,6 +104,7 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	}
 	c := copro{sqlDB: db, basePath: basePath, baseURL: baseURL + basePath, partage: cle, brain: brainTrigger{path: *claudeTriggerFile}}
 	addSourcesHandlers(subMux, c)
+	addReglagesHandlers(subMux, c)
 	if c.carnet, err = carnetConfigure(db); err != nil {
 		return fmt.Errorf("while setting up the address book of WhatsApp: %w", err)
 	}

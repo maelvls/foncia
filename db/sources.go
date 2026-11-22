@@ -429,6 +429,40 @@ func CountSources(ctx context.Context, db *sql.DB) (map[SourceEtat]int, error) {
 	return out, nil
 }
 
+// CanalStats is what was collected from one channel so far.
+type CanalStats struct {
+	N       int
+	Dernier time.Time // When the most recent message was sent.
+}
+
+// StatsSources tells, per channel, how many sources were collected and when
+// the most recent one was sent. A channel without any source is absent.
+func StatsSources(ctx context.Context, db *sql.DB) (map[SourceCanal]CanalStats, error) {
+	type ligne struct {
+		canal, dernier string
+		n              int
+	}
+	rows, err := queryAll(ctx, db, `SELECT canal, COUNT(*), MAX(date) FROM sources GROUP BY canal`,
+		func(rows *sql.Rows) (ligne, error) {
+			var l ligne
+			return l, rows.Scan(&l.canal, &l.n, &l.dernier)
+		})
+	if err != nil {
+		return nil, fmt.Errorf("while counting sources per channel: %w", err)
+	}
+	out := make(map[SourceCanal]CanalStats)
+	for _, l := range rows {
+		s := CanalStats{N: l.n}
+		// The dates are written by formatTime, in UTC: MAX on the text is
+		// the most recent, to the second.
+		if s.Dernier, err = parseTime("date", l.dernier); err != nil {
+			return nil, fmt.Errorf("while counting sources per channel: %w", err)
+		}
+		out[SourceCanal(l.canal)] = s
+	}
+	return out, nil
+}
+
 // AffairesOfSource returns the affaires a source is attached to.
 func AffairesOfSource(ctx context.Context, db *sql.DB, sourceID string) ([]AffaireRef, error) {
 	return queryAll(ctx, db, `

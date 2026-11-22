@@ -1,0 +1,141 @@
+{{define "reglages"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>Réglages</title>
+{{template "head"}}
+<style>
+	.flash.erreur { background: #fde8e8; color: var(--danger); }
+	.badge.refuse { background: #fde8e8; color: var(--danger); }
+	.reglage { margin: 12px 0; }
+	.reglage p { margin: 8px 0; }
+	.reglage .entete { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+	.reglage code { background: var(--bg-alt); padding: 1px 5px; border-radius: 4px; font-size: .85em; word-break: break-word; }
+	.reglage details { margin: 10px 0 0; }
+	.reglage summary { cursor: pointer; color: var(--accent); }
+	.reglage ol { margin: 8px 0; padding-left: 22px; }
+	.reglage ol li { margin: 10px 0; }
+	.reglage .ligne { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+	.reglage .ligne input { flex: 1 1 220px; min-width: 0; }
+	.reglage .requete { display: block; padding: 8px; margin-top: 6px; }
+</style>
+</head>
+<body>
+{{template "nav" .}}
+{{if .Erreur}}<div class="flash erreur">{{.Erreur}}</div>{{end}}
+
+<h1>Réglages <small>· d'où viennent les messages à trier</small></h1>
+<p class="muted">Visible des administrateurs seulement.</p>
+
+<h2 id="gmail">E-mails <small>· Gmail, en lecture seule</small></h2>
+{{with .Gmail}}
+<div class="carte reglage">
+{{if not .Active}}
+	<div class="entete"><span class="badge neutre">Pas activé</span></div>
+	<p class="muted">Les e-mails ne sont pas collectés sur ce serveur : il lui manque <code>--gmail-token-file</code>.</p>
+{{else}}
+	<div class="entete">
+		{{if .Probleme}}<span class="badge refuse">Illisible</span>
+		{{else if not .Relie}}<span class="badge en_cours">Pas reliée</span>
+		{{else if .Collecte.Refuse}}<span class="badge refuse">Jeton refusé par Google</span>
+		{{else if .Collecte.Erreur}}<span class="badge refuse">Reliée, en échec</span>
+		{{else}}<span class="badge levee">Reliée</span>{{end}}
+		{{if .Compte}}<strong>{{.Compte}}</strong>{{else if .Adresse}}<strong>{{.Adresse}}</strong>{{end}}
+	</div>
+
+	{{if .Probleme}}<p style="color: var(--danger)">{{.Probleme}}</p>{{end}}
+
+	{{if .Relie}}
+	<p>
+		{{if .Depuis.IsZero}}Reliée par un jeton posé à la main sur le serveur.
+		{{else}}Reliée depuis le {{quand .Depuis}}{{if .Par}} par {{.Par}}{{end}}.{{end}}
+		{{if .Collecte.Quand.IsZero}}Pas encore de passage depuis : le prochain a lieu dans moins de {{.Periode}}.
+		{{else if .Collecte.Erreur}}<span style="color: var(--danger)">Dernier passage le {{quand .Collecte.Quand}} en échec{{if not .Collecte.Reussie.IsZero}} (le dernier réussi : le {{quand .Collecte.Reussie}}){{end}}.</span>
+		{{else}}Dernier passage le {{quand .Collecte.Quand}} : {{.Collecte.Nouveaux}} nouveau(x) e-mail(s). Un passage toutes les {{.Periode}}.{{end}}
+	</p>
+	{{if .Collecte.Refuse}}<p style="color: var(--danger)">Google ne veut plus de ce jeton (accès retiré, ou jeton expiré) : il faut relier la boîte à nouveau.</p>
+	{{else if .Collecte.Erreur}}<p class="muted"><code>{{.Collecte.Erreur}}</code></p>{{end}}
+	{{else if not .Probleme}}
+	<p>Aucun e-mail n'est lu tant que la boîte n'est pas reliée.</p>
+	{{end}}
+
+	<p class="muted">
+		{{if $.Emails.N}}{{$.Emails.N}} e-mail(s) collecté(s) jusqu'ici, le plus récent reçu le {{quand $.Emails.Dernier}}.{{else}}Aucun e-mail collecté jusqu'ici.{{end}}
+		Google donne au site le droit de lire cette boîte, rien d'autre : ni envoyer, ni supprimer, ni classer. Le site n'y lit que les e-mails de la recherche ci-dessous.
+	</p>
+
+	{{if not .Compte}}
+	<p class="muted">La boîte à relier n'est pas fixée sur ce serveur (<code>--gmail-account</code>) : la connexion depuis cette page est fermée.</p>
+	{{else if not .Proprietaire}}
+	<p class="muted">Seule la boîte de {{.Compte}} peut être reliée, et seulement par ce compte : ouvre le site avec {{.Compte}} pour la relier ou la débrancher.</p>
+	{{else if not .Probleme}}
+
+	{{if and .ClientID .SecretConnu}}
+	{{if .Relie}}<details {{if .Collecte.Refuse}}open{{end}}><summary>Relier à nouveau</summary>{{end}}
+	<ol>
+		<li>
+			Ouvre Google dans un nouvel onglet, choisis <strong>{{.Compte}}</strong> et accepte la lecture des e-mails. Toute autre boîte est refusée.
+			<form method="POST" action="{{$.BasePath}}/reglages/gmail/connecter" target="_blank" class="ligne">
+				<button class="btn">Ouvrir Google</button>
+			</form>
+		</li>
+		<li>
+			Google ouvre ensuite une page <code>localhost</code> qui ne s'affiche pas : c'est normal. Copie son adresse entière et colle-la ici.
+			<form method="POST" action="{{$.BasePath}}/reglages/gmail/code" class="ligne">
+				<input type="url" name="url" required placeholder="{{.Redirect}}?state=…&amp;code=…" autocomplete="off" spellcheck="false" aria-label="Adresse de la page localhost">
+				<button class="btn">Relier la boîte</button>
+			</form>
+		</li>
+	</ol>
+	{{if .Relie}}</details>{{end}}
+	{{end}}
+
+	<details {{if not (and .ClientID .SecretConnu)}}open{{end}}>
+		<summary>{{if and .ClientID .SecretConnu}}Changer de client Google{{else}}Client Google{{end}}</summary>
+		<p class="muted">C'est au nom de ce client que le site se présente à Google : un client OAuth « Application de bureau », par exemple celui d'un outil en ligne de commande (rien à déclarer chez Google). En changer débranche la boîte.</p>
+		<form method="POST" action="{{$.BasePath}}/reglages/gmail/client">
+			<div class="ligne">
+				<input type="text" name="client_id" value="{{.ClientID}}" required placeholder="…apps.googleusercontent.com" autocomplete="off" spellcheck="false" aria-label="ID du client Google">
+				<input type="password" name="client_secret" placeholder="{{if .SecretConnu}}secret enregistré, laisser vide pour le garder{{else}}secret du client{{end}}" autocomplete="new-password" aria-label="Secret du client Google">
+				<button class="btn secondaire">Enregistrer</button>
+			</div>
+		</form>
+	</details>
+
+	{{if .Relie}}
+	<details>
+		<summary>Débrancher la boîte</summary>
+		<p class="muted">Le site arrête de lire la boîte et efface son jeton ; les e-mails déjà collectés restent. L'autorisation reste notée chez Google, où elle se retire dans <a href="https://myaccount.google.com/permissions" target="_blank" rel="noopener">les accès du compte Google</a> : attention, cela peut couper aussi les autres outils qui se servent du même client.</p>
+		<form method="POST" action="{{$.BasePath}}/reglages/gmail/deconnecter">
+			<button class="btn danger" onclick="return confirm('Arrêter de lire la boîte {{.Compte}} ?')">Débrancher</button>
+		</form>
+	</details>
+	{{end}}
+	{{end}}
+
+	<details>
+		<summary>Quels e-mails sont lus</summary>
+		<p class="muted">Ceux que cette recherche trouve dans Gmail (elle se change dans le script de déploiement, <code>--gmail-query</code>) :</p>
+		<code class="requete">{{.Requete}}</code>
+	</details>
+{{end}}
+</div>
+{{end}}
+
+<h2>Autres sources</h2>
+{{range .Canaux}}
+<div class="carte reglage">
+	<div class="entete">
+		<span class="badge {{if .Actif}}levee{{else}}neutre{{end}}">{{.Etat}}</span>
+		<strong>{{.Nom}}</strong>
+	</div>
+	<p>{{if .N}}{{.N}} message(s) collecté(s) jusqu'ici, le plus récent le {{quand .Dernier}}.{{else}}Aucun message collecté jusqu'ici.{{end}}</p>
+	<p class="muted">Ce qui est lu : {{.Detail}}.</p>
+</div>
+{{end}}
+<p class="muted">Ces deux sources se règlent dans le script de déploiement du serveur, pas ici.</p>
+
+{{with .Brain}}{{if .Actif}}<h2>Lecture par Claude</h2>{{template "brain" (brainCtx $.BasePath .)}}{{end}}{{end}}
+
+</body>
+</html>
+{{end}}
