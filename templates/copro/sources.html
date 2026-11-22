@@ -73,6 +73,7 @@
 	<a href="{{.BasePath}}/sources?etat=ignoree" {{if eq (print .Etat) "ignoree"}}class="actif"{{end}}>Écartés ({{index .Compte "ignoree"}})</a>
 </nav>
 
+{{if eq (print .Etat) "a_trier"}}{{template "liste_affaires" .Affaires}}{{end}}
 {{range .Sources}}
 <div class="tri">
 	{{template "message" (messageCtx $.BasePath "" .SourceDB "")}}
@@ -83,7 +84,7 @@
 		{{if eq (print $.Etat) "a_trier"}}
 		<form method="POST" action="{{$.BasePath}}/sources/{{.ID}}/rattacher" class="ligne">
 			<input type="hidden" name="retour" value="/sources">
-			{{template "choix_affaire" (choixAffaire "Rattacher à…" $.Affaires .Suggestion)}}
+			{{template "choix_affaire_liste" (choixAffaireListe "Rattacher à…" .Suggestion)}}
 			<button class="btn{{if not .Suggestion.AffaireID}} secondaire{{end}}">OK</button>
 		</form>
 		<form method="POST" action="{{$.BasePath}}/sources/{{.ID}}/nouvelle-affaire" class="inline">
