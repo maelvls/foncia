@@ -46,6 +46,35 @@ var coproFuncs = template.FuncMap{
 			S         db.SourceDB
 		}{basePath, affaireID, lienID, s}
 	},
+	// The "choix_affaire" sub-template is the field that picks an affaire:
+	// a select that the script of "head" turns into a field that filters
+	// as one types. s, when not nil, preselects an affaire.
+	"choixAffaire": func(invite string, affaires []db.AffaireDB, s *suggestion) any {
+		return struct {
+			Invite   string
+			Affaires []db.AffaireDB
+			Choisie  string
+		}{invite, affaires, s.AffaireID()}
+	},
+	// The same field on a page that has one per row: the affaires are
+	// written once ("liste_affaires") instead of in every row, which made
+	// /sources weigh megabytes.
+	"choixAffaireListe": func(invite string, s *suggestion) any {
+		var choisie *db.AffaireDB
+		if s != nil {
+			choisie = s.Affaire
+		}
+		return struct {
+			Invite  string
+			Choisie *db.AffaireDB
+		}{invite, choisie}
+	},
+	"suggestionCtx": func(basePath string, s *suggestion) any {
+		return struct {
+			BasePath string
+			S        *suggestion
+		}{basePath, s}
+	},
 	"tableRemboursements": func(basePath string, lignes []db.RemboursementDB) any {
 		return struct {
 			BasePath string

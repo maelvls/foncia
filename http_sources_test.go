@@ -358,3 +358,133 @@ func TestPropositions(t *testing.T) {
 		assert.False(t, e.Demande.IsZero())
 	})
 }
+
+func TestSuggestions(t *testing.T) {
+	srv, sqlDB, client, _ := sourcesServer(t)
+	ctx := t.Context()
+	vmc := nouvelleAffaire(t, sqlDB, 1, "VMC D04")
+	portail := nouvelleAffaire(t, sqlDB, 2, "Portail garage bloqué")
+	levee := nouvelleAffaire(t, sqlDB, 3, "Éclairage du hall")
+	levee.Statut = db.AffaireStatutLevee
+	require.NoError(t, db.UpdateAffaire(ctx, sqlDB, levee))
+
+	src := func(ext, texte string) string {
+		id, err := db.InsertSource(ctx, sqlDB, db.SourceDB{Canal: db.CanalWhatsApp, ExtID: ext, Fil: "groupe", Auteur: "Voisin", Texte: texte, Date: time.Now()})
+		require.NoError(t, err)
+		return id
+	}
+	prop := func(p db.PropositionDB) string {
+		p.Auteur = "claude"
+		id, err := db.InsertProposition(ctx, sqlDB, p)
+		require.NoError(t, err)
+		return id
+	}
+	etat := func(id string) db.PropositionDB {
+		p, err := db.GetProposition(ctx, sqlDB, id)
+		require.NoError(t, err)
+		return p
+	}
+	// ligne is what the page shows for one message: from its anchor to the
+	// next message.
+	ligne := func(body, id string) string {
+		_, apres, ok := strings.Cut(body, `id="m-`+id+`"`)
+		require.True(t, ok, "message %s is on the page", id)
+		l, _, _ := strings.Cut(apres, `<div class="tri">`)
+		return l
+	}
+
+	sVMC := src("s1", "La VMC du D04 refait du bruit.")
+	sPortail := src("s2", "Le portail est encore resté ouvert.")
+	sMerci := src("s3", "Merci !")
+	sRien := src("s4", "Quelqu'un a vu mon chat ?")
+	pVMC := prop(db.PropositionDB{Action: db.PropRattacher, AffaireID: vmc.ID, SourceIDs: []string{sVMC}, Justification: "Parle de la VMC du D04."})
+	// Setting aside loses against a proposition that names an affaire.
+	prop(db.PropositionDB{Action: db.PropIgnorer, SourceIDs: []string{sPortail, sMerci}, Justification: "Rien à suivre."})
+	pPortail := prop(db.PropositionDB{Action: db.PropCommenter, AffaireID: portail.ID, SourceIDs: []string{sPortail}, Donnees: db.PropositionDonnees{Texte: "Encore ouvert le 22/11."}})
+
+	t.Run("the affaire Claude proposed is preselected", func(t *testing.T) {
+		status, body := getAs(t, client, admin, srv.URL+"/sources")
+		require.Equal(t, http.StatusOK, status)
+
+		l := ligne(body, sVMC)
+		assert.Contains(t, l, `<option value="`+vmc.ID+`" selected`)
+		assert.Contains(t, l, "Claude propose de rattacher à n°1")
+		assert.Contains(t, l, "Parle de la VMC du D04.")
+		assert.Contains(t, l, "/propositions#p-"+pVMC)
+		assert.Contains(t, l, `<button class="btn">OK</button>`)
+
+		l = ligne(body, sPortail)
+		assert.Contains(t, l, `<option value="`+portail.ID+`" selected`)
+		assert.Contains(t, l, "Claude propose un commentaire sur n°2")
+
+		l = ligne(body, sMerci)
+		assert.NotContains(t, l, " selected")
+		assert.Contains(t, l, "Claude propose d&#39;écarter")
+		assert.Contains(t, l, `<button class="btn">Écarter</button>`)
+
+		l = ligne(body, sRien)
+		assert.NotContains(t, l, " selected")
+		assert.NotContains(t, l, "Claude propose")
+		assert.Contains(t, l, `<button class="btn secondaire">OK</button>`)
+		assert.Contains(t, l, `data-combo="liste-affaires"`)
+		assert.NotContains(t, l, "Éclairage du hall", "the affaires are written once for the page, not in every row")
+		assert.Equal(t, 1, strings.Count(body, "n°3 — Éclairage du hall (levée)"), "the field filters, so the affaires levées are offered too")
+		assert.Contains(t, body, `<select id="liste-affaires" hidden disabled>`)
+	})
+
+	t.Run("on the page of the message too", func(t *testing.T) {
+		status, body := getAs(t, client, admin, srv.URL+"/sources/"+sVMC)
+		require.Equal(t, http.StatusOK, status)
+		assert.Contains(t, body, `<option value="`+vmc.ID+`" selected`)
+		assert.Contains(t, body, "Claude propose de rattacher à n°1")
+	})
+
+	t.Run("the rest of an e-mail thread preselects its affaire", func(t *testing.T) {
+		mail := func(ext string) db.SourceDB {
+			id, err := db.InsertSource(ctx, sqlDB, db.SourceDB{Canal: db.CanalGmail, ExtID: ext, Fil: "fil-vmc", Auteur: "Gestionnaire", Sujet: "VMC", Texte: ext, Date: time.Now()})
+			require.NoError(t, err)
+			s, err := db.GetSource(ctx, sqlDB, id)
+			require.NoError(t, err)
+			return s
+		}
+		require.NoError(t, lierSource(ctx, sqlDB, mail("g1"), vmc, admin))
+		suite := mail("g2")
+		_, body := getAs(t, client, admin, srv.URL+"/sources")
+		l := ligne(body, suite.ID)
+		assert.Contains(t, l, `<option value="`+vmc.ID+`" selected`)
+		assert.Contains(t, l, "Même fil que n°1")
+	})
+
+	t.Run("sorting by hand closes the propositions it made pointless", func(t *testing.T) {
+		status, loc := post(t, client, admin, srv.URL+"/sources/"+sVMC+"/rattacher", url.Values{"affaire_id": {vmc.ID}})
+		require.Equal(t, http.StatusSeeOther, status, loc)
+		p := etat(pVMC)
+		assert.Equal(t, db.PropAcceptee, p.Etat, "what was done by hand is what Claude proposed")
+		assert.Equal(t, admin, p.DecidePar)
+
+		// Filed somewhere else than proposed.
+		autre := src("s5", "Le hall est dans le noir.")
+		pAutre := prop(db.PropositionDB{Action: db.PropRattacher, AffaireID: vmc.ID, SourceIDs: []string{autre}})
+		status, loc = post(t, client, admin, srv.URL+"/sources/"+autre+"/rattacher", url.Values{"affaire_id": {levee.ID}})
+		require.Equal(t, http.StatusSeeOther, status, loc)
+		assert.Equal(t, db.PropRefusee, etat(pAutre).Etat)
+
+		// A comment is more than sorting: it still waits for a decision, and
+		// the proposition to set aside still has a message to sort.
+		status, loc = post(t, client, admin, srv.URL+"/sources/"+sPortail+"/rattacher", url.Values{"affaire_id": {portail.ID}})
+		require.Equal(t, http.StatusSeeOther, status, loc)
+		assert.Equal(t, db.PropEnAttente, etat(pPortail).Etat)
+		waiting, err := db.GetPropositions(ctx, sqlDB, 0, db.PropEnAttente)
+		require.NoError(t, err)
+		assert.Len(t, waiting, 2)
+
+		// Once its last message is set aside by hand, it is done too; not as
+		// proposed, since one of the two messages was filed.
+		status, _ = post(t, client, admin, srv.URL+"/sources/"+sMerci+"/etat", url.Values{"etat": {"ignoree"}})
+		require.Equal(t, http.StatusSeeOther, status)
+		waiting, err = db.GetPropositions(ctx, sqlDB, 0, db.PropEnAttente)
+		require.NoError(t, err)
+		require.Len(t, waiting, 1)
+		assert.Equal(t, pPortail, waiting[0].ID)
+	})
+}

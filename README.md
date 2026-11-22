@@ -322,6 +322,14 @@ a message under an affaire shows it in the affaire's "Messages" to every
 co-owner, attaches its attachments, and files the rest of its e-mail thread
 with it; later answers in that thread are filed on arrival.
 
+On `/sources`, the affaire of each message is picked in a field that filters
+the affaires as one types (number, words of the title or of the place, accents
+ignored). It comes already filled with the affaire that Claude proposed for
+the message, or that of the rest of its e-mail thread, so that sorting is
+mostly confirming. Sorting a message by hand closes the propositions that
+were only about sorting it (rattacher, creer_affaire, ignorer); a proposed
+comment, relance or levée still waits on `/propositions`.
+
 - E-mails: `--gmail-token-file` (JSON with `client_id`, `client_secret` and
   `refresh_token` of a login with the `gmail.readonly` scope),
   `--gmail-query` (only the matching e-mails are read), `--gmail-account`.
