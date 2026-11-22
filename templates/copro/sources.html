@@ -74,26 +74,24 @@
 </nav>
 
 {{range .Sources}}
-<div style="display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: start">
+<div class="tri">
 	{{template "message" (messageCtx $.BasePath "" .SourceDB "")}}
-	<div style="padding-top: 10px; min-width: 230px">
-		{{if .Proposee}}<p><a href="{{$.BasePath}}/propositions" class="badge proposee">Claude a fait une proposition</a></p>{{end}}
+	<div class="actions">
+		{{if .Suggestion}}{{template "suggestion" (suggestionCtx $.BasePath .Suggestion)}}
+		{{else if .Proposee}}<p><a href="{{$.BasePath}}/propositions" class="badge proposee">Claude a fait une proposition</a></p>{{end}}
 		{{range .Affaires}}<p><a href="{{$.BasePath}}/affaires/{{.ID}}#messages">n°{{.Numero}} {{.Titre}}</a></p>{{end}}
 		{{if eq (print $.Etat) "a_trier"}}
-		<form method="POST" action="{{$.BasePath}}/sources/{{.ID}}/rattacher" class="ligne" style="margin: 0 0 6px">
+		<form method="POST" action="{{$.BasePath}}/sources/{{.ID}}/rattacher" class="ligne">
 			<input type="hidden" name="retour" value="/sources">
-			<select name="affaire_id" required>
-				<option value="">Rattacher à…</option>
-				{{range $.Affaires}}<option value="{{.ID}}">n°{{.Numero}} — {{.Titre}}</option>{{end}}
-			</select>
-			<button class="btn secondaire">OK</button>
+			{{template "choix_affaire" (choixAffaire "Rattacher à…" $.Affaires .Suggestion)}}
+			<button class="btn{{if not .Suggestion.AffaireID}} secondaire{{end}}">OK</button>
 		</form>
 		<form method="POST" action="{{$.BasePath}}/sources/{{.ID}}/nouvelle-affaire" class="inline">
 			<button class="lien">nouvelle affaire</button>
 		</form> ·
 		<form method="POST" action="{{$.BasePath}}/sources/{{.ID}}/etat" class="inline">
 			<input type="hidden" name="etat" value="ignoree">
-			<button class="lien">écarter</button>
+			{{if .Suggestion.Ecarter}}<button class="btn">Écarter</button>{{else}}<button class="lien">écarter</button>{{end}}
 		</form>
 		{{else if eq (print $.Etat) "ignoree"}}
 		<form method="POST" action="{{$.BasePath}}/sources/{{.ID}}/etat" class="inline">
@@ -135,13 +133,11 @@
 {{template "message" (messageCtx .BasePath "" .S "")}}
 
 {{if .Admin}}
+{{if .Suggestion}}{{template "suggestion" (suggestionCtx .BasePath .Suggestion)}}{{end}}
 <div class="barre-actions">
 	<form method="POST" action="{{.BasePath}}/sources/{{.S.ID}}/rattacher" class="ligne" style="margin: 0; flex: 1 1 420px">
 		<input type="hidden" name="retour" value="/sources/{{.S.ID}}">
-		<select name="affaire_id" required>
-			<option value="">Rattacher à l'affaire…</option>
-			{{range .Toutes}}<option value="{{.ID}}">n°{{.Numero}} — {{.Titre}}{{if eq (print .Statut) "levee"}} (levée){{end}}</option>{{end}}
-		</select>
+		{{template "choix_affaire" (choixAffaire "Rattacher à l'affaire…" .Toutes .Suggestion)}}
 		<button class="btn">Rattacher</button>
 	</form>
 	<form method="POST" action="{{.BasePath}}/sources/{{.S.ID}}/nouvelle-affaire" class="inline">
@@ -178,7 +174,7 @@
 {{with .Brain}}{{template "brain" (brainCtx $.BasePath .)}}{{end}}
 
 {{range .EnAttente}}
-<div class="carte" style="margin: 14px 0">
+<div class="carte" id="p-{{.ID}}" style="margin: 14px 0">
 	<div class="tete" style="display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap">
 		<span class="badge proposee">{{.Action.French}}</span>
 		{{with .Affaire}}<a href="{{$.BasePath}}/affaires/{{.ID}}"><strong>n°{{.Numero}} {{.Titre}}</strong></a>{{end}}
