@@ -104,6 +104,7 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	}
 	c := copro{sqlDB: db, basePath: basePath, baseURL: baseURL + basePath, partage: cle, brain: brainTrigger{path: *claudeTriggerFile}}
 	addSourcesHandlers(subMux, c)
+	addResidentsHandlers(subMux, c)
 	// The share links are for people without an account: outside the routes
 	// that onlyAllowedUsers guards. The proxy must let /f/* through too.
 	addPublicHandlers(rootMux, c)

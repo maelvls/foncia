@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/maelvls/foncia/db"
@@ -166,6 +167,53 @@ func ImportRemboursementsCmd(ctx context.Context, sqlDB *sql.DB, path string) {
 		}
 	}
 	fmt.Printf("imported %d remboursements\n", len(rows))
+}
+
+// ImportResidentsCmd reads an export of the contacts of a phone (a vCard file,
+// or "-" for stdin) and brings the residents up to date with it. Only the
+// contacts whose name carries an apartment, "Camille MARTIN (C01)", are kept;
+// see residents.go for the convention.
+//
+// Unlike the two imports above, this one is meant to be run again and again:
+// the contacts stay where the phone numbers are kept, and the table follows.
+func ImportResidentsCmd(ctx context.Context, sqlDB *sql.DB, path string, purger bool) {
+	var raw []byte
+	var err error
+	if path == "-" {
+		raw, err = io.ReadAll(os.Stdin)
+	} else {
+		raw, err = os.ReadFile(path)
+	}
+	if err != nil {
+		logutil.Errorf("while reading %s: %v", path, err)
+		os.Exit(1)
+	}
+
+	plan, err := importerResidents(ctx, sqlDB, raw, "import", purger)
+	if err != nil {
+		logutil.Errorf("while importing the contacts: %v", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("%d contact(s) read, %d with an apartment: %d added, %d updated, %d unchanged\n",
+		plan.Lus, plan.Retenus, len(plan.Ajouts), len(plan.MisAJour), plan.Inchanges)
+	lister := func(titre string, rs []db.ResidentDB) {
+		if len(rs) == 0 {
+			return
+		}
+		fmt.Printf("%s:\n", titre)
+		for _, r := range rs {
+			fmt.Printf("  %s  %s (%s)\n", r.Appartement, r.Nom, r.Qualite.French())
+		}
+	}
+	lister("added", plan.Ajouts)
+	lister("updated", plan.MisAJour)
+	if purger {
+		lister("no longer in the contacts, removed", plan.Absents)
+	} else {
+		lister("no longer in the contacts, kept (remove them with --purge)", plan.Absents)
+	}
+	lister("twice in the contacts, only one kept", plan.Doublons)
 }
 
 type importRemboursement struct {

@@ -34,6 +34,17 @@ var coproTmpl = template.Must(template.New("copro").Funcs(template.FuncMap{
 		}{e, basePath}
 	},
 	"chemin": url.PathEscape,
+	// The directory of the residents: the links that call a number, and the
+	// number without its spaces so that the search finds "0612".
+	"lienTelephone": lienTelephone,
+	"lienWhatsApp":  lienWhatsApp,
+	"chiffres":      func(s string) string { return strings.ReplaceAll(s, " ", "") },
+	"residentCtx": func(basePath string, p db.ResidentDB) any {
+		return struct {
+			BasePath string
+			P        db.ResidentDB
+		}{basePath, p}
+	},
 	// The "message" sub-template shows one collected message, in the lists
 	// and in the dossier of an affaire (where it can be detached).
 	"messageCtx": func(basePath, affaireID string, s db.SourceDB, lienID string) any {

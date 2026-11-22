@@ -283,6 +283,58 @@ foncia import-remboursements remboursements.json
 The JSON shapes are documented in `cmd_import.go`. Keep those files out of the
 repository: they name people.
 
+## Résidents
+
+`/residents` is the directory of the building: for each apartment, who lives
+there, who owns it without living there, who left, with their phone number
+(a tap calls it), e-mail and a note. Foncia only knows the co-owners and their
+postal address (`/coowners`); this page is about the people behind the doors,
+tenants included.
+
+It is for the administrators (`--admin-users`) only: these are personal phone
+numbers, given to one person and not to everybody who has an account here.
+
+The people come from the contacts of a phone. The convention is in the name of
+the contact: the apartment between parentheses, with a word in front when the
+person doesn't simply live there.
+
+| Contact                      | Read as                                   |
+|------------------------------|-------------------------------------------|
+| `Camille MARTIN (C01)`       | Lives in C01.                             |
+| `Alex DURAND (prop C01)`     | Owns C01 without living there.            |
+| `Sacha PETIT (ex loc C01)`   | Used to rent C01.                         |
+| `Dominique (compagnon C01)`  | Lives in C01; "compagnon" is kept.        |
+| `Claude ROUX (vendeur C01)`  | Sold C01.                                 |
+| `Jo (plombier C01)`          | Anything else: kept as "autre, plombier". |
+
+Export the contacts as a vCard (on the iPhone: Contacts, Lists, long press on
+"All Contacts", Export; on the Mac: Contacts, File, Export, Export vCard) and
+give the file to the form of the page, or to the CLI:
+
+```bash
+foncia import-residents contacts.vcf
+ssh server docker exec -i foncia foncia import-residents - < contacts.vcf
+```
+
+Only the contacts that follow the convention are read, and the file isn't
+kept. The form of the page sorts the file in the browser first, so that the
+rest of the address book never leaves the device. The import is meant to be run
+again whenever the contacts change:
+
+- A contact is the row of the same apartment and name (case, accents and the
+  order of the words don't matter); failing that, the row with the same phone
+  number, which is how a renamed contact or a move to another apartment is
+  followed; failing that, somebody new.
+- The contacts win where they say something: the apartment, the name, the
+  qualité, the phone and the e-mail. What was typed on the page and the
+  contacts don't know stays: the note always, and a phone, an e-mail or a
+  precision ("locataire") that the contact doesn't have.
+- Who is no longer in the contacts is listed, and removed only on request (the
+  button of the result page, or `--purge`). People added by hand on the page
+  are never removed by an import.
+- The same person twice in the same apartment is reported, so that the
+  contacts can be cleaned up.
+
 ## Fichiers, messages et Claude
 
 The affaires also fill themselves from what comes in: the e-mails and WhatsApp
