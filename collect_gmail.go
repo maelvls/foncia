@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/mail"
 	"net/url"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,66 +22,147 @@ import (
 
 	"github.com/maelvls/foncia/db"
 	"github.com/maelvls/foncia/logutil"
-	"golang.org/x/oauth2"
 )
 
 // The e-mails about the building, read from Gmail with a read-only token
-// (scope gmail.readonly). Only the messages matching --gmail-query are read.
+// (scope gmail.readonly). Only the messages matching --gmail-query are read,
+// and only in the mailbox of --gmail-account: that account connects it on
+// /reglages (gmail_connexion.go), which writes --gmail-token-file.
 
 var (
-	gmailTokenFile = flag.String("gmail-token-file", "", "JSON file with the OAuth client and refresh token of a Gmail account (client_id, client_secret, refresh_token), with the gmail.readonly scope. Empty disables the e-mail collection.")
+	gmailTokenFile = flag.String("gmail-token-file", "", "JSON file with the OAuth client and the refresh token of the Gmail account (client_id, client_secret, refresh_token), with the gmail.readonly scope. /reglages writes it when --gmail-account connects the mailbox, so it may not exist yet and its directory must be writable. Empty disables the e-mail collection.")
 	gmailQuery     = flag.String("gmail-query", "", "Gmail search (as in the search box) of the e-mails about the building. The collector adds after:<date> itself.")
-	gmailAccount   = flag.String("gmail-account", "", "The e-mail address of the account, for the \"voir dans Gmail\" links.")
+	gmailAccount   = flag.String("gmail-account", "", "The e-mail address of the only mailbox that is read. Only that user (as given by --auth-header) can connect or disconnect it on /reglages, a token of any other mailbox is refused, and the \"voir dans Gmail\" links use it. Empty closes the connection from /reglages: the token file is then made by hand (brain/gmail-token.py) and not checked.")
 	gmailAPIFlag   = flag.String("gmail-api", gmailAPI, "Base URL of the Gmail API, for tests.")
 )
 
 const gmailAPI = "https://gmail.googleapis.com/gmail/v1/users/me"
 
+// errGmailPasRelie: the collection is turned on, but no mailbox is connected
+// yet (or it was disconnected on /reglages).
+var errGmailPasRelie = errors.New("la boîte Gmail n'est pas reliée (voir /reglages)")
+
 type gmailCollecteur struct {
 	sqlDB   *sql.DB
-	client  *http.Client
 	query   string
 	account string
 	api     string // gmailAPI, or a test server.
+
+	// The token file is read again on every run, since /reglages changes it
+	// while the server runs. client is made from jeton, and made again when
+	// the file no longer says the same. The tests give a client and no file.
+	fichier string
+	client  *http.Client
+	jeton   gmailToken
 }
 
-type gmailToken struct {
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
-	RefreshToken string `json:"refresh_token"`
-	TokenURI     string `json:"token_uri"`
-}
-
-func newGmailCollecteur(ctx context.Context, sqlDB *sql.DB) (*gmailCollecteur, error) {
-	raw, err := os.ReadFile(*gmailTokenFile)
-	if err != nil {
-		return nil, fmt.Errorf("--gmail-token-file: %w", err)
-	}
-	var tok gmailToken
-	if err := json.Unmarshal(raw, &tok); err != nil {
-		return nil, fmt.Errorf("--gmail-token-file %s: %w", *gmailTokenFile, err)
-	}
-	if tok.ClientID == "" || tok.RefreshToken == "" {
-		return nil, fmt.Errorf("--gmail-token-file %s: client_id and refresh_token are needed", *gmailTokenFile)
-	}
+func newGmailCollecteur(sqlDB *sql.DB) (*gmailCollecteur, error) {
 	if strings.TrimSpace(*gmailQuery) == "" {
 		return nil, fmt.Errorf("--gmail-query is needed with --gmail-token-file: without it, every e-mail of the account would be read")
 	}
-	tokenURL := tok.TokenURI
-	if tokenURL == "" {
-		tokenURL = "https://oauth2.googleapis.com/token"
-	}
-	conf := oauth2.Config{ClientID: tok.ClientID, ClientSecret: tok.ClientSecret, Endpoint: oauth2.Endpoint{TokenURL: tokenURL}}
-	client := oauth2.NewClient(ctx, conf.TokenSource(ctx, &oauth2.Token{RefreshToken: tok.RefreshToken}))
-	client.Timeout = 2 * time.Minute
-	return &gmailCollecteur{sqlDB: sqlDB, client: client, query: *gmailQuery, account: *gmailAccount, api: *gmailAPIFlag}, nil
+	return &gmailCollecteur{sqlDB: sqlDB, fichier: *gmailTokenFile, query: *gmailQuery, account: *gmailAccount, api: *gmailAPIFlag}, nil
 }
 
 func (g *gmailCollecteur) nom() string { return "gmail" }
 
-const reglageGmailDepuis = "gmail_depuis"
+const (
+	reglageGmailDepuis = "gmail_depuis"
+	// reglageGmailCollecte is how the last run went (gmailCollecte, in
+	// JSON), for /reglages.
+	reglageGmailCollecte = "gmail_collecte"
+)
 
+// gmailCollecte is how the last collection of the e-mails went.
+type gmailCollecte struct {
+	Quand    time.Time `json:"quand"`
+	Nouveaux int       `json:"nouveaux"`
+	Erreur   string    `json:"erreur,omitempty"`
+	// Reussie is the last run without an error: since when it is broken.
+	Reussie time.Time `json:"reussie,omitzero"`
+}
+
+// Refuse tells whether Google no longer accepts the token (revoked, or
+// expired): only connecting the mailbox again fixes that.
+func (c gmailCollecte) Refuse() bool {
+	return strings.Contains(c.Erreur, "invalid_grant") || strings.Contains(c.Erreur, "invalid_client")
+}
+
+func lireGmailCollecte(ctx context.Context, sqlDB *sql.DB) (gmailCollecte, error) {
+	var c gmailCollecte
+	v, err := db.GetReglage(ctx, sqlDB, reglageGmailCollecte)
+	if err != nil || v == "" {
+		return c, err
+	}
+	if err := json.Unmarshal([]byte(v), &c); err != nil {
+		return gmailCollecte{}, fmt.Errorf("setting %s: %w", reglageGmailCollecte, err)
+	}
+	return c, nil
+}
+
+// collecter reads the new e-mails, and notes how it went for /reglages.
 func (g *gmailCollecteur) collecter(ctx context.Context) (int, error) {
+	n, err := g.collecterMessages(ctx)
+	if errors.Is(err, errGmailPasRelie) {
+		// Nothing was tried: /reglages says so from the token file.
+		return 0, err
+	}
+	c := gmailCollecte{Quand: time.Now().UTC(), Nouveaux: n}
+	if err != nil {
+		c.Erreur = err.Error()
+		if avant, errAvant := lireGmailCollecte(ctx, g.sqlDB); errAvant == nil {
+			c.Reussie = avant.Reussie
+		}
+	} else {
+		c.Reussie = c.Quand
+	}
+	raw, errJSON := json.Marshal(c)
+	if errJSON == nil {
+		errJSON = db.SetReglage(ctx, g.sqlDB, reglageGmailCollecte, string(raw))
+	}
+	if errJSON != nil {
+		logutil.Errorf("noting how the collection of the e-mails went: %v", errJSON)
+	}
+	return n, err
+}
+
+// brancher makes the HTTP client from the token file, again when /reglages
+// changed it. With --gmail-account, a token of any other mailbox is refused:
+// the address is asked to Google, not read in the file.
+func (g *gmailCollecteur) brancher(ctx context.Context) error {
+	if g.fichier == "" {
+		return nil // The tests give the client.
+	}
+	tok, err := lireGmailToken(g.fichier)
+	if err != nil {
+		g.client = nil
+		return err
+	}
+	if !tok.relie() {
+		g.client = nil
+		return errGmailPasRelie
+	}
+	if g.client != nil && tok.memeJeton(g.jeton) {
+		return nil
+	}
+	g.client = nil
+	client := tok.client(ctx)
+	if g.account != "" {
+		adresse, err := gmailAdresse(ctx, client, g.api)
+		if err != nil {
+			return fmt.Errorf("checking whose mailbox the token reads: %w", err)
+		}
+		if !memeAdresse(adresse, g.account) {
+			return fmt.Errorf("the token of %s reads the mailbox of %s, not that of %s: nothing is read", g.fichier, adresse, g.account)
+		}
+	}
+	g.client, g.jeton = client, tok
+	return nil
+}
+
+func (g *gmailCollecteur) collecterMessages(ctx context.Context) (int, error) {
+	if err := g.brancher(ctx); err != nil {
+		return 0, err
+	}
 	depuis, err := g.depuis(ctx)
 	if err != nil {
 		return 0, err

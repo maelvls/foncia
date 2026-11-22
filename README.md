@@ -403,7 +403,9 @@ comment, relance or levée still waits on `/propositions`.
 
 - E-mails: `--gmail-token-file` (JSON with `client_id`, `client_secret` and
   `refresh_token` of a login with the `gmail.readonly` scope),
-  `--gmail-query` (only the matching e-mails are read), `--gmail-account`.
+  `--gmail-query` (only the matching e-mails are read), `--gmail-account`
+  (the only mailbox that is read). The mailbox is connected on `/reglages`,
+  see below.
 - WhatsApp: `--whatsapp-url http://whatsapp:8093` and
   `--whatsapp-token-file` (the whatsapp service's `state/internal.token`, see
   vls.dev/whatsapp/internal.go). Only `--whatsapp-chats`, the people whose
@@ -415,6 +417,32 @@ comment, relance or levée still waits on `/propositions`.
 - `--sources-since 2026-08-01` sets how far back the first collection looks;
   `foncia collecter` runs the collectors once (first import, or to check the
   configuration).
+
+### Réglages
+
+`/reglages` (administrators only) says where the messages come from and how
+the last collection of the e-mails went, and connects the Gmail mailbox
+without a shell on the server:
+
+- Only the mailbox of `--gmail-account` can be connected, and only by that
+  very user (as given by `--auth-header`): the other administrators see the
+  state, not the buttons. Google is asked whose mailbox the new token reads,
+  and any other one is refused, nothing kept. The collector asks the same
+  before it reads anything, so a token file made by hand for another mailbox
+  isn't read either.
+- The login asks for `gmail.readonly` only, with a "Desktop app" OAuth client
+  (set on the page, or already in the token file): nothing to declare at
+  Google. Such a client is only sent back to `http://localhost`, where
+  nothing answers, so the page asks for the address of that page that
+  doesn't load, pasted in a field.
+- The page writes `--gmail-token-file` (0600, same owner as before), and the
+  collector reads it again on every run: no restart. The file may not exist
+  yet; give the three flags anyway.
+- "Débrancher" erases the refresh token from the file and keeps the client.
+  It doesn't revoke the token at Google, which could also cut the other
+  logins of that account with the same client (a command-line tool, say).
+
+`brain/gmail-token.py` still makes the same file from a terminal.
 
 ### Claude
 

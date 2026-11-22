@@ -43,6 +43,7 @@ func sourcesServer(t *testing.T) (*httptest.Server, *sql.DB, *http.Client, copro
 	c := copro{sqlDB: sqlDB, baseURL: srv.URL, partage: cle, brain: brainTrigger{path: t.TempDir() + "/brain/demande"}}
 	addAffairesHandlers(sub, sqlDB, "")
 	addSourcesHandlers(sub, c)
+	addReglagesHandlers(sub, c)
 	addPublicHandlers(root, c)
 	root.Handle("/", sub)
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
