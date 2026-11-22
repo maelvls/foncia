@@ -363,8 +363,8 @@ page of the message has the whole list. */}}
 	<a href="{{.BasePath}}/comptes" {{if eq .Section "comptes"}}class="actif"{{end}}>Comptes</a>
 	<a href="{{.BasePath}}/remboursements" {{if eq .Section "remboursements"}}class="actif"{{end}}>Remboursements</a>
 	<a href="{{.BasePath}}/" {{if eq .Section "factures"}}class="actif"{{end}}>Factures et ordres de service</a>
+	<a href="{{.BasePath}}/residents" {{if eq .Section "residents"}}class="actif"{{end}}>{{if .Admin}}Résidents{{else}}Copropriétaires{{end}}</a>
 	{{if .Admin}}
-	<a href="{{.BasePath}}/residents" {{if eq .Section "residents"}}class="actif"{{end}}>Résidents</a>
 	<a href="{{.BasePath}}/sources" {{if eq .Section "sources"}}class="actif"{{end}}>À trier{{if .NATrier}} <span class="badge en_cours">{{.NATrier}}</span>{{end}}</a>
 	<a href="{{.BasePath}}/propositions" {{if eq .Section "propositions"}}class="actif"{{end}}>Propositions{{if .NPropositions}} <span class="badge en_cours">{{.NPropositions}}</span>{{end}}</a>
 	{{end}}

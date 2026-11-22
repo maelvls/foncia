@@ -5,8 +5,14 @@
 	table.annuaire td.tel { white-space: nowrap; }
 	table.annuaire td.tel a.numero { font-variant-numeric: tabular-nums; font-weight: 600; text-decoration: none; }
 	table.annuaire td.tel .wa { font-size: .75rem; color: var(--muted); margin-left: 6px; }
-	table.annuaire tr.premier td { border-top: 2px solid var(--border); }
+	/* The line of an apartment: who owns it according to Foncia. The people follow, under it. */
+	table.annuaire tr.lot td { border-top: 2px solid var(--border); background: var(--bg-alt); }
+	/* The table is wider than a phone (it scrolls sideways): the co-owner wraps in what is seen of it. */
+	table.annuaire tr.lot .coowner { max-width: calc(100vw - 110px); }
+	table.annuaire tr.lot .coowner .titre { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .02em; margin-right: 4px; }
+	table.annuaire tr.lot .coowner .muted { font-size: .82rem; margin-left: 6px; }
 	table.annuaire tr.vide td { color: var(--muted); }
+	.flash.attention { background: var(--warn-bg); color: var(--warn); }
 	.badge.proprietaire { background: #ece8fb; color: var(--accent); }
 	.badge.sans { background: var(--warn-bg); color: var(--warn); }
 	input#filtre { max-width: 340px; }
@@ -28,15 +34,39 @@
 {{define "residents"}}<!DOCTYPE html>
 <html lang="fr">
 <head>
-<title>Résidents</title>
+<title>{{if .Admin}}Résidents et copropriétaires{{else}}Copropriétaires{{end}} · Terra Nostra 2</title>
 {{template "head"}}
 {{template "residents_style"}}
 </head>
 <body>
 {{template "nav" .}}
 
+{{if not .Admin}}
+<h1>Copropriétaires <small>{{len .Coowners}}</small></h1>
+{{if .CoownersErreur}}<p class="flash attention">Foncia n'a pas donné la liste des copropriétaires. Réessayez dans quelques minutes.</p>{{end}}
+<div class="scroll">
+<table>
+	<thead>
+		<tr><th>Appartement</th><th>Nom</th><th>Adresse</th><th>Places de parking</th></tr>
+	</thead>
+	<tbody>
+		{{range .Coowners}}
+		<tr>
+			<td>{{if .Apartment}}<strong>{{.Apartment}}</strong>{{end}}</td>
+			<td>{{.Name}}</td>
+			<td>{{.Address}}</td>
+			<td>{{range $i, $p := .Parking}}{{if $i}}, {{end}}{{$p}}{{end}}</td>
+		</tr>
+		{{else}}
+		<tr><td colspan="4" class="muted">Aucun copropriétaire.</td></tr>
+		{{end}}
+	</tbody>
+</table>
+</div>
+{{else}}
+
 <div class="barre-actions">
-	<h1 style="margin: 8px auto 8px 0">Résidents et téléphones</h1>
+	<h1 style="margin: 8px auto 8px 0">Résidents et copropriétaires</h1>
 	<a href="{{.BasePath}}/residents/export.csv" class="btn secondaire">Exporter (CSV)</a>
 	<a href="{{.BasePath}}/residents/new" class="btn">Ajouter une personne</a>
 </div>
@@ -157,29 +187,63 @@ function fichesAvecAppartement(texte) {
 	<input id="filtre" type="search" placeholder="Chercher un nom, un appartement, un numéro…" autocomplete="off">
 </form>
 
+{{if .CoownersErreur}}<p class="flash attention">Foncia n'a pas donné la liste des copropriétaires : seules les personnes sont affichées.</p>{{end}}
+
 <div class="scroll">
 <table class="annuaire">
 	<thead><tr><th>Appt</th><th>Nom</th><th>Téléphone</th><th>E-mail, note</th></tr></thead>
-	<tbody>
-		{{range $a := .Appartements}}
-		{{range $i, $p := $a.Personnes}}
-		<tr id="resident-{{$p.ID}}" {{if not $i}}class="premier"{{end}} data-q="{{$a.Code}} {{$p.Nom}} {{$p.Qualite.French}} {{$p.Detail}} {{$p.Telephone}} {{chiffres $p.Telephone}} {{$p.Email}} {{$p.Note}}">
+	{{range $a := .Appartements}}
+	{{/* One tbody per apartment: the search shows or hides it whole. */}}
+	<tbody data-lot="{{$a.Code}}" data-q="{{$a.Code}} {{$a.Type}} {{$a.NomsCoowners}}">
+		<tr class="lot" id="lot-{{$a.Code}}">
 			<td class="appt"><strong>{{$a.Code}}</strong>{{if $a.Type}} <small>{{$a.Type}}</small>{{end}}</td>
+			<td colspan="3">
+				{{range $a.Coowners}}
+				<div class="coowner">
+					<span class="titre">Copropriétaire</span> <strong>{{.Name}}</strong>
+					<span class="muted">{{.Address}}{{if .Parking}} · parking{{if gt (len .Parking) 1}}s{{end}} {{range $i, $p := .Parking}}{{if $i}}, {{end}}{{$p}}{{end}}{{end}}</span>
+				</div>
+				{{else}}
+				{{if $.Coowners}}<span class="muted">Pas de copropriétaire connu de Foncia.</span>{{end}}
+				{{end}}
+			</td>
+		</tr>
+		{{range $p := $a.Personnes}}
+		<tr id="resident-{{$p.ID}}" data-q="{{$a.Code}} {{$p.Nom}} {{$p.Qualite.French}} {{$p.Detail}} {{$p.Telephone}} {{chiffres $p.Telephone}} {{$p.Email}} {{$p.Note}}">
+			<td class="appt"></td>
 			<td>{{template "resident_nom" residentCtx $.BasePath $p}}</td>
 			<td class="tel">{{template "resident_tel" $p}}</td>
 			<td>{{template "resident_plus" $p}}</td>
 		</tr>
 		{{end}}
 		{{if $a.SansResident}}
-		<tr class="vide{{if not $a.Personnes}} premier{{end}}" data-q="{{$a.Code}} personne">
-			<td class="appt"><strong>{{$a.Code}}</strong>{{if $a.Type}} <small>{{$a.Type}}</small>{{end}}</td>
+		<tr class="vide" data-q="">
+			<td class="appt"></td>
 			<td colspan="3"><span class="badge sans">Aucun résident connu</span> <a href="{{$.BasePath}}/residents/new?appartement={{$a.Code}}">Ajouter</a></td>
 		</tr>
 		{{end}}
+	</tbody>
+	{{end}}
+</table>
+</div>
+
+{{if .CoownersParking}}
+<h2>Copropriétaires sans appartement <small>({{len .CoownersParking}})</small></h2>
+<div class="scroll">
+<table class="annuaire">
+	<thead><tr><th>Nom</th><th>Adresse</th><th>Places de parking</th></tr></thead>
+	<tbody>
+		{{range .CoownersParking}}
+		<tr data-q="{{.Name}} {{.Address}} parking {{range .Parking}}{{.}} {{end}}">
+			<td>{{.Name}}</td>
+			<td>{{.Address}}</td>
+			<td>{{range $i, $p := .Parking}}{{if $i}}, {{end}}{{$p}}{{end}}</td>
+		</tr>
 		{{end}}
 	</tbody>
 </table>
 </div>
+{{end}}
 
 <details class="bloc" id="anciens">
 	<summary>Anciens résidents et propriétaires <small>({{len .Anciens}})</small></summary>
@@ -206,12 +270,25 @@ function fichesAvecAppartement(texte) {
 (function () {
 	var champ = document.getElementById('filtre');
 	var anciens = document.getElementById('anciens');
-	function plie(s) { return s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+	function plie(s) { return s.toLowerCase().normalize('NFD').replace(/\p{M}/gu, ''); }
 	function filtrer() {
 		var mots = plie(champ.value).split(/\s+/).filter(Boolean);
-		document.querySelectorAll('tr[data-q]').forEach(function (tr) {
-			var texte = plie(tr.dataset.q);
-			tr.hidden = !mots.every(function (m) { return texte.indexOf(m) >= 0; });
+		function trouve(el) {
+			var texte = plie(el.dataset.q);
+			return mots.every(function (m) { return texte.indexOf(m) >= 0; });
+		}
+		// An apartment is shown whole when the search is about it (its
+		// number, its co-owner); otherwise only with the people it finds.
+		document.querySelectorAll('tbody[data-lot]').forEach(function (lot) {
+			var entier = trouve(lot), vus = 0;
+			lot.querySelectorAll('tr[data-q]').forEach(function (tr) {
+				tr.hidden = !(entier || trouve(tr));
+				if (!tr.hidden) { vus++; }
+			});
+			lot.hidden = !(entier || vus);
+		});
+		document.querySelectorAll('tbody:not([data-lot]) > tr[data-q]').forEach(function (tr) {
+			tr.hidden = !trouve(tr);
 		});
 		// Somebody who left is still somebody one may be looking for.
 		if (mots.length) { anciens.open = true; }
@@ -222,6 +299,7 @@ function fichesAvecAppartement(texte) {
 	if (q) { champ.value = q; filtrer(); }
 })();
 </script>
+{{end}}
 </body>
 </html>
 {{end}}

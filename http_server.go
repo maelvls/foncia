@@ -107,6 +107,9 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	if c.carnet, err = carnetConfigure(db); err != nil {
 		return fmt.Errorf("while setting up the address book of WhatsApp: %w", err)
 	}
+	c.coowners = coownersEnCache(func(ctx context.Context) ([]coownerRow, error) {
+		return fetchCoowners(ctx, client, uuid)
+	}, coownersTTL)
 	addResidentsHandlers(subMux, c)
 	// The share links are for people without an account: outside the routes
 	// that onlyAllowedUsers guards. The proxy must let /f/* through too.
@@ -304,8 +307,6 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 			logutil.Errorf("writing the page: %v", err)
 		}
 	})
-
-	mux.HandleFunc("GET /coowners", coownersEndpoint(c, client, uuid))
 
 	addAffairesHandlers(mux, sqlDB, basePath)
 	addComptesHandlers(mux, sqlDB, basePath)

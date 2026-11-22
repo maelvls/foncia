@@ -16,12 +16,14 @@ import (
 	"github.com/maelvls/foncia/logutil"
 )
 
-// The directory of the building: who lives in each apartment, who owns it
-// without living there, who left, and how to call them.
+// The page of the building, apartment by apartment: who owns it according to
+// Foncia (http_coowners.go), then who lives there, who owns it without living
+// there, who left, and how to call them.
 //
-// Who sees it: the administrators (--admin-users) only. These are personal
-// phone numbers, given to one person and not to the fifteen or so co-owners
-// who have an account here.
+// Who sees what: everybody who has an account sees the co-owners. The people
+// and their numbers are for the administrators (--admin-users) only: these
+// are personal phone numbers, given to one person and not to the fifteen or
+// so co-owners who have an account here.
 
 // maxVCard bounds an export of the contacts. The one of an iPhone holds the
 // photos, which makes it tens of megabytes for a thousand contacts.
@@ -47,9 +49,21 @@ func appartements() []appartement {
 
 type appartementResidents struct {
 	appartement
+	// Who owns it according to Foncia: the name on the title deed, which
+	// may be a couple or an SCI.
+	Coowners []coownerRow
 	// Those who live there first, then the owners, then the others.
 	Personnes    []db.ResidentDB
 	SansResident bool
+}
+
+// NomsCoowners is for the search: the names and addresses of the co-owners.
+func (a appartementResidents) NomsCoowners() string {
+	var out []string
+	for _, c := range a.Coowners {
+		out = append(out, c.Name, c.Address)
+	}
+	return strings.Join(out, " ")
 }
 
 type residentsData struct {
@@ -59,6 +73,13 @@ type residentsData struct {
 	NResidents     int
 	NProprietaires int
 	SansResident   []string // The apartments where nobody is known to live.
+
+	// The co-owners according to Foncia, by apartment, and whether Foncia
+	// could be asked at all. Those who only own parking spaces have no
+	// apartment to be shown under.
+	Coowners        []coownerRow
+	CoownersParking []coownerRow
+	CoownersErreur  bool
 
 	// The address book of WhatsApp, when there is a whatsapp service to ask:
 	// how its last reading went, if there was one.
@@ -80,6 +101,10 @@ type residentsImportData struct {
 
 func addResidentsHandlers(mux *http.ServeMux, c copro) {
 	mux.HandleFunc("GET /residents", c.residents)
+	// The co-owners had a page of their own; the links to it still work.
+	mux.HandleFunc("GET /coowners", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, c.basePath+"/residents", http.StatusFound)
+	})
 	mux.HandleFunc("GET /residents/export.csv", c.residentsCSV)
 	mux.HandleFunc("POST /residents/import", c.residentsImporter)
 	mux.HandleFunc("POST /residents/whatsapp", c.residentsWhatsApp)
@@ -123,20 +148,44 @@ func parAppartement(rs []db.ResidentDB) (apps []appartementResidents, anciens []
 	return apps, anciens
 }
 
+// residents is the page of the building, apartment by apartment. Everybody
+// who has an account sees who owns each apartment according to Foncia (what
+// /coowners used to show). The administrators also see the people behind the
+// doors and how to call them: those rows aren't even read for the others.
 func (c copro) residents(w http.ResponseWriter, r *http.Request) {
-	if !c.adminOnly(w, r) {
-		return
+	data := residentsData{page: c.page(r, "residents")}
+	var rs []db.ResidentDB
+	if data.Admin {
+		var err error
+		if rs, err = db.GetResidents(r.Context(), c.sqlDB); err != nil {
+			c.fail(w, "listing residents", err)
+			return
+		}
+		data.WhatsApp = c.carnet != nil
+		if e, ok := dernierCarnet(r.Context(), c.sqlDB); ok && data.WhatsApp {
+			data.Carnet = &e
+		}
 	}
-	rs, err := db.GetResidents(r.Context(), c.sqlDB)
-	if err != nil {
-		c.fail(w, "listing residents", err)
-		return
-	}
-	data := residentsData{page: c.page(r, "residents"), WhatsApp: c.carnet != nil}
-	if e, ok := dernierCarnet(r.Context(), c.sqlDB); ok && data.WhatsApp {
-		data.Carnet = &e
+	if c.coowners != nil {
+		var err error
+		if data.Coowners, err = c.coowners(r.Context()); err != nil {
+			// The phone numbers are worth showing without the co-owners.
+			logutil.Errorf("residents: asking Foncia for the co-owners: %v", err)
+			data.CoownersErreur = true
+		}
 	}
 	data.Appartements, data.Anciens = parAppartement(rs)
+	parCode := make(map[string]int, len(data.Appartements))
+	for i, a := range data.Appartements {
+		parCode[a.Code] = i
+	}
+	for _, co := range data.Coowners {
+		if i, ok := parCode[co.Apartment]; ok {
+			data.Appartements[i].Coowners = append(data.Appartements[i].Coowners, co)
+		} else {
+			data.CoownersParking = append(data.CoownersParking, co)
+		}
+	}
 	for _, a := range data.Appartements {
 		if a.SansResident {
 			data.SansResident = append(data.SansResident, a.Code)

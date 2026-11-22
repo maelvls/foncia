@@ -285,14 +285,26 @@ repository: they name people.
 
 ## Résidents
 
-`/residents` is the directory of the building: for each apartment, who lives
-there, who owns it without living there, who left, with their phone number
-(a tap calls it), e-mail and a note. Foncia only knows the co-owners and their
-postal address (`/coowners`); this page is about the people behind the doors,
-tenants included.
+`/residents` is the page of the building, apartment by apartment. Each one
+starts with who owns it according to Foncia: the name on the title deed (a
+person, a couple, an SCI), their postal address and their parking spaces. Under
+it come the people behind the door, tenants included: who lives there, who owns
+it without living there, who left, with their phone number (a tap calls it),
+e-mail and a note. The search finds an apartment by either, so that the name of
+an SCI leads to the people who answer for it.
 
-It is for the administrators (`--admin-users`) only: these are personal phone
-numbers, given to one person and not to everybody who has an account here.
+Who sees what:
+
+- Everybody who has an account sees the co-owners, their address and their
+  parking spaces. This used to be a page of its own, `/coowners`, which now
+  leads here.
+- The people, their numbers and the tools to change them are for the
+  administrators (`--admin-users`) only: these are personal phone numbers,
+  given to one person and not to everybody who has an account here. They
+  aren't even read from the database for the others.
+
+The co-owners are asked from Foncia at most once an hour; when Foncia doesn't
+answer, the last answer is shown, and without any the people are shown alone.
 
 The people come from the contacts of a phone, where they are kept anyway. The
 convention is in the name of the contact: the apartment between parentheses,
