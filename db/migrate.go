@@ -69,6 +69,11 @@ var migrations = []migration{
 		name:    "sources",
 		sql:     migrationSQL("0005_sources.sql"),
 	},
+	{
+		version: 6,
+		name:    "residents",
+		sql:     migrationSQL("0006_residents.sql"),
+	},
 }
 
 // migrationSQL reads an embedded migration. It panics rather than returning an

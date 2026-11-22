@@ -101,6 +101,7 @@ func TestMigrate(t *testing.T) {
 			"idx_oauth_tokens_expires_at",
 			"idx_propositions_etat",
 			"idx_remboursements_statut",
+			"idx_residents_appartement",
 			"idx_sources_etat_date",
 			"idx_sources_fichiers_sha256",
 			"idx_sources_fil",

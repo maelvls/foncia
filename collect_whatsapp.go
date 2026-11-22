@@ -346,6 +346,39 @@ func (w *whatsappCollecteur) enregistrer(ctx context.Context, c waChat, e []waMe
 	return err == nil, err
 }
 
+type waContact struct {
+	JID      string `json:"jid"`
+	FullName string `json:"full_name"` // The name in the address book of the phone.
+}
+
+// carnetMatch is the name of a neighbour in the address book: an apartment
+// between parentheses, maybe with a word in front, "(C01)" or "(ex loc C01)".
+// It is what the whatsapp service is asked for, so that the rest of the address
+// book stays there; residents.go then reads each name properly.
+const carnetMatch = `\([^()]*[CDcd][0-9]{2}\s*\)`
+
+// carnet returns the neighbours of the address book as WhatsApp knows it: the
+// phone sends its contacts to the linked devices, and keeps them up to date.
+// A contact is its name and the phone number of its WhatsApp account.
+func (w *whatsappCollecteur) carnet(ctx context.Context) ([]contactVCard, error) {
+	var contacts []waContact
+	if err := w.getJSON(ctx, "/internal/contacts?"+url.Values{"match": {carnetMatch}}.Encode(), &contacts); err != nil {
+		return nil, err
+	}
+	out := make([]contactVCard, 0, len(contacts))
+	for _, c := range contacts {
+		// Only the accounts known by their phone number: a "…@lid" is an
+		// identifier that WhatsApp makes up to hide the number.
+		numero, serveur, _ := strings.Cut(c.JID, "@")
+		numero, _, _ = strings.Cut(numero, ":")
+		if serveur != "s.whatsapp.net" || numero == "" || strings.Trim(numero, "0123456789") != "" {
+			continue
+		}
+		out = append(out, contactVCard{NomComplet: c.FullName, Telephones: []string{"+" + numero}})
+	}
+	return out, nil
+}
+
 func isGone(err error) bool {
 	var we *waError
 	return errors.As(err, &we) && (we.status == http.StatusGone || we.status == http.StatusNotFound)

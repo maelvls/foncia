@@ -111,7 +111,7 @@ func main() {
 			"  %s [flags] <command>\n"+
 			"\n"+
 			"Commands:\n"+
-			"  serve, collecter, mcp-brain, list, comptes-travaux, convocations, import-affaires, import-remboursements, rm-last-expense, rm-last-mission, token, version\n"+
+			"  serve, collecter, mcp-brain, list, comptes-travaux, convocations, import-affaires, import-remboursements, import-residents, rm-last-expense, rm-last-mission, token, version\n"+
 			"\n"+
 			"Flags:\n", os.Args[0])
 		flag.CommandLine.PrintDefaults()
@@ -284,6 +284,14 @@ func main() {
 		}
 		go collecterEnBoucle(ctx, sqlDB, brainTrigger{path: *claudeTriggerFile}, collecteurs)
 
+		// The residents follow the address book of the same whatsapp service.
+		carnet, err := carnetConfigure(sqlDB)
+		if err != nil {
+			logutil.Errorf("%v", err)
+			os.Exit(1)
+		}
+		go synchroniserResidentsEnBoucle(ctx, sqlDB, carnet)
+
 		var htmlHeader string
 		if *htmlHeaderFile != "" {
 			htmlHeader, err = readHeaderFile(*htmlHeaderFile)
@@ -408,6 +416,17 @@ func main() {
 		sqlDB := openDB()
 		defer sqlDB.Close()
 		ImportRemboursementsCmd(ctx, sqlDB, args[0])
+	case "import-residents":
+		fs := flag.NewFlagSet(flag.Arg(0), flag.ExitOnError)
+		purger := fs.Bool("purge", false, "Also remove the people of an earlier import who are no longer in the contacts. Without it, they are only listed.")
+		args := parseInterspersed(fs, flag.Args()[1:])
+		if len(args) != 1 {
+			logutil.Errorf("usage: %s import-residents [--purge] <path/to/contacts.vcf | ->", os.Args[0])
+			os.Exit(1)
+		}
+		sqlDB := openDB()
+		defer sqlDB.Close()
+		ImportResidentsCmd(ctx, sqlDB, args[0], *purger)
 	case "rm-last-expense":
 		sqlDB := openDB()
 		defer sqlDB.Close()

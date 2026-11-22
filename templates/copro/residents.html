@@ -1,0 +1,384 @@
+{{define "residents_style"}}
+<style>
+	table.annuaire td.appt { white-space: nowrap; width: 1%; }
+	table.annuaire td.appt strong { font-size: .95rem; }
+	table.annuaire td.tel { white-space: nowrap; }
+	table.annuaire td.tel a.numero { font-variant-numeric: tabular-nums; font-weight: 600; text-decoration: none; }
+	table.annuaire td.tel .wa { font-size: .75rem; color: var(--muted); margin-left: 6px; }
+	table.annuaire tr.premier td { border-top: 2px solid var(--border); }
+	table.annuaire tr.vide td { color: var(--muted); }
+	.badge.proprietaire { background: #ece8fb; color: var(--accent); }
+	.badge.sans { background: var(--warn-bg); color: var(--warn); }
+	input#filtre { max-width: 340px; }
+	/* Two by two on a phone, where four cards on top of each other hide the list. */
+	.cartes.serrees { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+	.carnet {
+		display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+		border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: .9rem;
+	}
+	.carnet .texte { flex: 1 1 260px; }
+	.carnet .texte span { display: block; margin-top: 2px; font-size: .85rem; }
+	.carnet .echec { color: var(--danger); }
+	.carte .liste { font-size: .8rem; color: var(--muted); margin-top: 4px; }
+	ul.personnes { margin: 6px 0 12px; padding-left: 20px; }
+	ul.personnes li { margin: 2px 0; }
+</style>
+{{end}}
+
+{{define "residents"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>Résidents</title>
+{{template "head"}}
+{{template "residents_style"}}
+</head>
+<body>
+{{template "nav" .}}
+
+<div class="barre-actions">
+	<h1 style="margin: 8px auto 8px 0">Résidents et téléphones</h1>
+	<a href="{{.BasePath}}/residents/export.csv" class="btn secondaire">Exporter (CSV)</a>
+	<a href="{{.BasePath}}/residents/new" class="btn">Ajouter une personne</a>
+</div>
+
+<div class="cartes serrees">
+	<div class="carte">
+		<div class="titre">Résidents connus</div>
+		<div class="valeur">{{.NResidents}}</div>
+		<small>dans {{len .Appartements}} appartements</small>
+	</div>
+	<div class="carte">
+		<div class="titre">Appartements sans résident connu</div>
+		<div class="valeur">{{len .SansResident}}</div>
+		{{if .SansResident}}<div class="liste">{{range $i, $a := .SansResident}}{{if $i}}, {{end}}{{$a}}{{end}}</div>{{end}}
+	</div>
+	<div class="carte">
+		<div class="titre">Propriétaires non occupants</div>
+		<div class="valeur">{{.NProprietaires}}</div>
+	</div>
+	<div class="carte">
+		<div class="titre">Anciens</div>
+		<div class="valeur">{{len .Anciens}}</div>
+	</div>
+</div>
+
+{{if .WhatsApp}}
+<div class="carnet">
+	<div class="texte">
+		<strong>La liste suit les contacts du téléphone, par WhatsApp.</strong>
+		Un voisin noté « Camille MARTIN (C01) » dans les contacts arrive ici tout seul, dans l'heure.
+		{{with .Carnet}}
+			{{if .Erreur}}
+			<span class="echec">La dernière lecture, le {{quand .Quand}}, a échoué : {{.Erreur}}</span>
+			{{else}}
+			<span class="muted">Dernière lecture le {{quand .Quand}} : {{.Retenus}} personne{{if gt .Retenus 1}}s{{end}}{{if .Ajouts}}, {{.Ajouts}} ajoutée{{if gt .Ajouts 1}}s{{end}}{{end}}{{if .MisAJour}}, {{.MisAJour}} mise{{if gt .MisAJour 1}}s{{end}} à jour{{end}}{{if .Absents}}, {{.Absents}} qui n'y {{if gt .Absents 1}}sont{{else}}est{{end}} plus{{end}}.</span>
+			{{end}}
+		{{else}}
+			<span class="muted">Pas encore lu.</span>
+		{{end}}
+	</div>
+	<form method="POST" action="{{.BasePath}}/residents/whatsapp">
+		<button type="submit" class="btn secondaire">Relire maintenant</button>
+	</form>
+</div>
+{{end}}
+
+<details class="bloc">
+	<summary>{{if .WhatsApp}}Comment noter un voisin, et compléter avec un export des contacts…{{else}}Importer depuis les contacts du téléphone…{{end}}</summary>
+	<p>
+		Dans les contacts, l'appartement se note entre parenthèses dans le nom :
+		<strong>Camille MARTIN (C01)</strong> habite au C01,
+		<strong>Alex DURAND (prop C01)</strong> en est propriétaire sans y habiter,
+		<strong>Sacha PETIT (ex loc C01)</strong> est un ancien locataire.
+		Un autre mot devant l'appartement, <strong>(compagnon C01)</strong>, <strong>(vendeur C01)</strong>, est gardé comme précision.
+	</p>
+	{{if .WhatsApp}}
+	<p>
+		WhatsApp ne connaît que le numéro du compte WhatsApp de chacun : pas les e-mails, pas les autres numéros,
+		et pas les personnes qui n'ont pas WhatsApp. Un export des contacts les ajoute.
+	</p>
+	{{end}}
+	<p class="muted">
+		Sur l'iPhone : Contacts → Listes → appui long sur « Tous les contacts » → Exporter, puis choisir le fichier ici.
+		Sur le Mac : Contacts → Fichier → Exporter → Exporter vCard…
+	</p>
+	<form id="import" method="POST" action="{{.BasePath}}/residents/import" enctype="multipart/form-data" class="ligne">
+		<input type="file" name="contacts" accept=".vcf,text/vcard,text/x-vcard" required>
+		<button type="submit" class="btn">Importer</button>
+	</form>
+	<p id="import-message" class="flash" style="background: var(--warn-bg); color: var(--warn)" hidden></p>
+	<p class="muted">
+		Le tri est fait par le navigateur avant l'envoi : seules les fiches dont le nom porte un appartement partent
+		vers le serveur, le reste du carnet d'adresses ne quitte pas l'appareil. Le fichier n'est pas conservé.
+		L'import peut être refait autant de fois qu'on veut : il ajoute les nouveaux, met à jour ceux qui ont changé,
+		et ne touche jamais aux notes saisies ici.
+	</p>
+</details>
+
+<script>
+// fichesAvecAppartement keeps the cards of a vCard file that mention an
+// apartment between parentheses, "(C01)" or "(ex loc C01)". It is wider than
+// what the server reads (any line of the card, not only the name): the server
+// decides, this only leaves the rest of the address book on the device.
+function fichesAvecAppartement(texte) {
+	var fiches = texte.replace(/\r\n?/g, '\n').replace(/\n[ \t]/g, '').match(/BEGIN:VCARD[\s\S]*?END:VCARD/g) || [];
+	return fiches.filter(function (f) { return /\([^()\n]*[CD][0-9]{2}\s*\)/i.test(f); });
+}
+(function () {
+	var form = document.getElementById('import');
+	var envoi = false;
+	form.addEventListener('submit', function (e) {
+		var champ = form.elements.contacts;
+		if (envoi || !champ.files.length || !champ.files[0].text || typeof DataTransfer !== 'function') { return; }
+		e.preventDefault();
+		var message = document.getElementById('import-message');
+		champ.files[0].text().then(function (texte) {
+			var fiches = fichesAvecAppartement(texte);
+			// Nothing to send: say so here rather than send the whole
+			// address book to be told the same.
+			if (!fiches.length) {
+				message.textContent = texte.indexOf('BEGIN:VCARD') < 0
+					? "Ce fichier n'est pas un export de contacts (vCard, .vcf)."
+					: "Aucun contact de ce fichier ne porte d'appartement dans son nom, comme « Camille MARTIN (C01) ».";
+				message.hidden = false;
+				return;
+			}
+			var tri = new DataTransfer();
+			tri.items.add(new File([fiches.join('\n') + '\n'], 'residents.vcf', { type: 'text/vcard' }));
+			champ.files = tri.files;
+			envoi = true;
+			form.submit();
+		}, function () { envoi = true; form.submit(); });
+	});
+})();
+</script>
+
+<form class="ligne" onsubmit="return false">
+	<input id="filtre" type="search" placeholder="Chercher un nom, un appartement, un numéro…" autocomplete="off">
+</form>
+
+<div class="scroll">
+<table class="annuaire">
+	<thead><tr><th>Appt</th><th>Nom</th><th>Téléphone</th><th>E-mail, note</th></tr></thead>
+	<tbody>
+		{{range $a := .Appartements}}
+		{{range $i, $p := $a.Personnes}}
+		<tr id="resident-{{$p.ID}}" {{if not $i}}class="premier"{{end}} data-q="{{$a.Code}} {{$p.Nom}} {{$p.Qualite.French}} {{$p.Detail}} {{$p.Telephone}} {{chiffres $p.Telephone}} {{$p.Email}} {{$p.Note}}">
+			<td class="appt"><strong>{{$a.Code}}</strong>{{if $a.Type}} <small>{{$a.Type}}</small>{{end}}</td>
+			<td>{{template "resident_nom" residentCtx $.BasePath $p}}</td>
+			<td class="tel">{{template "resident_tel" $p}}</td>
+			<td>{{template "resident_plus" $p}}</td>
+		</tr>
+		{{end}}
+		{{if $a.SansResident}}
+		<tr class="vide{{if not $a.Personnes}} premier{{end}}" data-q="{{$a.Code}} personne">
+			<td class="appt"><strong>{{$a.Code}}</strong>{{if $a.Type}} <small>{{$a.Type}}</small>{{end}}</td>
+			<td colspan="3"><span class="badge sans">Aucun résident connu</span> <a href="{{$.BasePath}}/residents/new?appartement={{$a.Code}}">Ajouter</a></td>
+		</tr>
+		{{end}}
+		{{end}}
+	</tbody>
+</table>
+</div>
+
+<details class="bloc" id="anciens">
+	<summary>Anciens résidents et propriétaires <small>({{len .Anciens}})</small></summary>
+	<div class="scroll">
+	<table class="annuaire">
+		<thead><tr><th>Appt</th><th>Nom</th><th>Téléphone</th><th>E-mail, note</th></tr></thead>
+		<tbody>
+			{{range $p := .Anciens}}
+			<tr id="resident-{{$p.ID}}" data-q="{{$p.Appartement}} {{$p.Nom}} ancien {{$p.Detail}} {{$p.Telephone}} {{chiffres $p.Telephone}} {{$p.Email}} {{$p.Note}}">
+				<td class="appt"><strong>{{$p.Appartement}}</strong></td>
+				<td>{{template "resident_nom" residentCtx $.BasePath $p}}</td>
+				<td class="tel">{{template "resident_tel" $p}}</td>
+				<td>{{template "resident_plus" $p}}</td>
+			</tr>
+			{{else}}
+			<tr><td colspan="4" class="muted">Personne.</td></tr>
+			{{end}}
+		</tbody>
+	</table>
+	</div>
+</details>
+
+<script>
+(function () {
+	var champ = document.getElementById('filtre');
+	var anciens = document.getElementById('anciens');
+	function plie(s) { return s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+	function filtrer() {
+		var mots = plie(champ.value).split(/\s+/).filter(Boolean);
+		document.querySelectorAll('tr[data-q]').forEach(function (tr) {
+			var texte = plie(tr.dataset.q);
+			tr.hidden = !mots.every(function (m) { return texte.indexOf(m) >= 0; });
+		});
+		// Somebody who left is still somebody one may be looking for.
+		if (mots.length) { anciens.open = true; }
+	}
+	champ.addEventListener('input', filtrer);
+	// /residents?q=C05 opens the list already filtered.
+	var q = new URLSearchParams(location.search).get('q');
+	if (q) { champ.value = q; filtrer(); }
+})();
+</script>
+</body>
+</html>
+{{end}}
+
+{{define "resident_nom"}}
+<a href="{{.BasePath}}/residents/{{.P.ID}}">{{.P.Nom}}</a>
+{{if eq (print .P.Qualite) "proprietaire"}}<span class="badge proprietaire">Propriétaire{{if .P.Detail}} · {{.P.Detail}}{{end}}</span>
+{{else if eq (print .P.Qualite) "autre"}}<span class="badge neutre">{{if .P.Detail}}{{.P.Detail}}{{else}}Autre{{end}}</span>
+{{else if .P.Detail}}<span class="badge neutre">{{.P.Detail}}</span>{{end}}
+{{end}}
+
+{{define "resident_tel"}}
+{{range $t := .Telephones}}
+<div>
+	{{with lienTelephone $t}}<a class="numero" href="{{.}}">{{$t}}</a>{{else}}{{$t}}{{end}}
+	{{with lienWhatsApp $t}}<a class="wa" href="{{.}}" target="_blank" rel="noopener">WhatsApp</a>{{end}}
+</div>
+{{else}}<span class="muted">—</span>{{end}}
+{{end}}
+
+{{define "resident_plus"}}
+{{range .Emails}}<div><a href="mailto:{{.}}">{{.}}</a></div>{{end}}
+{{if .Note}}<small>{{.Note}}</small>{{end}}
+{{end}}
+
+{{define "resident_edit"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>{{if .IsNew}}Ajouter une personne{{else}}{{.R.Nom}}{{end}}</title>
+{{template "head"}}
+</head>
+<body>
+{{template "nav" .}}
+
+<p><a href="{{.BasePath}}/residents">← Tous les résidents</a></p>
+<h1>{{if .IsNew}}Ajouter une personne{{else}}{{.R.Nom}} <small>{{.R.Appartement}}</small>{{end}}</h1>
+
+<form method="POST" action="{{.BasePath}}/residents/{{if .IsNew}}new{{else}}{{.R.ID}}{{end}}" class="grille">
+	<label for="appartement">Appartement</label>
+	<select id="appartement" name="appartement" required>
+		{{if not .R.Appartement}}<option value="" selected disabled>Choisir…</option>{{end}}
+		{{$actuel := .R.Appartement}}{{$connu := false}}
+		{{range .Appartements}}<option value="{{.Code}}" {{if eq .Code $actuel}}selected{{end}}>{{.Code}} ({{.Type}})</option>{{if eq .Code $actuel}}{{$connu = true}}{{end}}{{end}}
+		{{if and $actuel (not $connu)}}<option value="{{$actuel}}" selected>{{$actuel}}</option>{{end}}
+	</select>
+
+	<label for="nom">Nom</label>
+	<input id="nom" type="text" name="nom" value="{{.R.Nom}}" required placeholder="Camille MARTIN">
+
+	<label for="qualite">Qualité</label>
+	<select id="qualite" name="qualite">
+		<option value="resident" {{if eq (print .R.Qualite) "resident"}}selected{{end}}>Résident (y habite)</option>
+		<option value="proprietaire" {{if eq (print .R.Qualite) "proprietaire"}}selected{{end}}>Propriétaire, sans y habiter</option>
+		<option value="ancien" {{if eq (print .R.Qualite) "ancien"}}selected{{end}}>Ancien (n'y est plus)</option>
+		<option value="autre" {{if eq (print .R.Qualite) "autre"}}selected{{end}}>Autre</option>
+	</select>
+
+	<label for="detail">Précision</label>
+	<input id="detail" type="text" name="detail" value="{{.R.Detail}}" placeholder="locataire, compagnon, ancien locataire, gestionnaire…">
+
+	<label for="telephone">Téléphone</label>
+	<input id="telephone" type="text" name="telephone" inputmode="tel" value="{{.R.Telephone}}" placeholder="06 12 34 56 78">
+	<div class="aide">Plusieurs numéros : les séparer par une virgule.</div>
+
+	<label for="email">E-mail</label>
+	<input id="email" type="text" name="email" inputmode="email" value="{{.R.Email}}">
+
+	<label for="note">Note</label>
+	<textarea id="note" name="note" placeholder="Arrivée en mars 2026, préfère WhatsApp, a les clés du local vélo…">{{.R.Note}}</textarea>
+
+	<div class="actions">
+		<button type="submit" class="btn">Enregistrer</button>
+		{{if not .IsNew}}
+		<button type="submit" formaction="{{.BasePath}}/residents/{{.R.ID}}/delete" formnovalidate class="btn danger"
+			onclick="return confirm('Supprimer cette personne ?')">Supprimer</button>
+		{{end}}
+	</div>
+	{{if not .IsNew}}
+	<div class="aide">
+		{{if eq (print .R.Origine) "whatsapp"}}
+		Vient des contacts du téléphone, lus par WhatsApp : le nom, l'appartement et la qualité y sont relus toutes les heures.
+		Mieux vaut donc les corriger dans les contacts du téléphone. La note, l'e-mail et les autres numéros, eux, ne sont qu'ici.
+		{{else if eq (print .R.Origine) "contacts"}}
+		Vient d'un export des contacts du téléphone : au prochain import, le nom, l'appartement, la qualité, le téléphone et l'e-mail
+		sont repris des contacts quand ils y figurent. Mieux vaut donc les corriger dans les contacts. La note, elle, n'est qu'ici.
+		{{else}}
+		Saisi ici par {{.R.CreatedBy}}.
+		{{end}}
+		Ajouté le {{jour .R.CreatedAt}}, modifié le {{jour .R.UpdatedAt}}.
+	</div>
+	{{end}}
+</form>
+</body>
+</html>
+{{end}}
+
+{{define "residents_import"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+{{$wa := eq (print .Plan.Source) "whatsapp"}}
+<title>{{if $wa}}Lecture de WhatsApp{{else}}Import des contacts{{end}}</title>
+{{template "head"}}
+{{template "residents_style"}}
+</head>
+<body>
+{{template "nav" .}}
+
+<p><a href="{{.BasePath}}/residents">← Tous les résidents</a></p>
+<h1>{{if $wa}}Lecture des contacts de WhatsApp{{else}}Import des contacts{{end}}</h1>
+
+{{with .Plan}}
+<div class="cartes">
+	{{if $wa}}
+	<div class="carte"><div class="titre">Voisins dans WhatsApp</div><div class="valeur">{{.Retenus}}</div></div>
+	{{else}}
+	<div class="carte"><div class="titre">Contacts lus</div><div class="valeur">{{.Lus}}</div><small>dont {{.Retenus}} avec un appartement</small></div>
+	{{end}}
+	<div class="carte"><div class="titre">Ajoutés</div><div class="valeur">{{len .Ajouts}}</div></div>
+	<div class="carte"><div class="titre">Mis à jour</div><div class="valeur">{{len .MisAJour}}</div></div>
+	<div class="carte"><div class="titre">Inchangés</div><div class="valeur">{{.Inchanges}}</div></div>
+</div>
+
+{{if not .Retenus}}
+<p>Aucun contact {{if $wa}}connu de WhatsApp{{else}}de ce fichier{{end}} ne porte d'appartement dans son nom, comme « Camille MARTIN (C01) ». Rien n'a changé.</p>
+{{end}}
+
+{{if .Ajouts}}
+<h2>Ajoutés <small>({{len .Ajouts}})</small></h2>
+<ul class="personnes">{{range .Ajouts}}<li><strong>{{.Appartement}}</strong> {{.Nom}} <span class="muted">{{.Qualite.French}}{{if .Detail}}, {{.Detail}}{{end}}</span></li>{{end}}</ul>
+{{end}}
+
+{{if .MisAJour}}
+<h2>Mis à jour <small>({{len .MisAJour}})</small></h2>
+<ul class="personnes">{{range .MisAJour}}<li><strong>{{.Appartement}}</strong> <a href="{{$.BasePath}}/residents/{{.ID}}">{{.Nom}}</a> <span class="muted">{{.Qualite.French}}{{if .Detail}}, {{.Detail}}{{end}}</span></li>{{end}}</ul>
+{{end}}
+
+{{if .Absents}}
+<h2>Plus dans les contacts <small>({{len .Absents}})</small></h2>
+{{if $wa}}
+<p class="muted">Ces personnes venaient de WhatsApp et n'y sont plus : le contact a été supprimé du téléphone, ou son nom ne porte plus d'appartement. Elles sont toujours dans la liste.</p>
+{{else}}
+<p class="muted">Ces personnes venaient d'un import précédent et ne sont plus dans ce fichier : le contact a été supprimé, ou son nom ne porte plus d'appartement. Elles sont toujours dans la liste.</p>
+{{end}}
+<form method="POST" action="{{$.BasePath}}/residents/supprimer">
+	<ul class="personnes">{{range .Absents}}<li><input type="hidden" name="id" value="{{.ID}}"><strong>{{.Appartement}}</strong> <a href="{{$.BasePath}}/residents/{{.ID}}">{{.Nom}}</a></li>{{end}}</ul>
+	<button type="submit" class="btn danger" onclick="return confirm('Supprimer ces {{len .Absents}} personnes de la liste ?')">Les supprimer de la liste</button>
+</form>
+{{end}}
+
+{{if .Doublons}}
+<h2>En double dans les contacts <small>({{len .Doublons}})</small></h2>
+<p class="muted">Ces fiches disent deux fois la même personne dans le même appartement : une seule est gardée, celle qui dit que la personne y est encore. L'autre fiche est à supprimer dans les contacts.</p>
+<ul class="personnes">{{range .Doublons}}<li><strong>{{.Appartement}}</strong> {{.Nom}} <span class="muted">{{.Qualite.French}}{{if .Detail}}, {{.Detail}}{{end}}</span></li>{{end}}</ul>
+{{end}}
+{{end}}
+
+<p><a href="{{.BasePath}}/residents" class="btn">Voir la liste</a></p>
+</body>
+</html>
+{{end}}

@@ -36,6 +36,17 @@ var coproFuncs = template.FuncMap{
 		}{e, basePath}
 	},
 	"chemin": url.PathEscape,
+	// The directory of the residents: the links that call a number, and the
+	// number without its spaces so that the search finds "0612".
+	"lienTelephone": lienTelephone,
+	"lienWhatsApp":  lienWhatsApp,
+	"chiffres":      func(s string) string { return strings.ReplaceAll(s, " ", "") },
+	"residentCtx": func(basePath string, p db.ResidentDB) any {
+		return struct {
+			BasePath string
+			P        db.ResidentDB
+		}{basePath, p}
+	},
 	// The "message" sub-template shows one collected message, in the lists
 	// and in the dossier of an affaire (where it can be detached).
 	"messageCtx": func(basePath, affaireID string, s db.SourceDB, lienID string) any {
@@ -144,6 +155,7 @@ type copro struct {
 	baseURL  string  // With the base path; for the share links.
 	partage  partage // The key of the share links; zero in the pages that make none.
 	brain    brainTrigger
+	carnet   carnetFunc // The address book of WhatsApp, for the residents; nil without a whatsapp service.
 }
 
 func (c copro) page(r *http.Request, section string) page {
