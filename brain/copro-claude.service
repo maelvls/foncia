@@ -10,8 +10,12 @@ After=docker.service
 
 [Service]
 Type=oneshot
-User=pi
-Group=pi
+# The server is no longer the Raspberry Pi: there is no "pi" user on it, and
+# with User=pi the unit failed before running anything (status=217/USER), so
+# the page showed "en train de lire…" forever. /home/pi is a symlink to this
+# user's home, which keeps the paths below working.
+User=mvalais
+Group=mvalais
 # The directory that the foncia container sees as /data/brain.
 Environment=COPRO_STATE=/home/pi/vls.dev/foncia/brain
 Environment=CLAUDE_BIN=/home/pi/.local/bin/claude
