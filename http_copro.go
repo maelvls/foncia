@@ -44,6 +44,22 @@ var coproTmpl = template.Must(template.New("copro").Funcs(template.FuncMap{
 			S         db.SourceDB
 		}{basePath, affaireID, lienID, s}
 	},
+	// The "choix_affaire" sub-template is the field that picks an affaire:
+	// a select that the script of "head" turns into a field that filters
+	// as one types. s, when not nil, preselects an affaire.
+	"choixAffaire": func(invite string, affaires []db.AffaireDB, s *suggestion) any {
+		return struct {
+			Invite   string
+			Affaires []db.AffaireDB
+			Choisie  string
+		}{invite, affaires, s.AffaireID()}
+	},
+	"suggestionCtx": func(basePath string, s *suggestion) any {
+		return struct {
+			BasePath string
+			S        *suggestion
+		}{basePath, s}
+	},
 	"tableRemboursements": func(basePath string, lignes []db.RemboursementDB) any {
 		return struct {
 			BasePath string

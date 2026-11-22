@@ -102,13 +102,215 @@
 	.pj img { max-height: 90px; border-radius: 4px; display: block; }
 	.citation { border-left: 3px solid var(--border); padding: 2px 0 2px 10px; color: var(--muted); white-space: pre-wrap; margin: 6px 0; }
 	.badge.proposee { background: #ece8fb; color: var(--accent); }
+	a.badge { text-decoration: none; }
+	.carte:target { border-color: var(--accent); box-shadow: 0 0 0 3px #ece8fb; scroll-margin-top: 12px; }
+
+	/* A message to sort, with what to do with it on its right. */
+	.tri { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: start; }
+	.tri .actions { padding-top: 10px; }
+	.tri .actions p { margin: 0 0 6px; }
+	.tri .actions form.ligne { margin: 0 0 6px; flex-wrap: nowrap; }
+	.suggestion { font-size: .85rem; }
+	.suggestion small { display: block; margin-top: 2px; }
+
+	/* The field that picks an affaire: see the script below. */
+	.combo { position: relative; display: block; min-width: 0; }
+	.combo-liste {
+		position: absolute; z-index: 10; top: 100%; left: 0; margin: 2px 0 0; padding: 4px 0; list-style: none;
+		min-width: 100%; width: max-content; max-width: min(460px, 92vw); max-height: 19em; overflow-y: auto;
+		background: #fff; border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 6px 18px rgba(0, 0, 0, .14);
+		font-size: .9rem; text-align: left;
+	}
+	.combo-liste li { padding: 6px 10px; cursor: pointer; }
+	.combo-liste li small { display: block; }
+	.combo-liste li:hover { background: var(--bg-alt); }
+	.combo-liste li[aria-selected=true] { background: #ece8fb; }
+	.combo.erreur input { border-color: var(--danger); outline-color: var(--danger); }
+	.combo-liste li.vide { color: var(--muted); cursor: default; background: none; }
+	.tri .combo-liste { left: auto; right: 0; }
 	@media (max-width: 720px) {
 		.deux { grid-template-columns: 1fr; gap: 0; }
 		form.grille, dl.fiche { grid-template-columns: 1fr; gap: 4px; }
 		form.grille .aide, form.grille .actions { grid-column: 1; }
 		dl.fiche dt { margin-top: 8px; }
+		.tri { grid-template-columns: minmax(0, 1fr); gap: 0; border-bottom: 1px solid var(--border); }
+		.tri .message { border-bottom: none; }
+		.tri .actions { padding: 0 0 12px; }
+		.tri .combo-liste { left: 0; right: auto; }
+		.combo input { font-size: 16px; } /* Below 16px, iOS zooms into the field. */
 	}
 </style>
+<script>
+// Turns every <select data-combo> into a text field that filters the options
+// as one types: case and accents are ignored and every word typed must be
+// found (in the number, the title or the place of the affaire), the affaires
+// where each one starts a word coming first. Without JavaScript the select
+// stays a select.
+document.addEventListener("DOMContentLoaded", function () {
+	var plie = function (t) { return t.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase(); };
+	document.querySelectorAll("select[data-combo]").forEach(function (select, n) {
+		var options = Array.prototype.filter.call(select.options, function (o) { return o.value; }).map(function (o) {
+			var texte = o.textContent.trim();
+			return {
+				o: o, texte: texte, detail: o.dataset.detail || "",
+				num: (texte.match(/^n°\s*(\d+)/) || [])[1] || "",
+				cle: " " + plie(texte + " " + (o.dataset.detail || "") + " " + (o.dataset.mots || "")).replace(/[^a-z0-9]+/g, " "),
+			};
+		});
+		var obligatoire = select.required, trouvees = [], actif = -1;
+
+		var boite = document.createElement("span");
+		boite.className = "combo";
+		var champ = document.createElement("input");
+		champ.type = "search";
+		champ.autocomplete = "off";
+		champ.spellcheck = false;
+		champ.setAttribute("autocapitalize", "off");
+		champ.setAttribute("role", "combobox");
+		champ.setAttribute("aria-autocomplete", "list");
+		champ.setAttribute("aria-expanded", "false");
+		champ.setAttribute("aria-controls", "combo-" + n);
+		champ.placeholder = (select.options[0] && !select.options[0].value ? select.options[0].textContent.trim() + " " : "") + "(n° ou mots)";
+		var liste = document.createElement("ul");
+		liste.id = "combo-" + n;
+		liste.className = "combo-liste";
+		liste.setAttribute("role", "listbox");
+		liste.hidden = true;
+		select.before(boite);
+		boite.append(champ, liste, select);
+		select.hidden = true;
+		select.required = false; // A hidden field can't show its own error: the text field does.
+
+		var valider = function () {
+			champ.setCustomValidity(obligatoire && !select.value ? "Choisissez une affaire dans la liste." : "");
+			champ.title = select.value ? champ.value : "";
+			if (select.value) { boite.classList.remove("erreur"); }
+		};
+		var choisie = function () {
+			return options.find(function (x) { return x.o.value === select.value; });
+		};
+		// What the text typed matches. The name of the affaire already chosen
+		// is not a search: all of them are shown, to pick another.
+		var chercher = function () {
+			var c = choisie(), q = plie(champ.value).trim();
+			if (!q || (c && champ.value === c.texte)) { return options.slice(); }
+			var mots = q.split(/[^a-z0-9]+/).filter(Boolean);
+			var t = options.filter(function (x) { return mots.every(function (m) { return x.cle.indexOf(m) >= 0; }); });
+			// "12" is first of all the affaire n°12; then come those where
+			// every word typed starts a word ("hall c" is the hall C before
+			// the hall A of the boîtes forcées).
+			var rang = function (x) {
+				if (x.num === q) { return 2; }
+				return mots.every(function (m) { return x.cle.indexOf(" " + m) >= 0; }) ? 1 : 0;
+			};
+			return t.sort(function (a, b) { return rang(b) - rang(a); });
+		};
+		var marquer = function () {
+			Array.prototype.forEach.call(liste.children, function (li, i) {
+				li.setAttribute("aria-selected", i === actif ? "true" : "false");
+				if (i === actif) { li.scrollIntoView({ block: "nearest" }); }
+			});
+			if (actif >= 0) { champ.setAttribute("aria-activedescendant", liste.id + "-" + actif); } else { champ.removeAttribute("aria-activedescendant"); }
+		};
+		var fermer = function () {
+			liste.hidden = true;
+			champ.setAttribute("aria-expanded", "false");
+			champ.removeAttribute("aria-activedescendant");
+		};
+		var choisir = function (x) {
+			select.value = x.o.value;
+			champ.value = x.texte;
+			valider();
+			fermer();
+		};
+		// Sending the form without an affaire: rather than the bubble of the
+		// browser, which the list would cover, the field turns red and the
+		// list opens.
+		champ.addEventListener("invalid", function (e) {
+			e.preventDefault();
+			boite.classList.add("erreur");
+			champ.focus();
+		});
+		var ouvrir = function () {
+			var c = choisie();
+			trouvees = chercher();
+			liste.replaceChildren();
+			trouvees.forEach(function (x, i) {
+				var li = document.createElement("li");
+				li.id = liste.id + "-" + i;
+				li.setAttribute("role", "option");
+				li.textContent = x.texte;
+				if (x.detail) {
+					var s = document.createElement("small");
+					s.textContent = x.detail;
+					li.append(s);
+				}
+				li.addEventListener("click", function () { choisir(x); });
+				liste.append(li);
+			});
+			if (!trouvees.length) {
+				var vide = document.createElement("li");
+				vide.className = "vide";
+				vide.textContent = "Aucune affaire ne correspond.";
+				liste.append(vide);
+			}
+			actif = c ? trouvees.indexOf(c) : (champ.value.trim() && trouvees.length ? 0 : -1);
+			liste.hidden = false;
+			champ.setAttribute("aria-expanded", "true");
+			marquer();
+		};
+
+		// Clicking in the list must not take the focus away from the field.
+		liste.addEventListener("mousedown", function (e) { e.preventDefault(); });
+		champ.addEventListener("focus", function () { champ.select(); ouvrir(); });
+		champ.addEventListener("click", function () { if (liste.hidden) { ouvrir(); } });
+		champ.addEventListener("input", function () { select.value = ""; valider(); ouvrir(); });
+		champ.addEventListener("blur", function () {
+			fermer();
+			// One affaire left by what was typed: that's the one.
+			if (!select.value && champ.value.trim()) {
+				var t = chercher();
+				if (t.length === 1) { choisir(t[0]); }
+			}
+		});
+		champ.addEventListener("keydown", function (e) {
+			if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+				e.preventDefault();
+				if (liste.hidden) { ouvrir(); return; }
+				if (!trouvees.length) { return; }
+				actif = e.key === "ArrowDown" ? Math.min(actif + 1, trouvees.length - 1) : Math.max(actif - 1, 0);
+				marquer();
+			} else if (e.key === "Enter" && !liste.hidden && actif >= 0) {
+				e.preventDefault(); // Enter picks; Enter again sends the form.
+				choisir(trouvees[actif]);
+			} else if (e.key === "Escape" && !liste.hidden) {
+				e.preventDefault();
+				fermer();
+			}
+		});
+
+		var c = choisie();
+		if (c) { champ.value = c.texte; }
+		valider();
+	});
+});
+</script>
+{{end}}
+
+{{define "choix_affaire"}}
+<select name="affaire_id" required data-combo>
+	<option value="">{{.Invite}}</option>
+	{{range .Affaires}}<option value="{{.ID}}"{{if eq .ID $.Choisie}} selected{{end}} data-detail="{{.Localisation}}" data-mots="{{.Responsable}}">n°{{.Numero}} — {{.Titre}}{{if eq (print .Statut) "levee"}} (levée){{end}}</option>{{end}}
+</select>
+{{end}}
+
+{{define "suggestion"}}
+<p class="suggestion">
+	{{if .S.PropositionID}}<a href="{{.BasePath}}/propositions#p-{{.S.PropositionID}}" class="badge proposee">{{.S.Libelle}}</a>
+	{{else}}<span class="badge neutre">{{.S.Libelle}}</span>{{end}}
+	{{if .S.Titre}}<strong>{{.S.Titre}}</strong>{{end}}
+	{{if .S.Pourquoi}}<small>{{.S.Pourquoi}}</small>{{end}}
+</p>
 {{end}}
 
 {{define "nav"}}

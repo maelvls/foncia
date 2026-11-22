@@ -93,10 +93,7 @@
 {{end}}
 
 <form method="POST" action="{{.BasePath}}/comptes/depenses/{{.D.ID}}/lier" class="ligne">
-	<select name="affaire_id" required>
-		<option value="">Rattacher à l'affaire…</option>
-		{{range .Affaires}}<option value="{{.ID}}">n°{{.Numero}} {{.Titre}}{{if eq (print .Statut) "levee"}} (levée){{end}}</option>{{end}}
-	</select>
+	{{template "choix_affaire" (choixAffaire "Rattacher à l'affaire…" .Affaires nil)}}
 	<input type="text" name="note" placeholder="Note (facultatif)">
 	<button class="btn">Rattacher</button>
 </form>

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -40,16 +41,123 @@ type sourcesData struct {
 
 type sourceLigne struct {
 	db.SourceDB
-	Affaires []db.AffaireRef
-	Proposee bool
+	Affaires   []db.AffaireRef
+	Proposee   bool
+	Suggestion *suggestion
 }
 
 type sourceData struct {
 	page
-	S        db.SourceDB
-	Affaires []db.AffaireRef // Those it is attached to.
-	Fil      []db.SourceDB   // The other messages of the same e-mail thread.
-	Toutes   []db.AffaireDB  // To pick one to attach to.
+	S          db.SourceDB
+	Affaires   []db.AffaireRef // Those it is attached to.
+	Fil        []db.SourceDB   // The other messages of the same e-mail thread.
+	Toutes     []db.AffaireDB  // To pick one to attach to.
+	Suggestion *suggestion
+}
+
+// suggestion is what the page offers to do with a message still to sort, so
+// that the administrator confirms rather than looks for the affaire: what
+// Claude proposed for it, else the affaire of the rest of its e-mail thread.
+type suggestion struct {
+	Action        db.PropositionAction // Empty when it comes from the thread.
+	PropositionID string
+	Affaire       *db.AffaireDB // The affaire to preselect, when there is one.
+	Titre         string        // creer_affaire: the title Claude gave.
+	Pourquoi      string
+}
+
+// AffaireID is the affaire to preselect, or "". It is safe on a nil
+// suggestion, which is what the templates have for most messages.
+func (s *suggestion) AffaireID() string {
+	if s == nil || s.Affaire == nil {
+		return ""
+	}
+	return s.Affaire.ID
+}
+
+// Libelle says where the suggestion comes from and what it is.
+func (s *suggestion) Libelle() string {
+	num := ""
+	if s.Affaire != nil {
+		num = "n°" + strconv.Itoa(s.Affaire.Numero)
+	}
+	switch s.Action {
+	case db.PropRattacher:
+		return "Claude propose de rattacher à " + num
+	case db.PropCommenter:
+		return "Claude propose un commentaire sur " + num
+	case db.PropRelancer:
+		return "Claude propose une relance sur " + num
+	case db.PropLever:
+		return "Claude propose de lever " + num
+	case db.PropCreerAffaire:
+		return "Claude propose une nouvelle affaire"
+	case db.PropIgnorer:
+		return "Claude propose d'écarter"
+	}
+	return "Même fil que " + num
+}
+
+// Ecarter tells whether the suggestion is to set the message aside. Safe on
+// a nil suggestion too.
+func (s *suggestion) Ecarter() bool { return s != nil && s.Action == db.PropIgnorer }
+
+// suggestions finds what to offer for each message to sort. Several waiting
+// propositions may be about the same message: the one that names an affaire
+// wins over a new affaire, which wins over setting it aside.
+func suggestions(ctx context.Context, sqlDB *sql.DB, sources []db.SourceDB, affaires []db.AffaireDB) (map[string]*suggestion, error) {
+	parID := make(map[string]*db.AffaireDB, len(affaires))
+	for i := range affaires {
+		parID[affaires[i].ID] = &affaires[i]
+	}
+	props, err := db.GetPropositions(ctx, sqlDB, 0, db.PropEnAttente)
+	if err != nil {
+		return nil, err
+	}
+	rang := func(s *suggestion) int {
+		switch {
+		case s == nil:
+			return 0
+		case s.Action == db.PropIgnorer:
+			return 1
+		case s.Action == db.PropCreerAffaire:
+			return 2
+		case s.Action == db.PropRattacher:
+			return 4
+		}
+		return 3
+	}
+	out := make(map[string]*suggestion)
+	for _, p := range props {
+		sug := &suggestion{Action: p.Action, PropositionID: p.ID, Pourquoi: p.Justification}
+		switch p.Action {
+		case db.PropIgnorer:
+		case db.PropCreerAffaire:
+			sug.Titre = p.Donnees.Titre
+		default:
+			if sug.Affaire = parID[p.AffaireID]; sug.Affaire == nil {
+				continue // The affaire is gone: nothing to preselect.
+			}
+		}
+		for _, id := range p.SourceIDs {
+			if rang(sug) > rang(out[id]) {
+				out[id] = sug
+			}
+		}
+	}
+	for _, s := range sources {
+		if out[s.ID] != nil || s.Etat != db.SourceATrier || s.Canal != db.CanalGmail {
+			continue
+		}
+		fil, err := db.AffairesOfFil(ctx, sqlDB, s.Canal, s.Fil, s.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(fil) == 1 && parID[fil[0].ID] != nil {
+			out[s.ID] = &suggestion{Affaire: parID[fil[0].ID], Pourquoi: "D'autres messages de ce fil y sont déjà rattachés."}
+		}
+	}
+	return out, nil
 }
 
 type propositionsData struct {
@@ -243,10 +351,19 @@ func (c copro) sourcesList(w http.ResponseWriter, r *http.Request) {
 		c.fail(w, "sources proposees", err)
 		return
 	}
-	affaires, err := db.GetAffaires(ctx, c.sqlDB, db.AffaireStatutEnCours)
+	// Every affaire, those en cours first: the field filters them as one
+	// types, and a late message may be about an affaire already levée.
+	affaires, err := db.GetAffaires(ctx, c.sqlDB, "")
 	if err != nil {
 		c.fail(w, "listing affaires", err)
 		return
+	}
+	var sugg map[string]*suggestion
+	if etat == db.SourceATrier {
+		if sugg, err = suggestions(ctx, c.sqlDB, sources, affaires); err != nil {
+			c.fail(w, "suggestions", err)
+			return
+		}
 	}
 	compte, err := db.CountSources(ctx, c.sqlDB)
 	if err != nil {
@@ -258,7 +375,7 @@ func (c copro) sourcesList(w http.ResponseWriter, r *http.Request) {
 		data.Compte[string(e)] = n
 	}
 	for _, s := range sources {
-		l := sourceLigne{SourceDB: s, Proposee: proposees[s.ID]}
+		l := sourceLigne{SourceDB: s, Proposee: proposees[s.ID], Suggestion: sugg[s.ID]}
 		if etat == db.SourceClassee {
 			if l.Affaires, err = db.AffairesOfSource(ctx, c.sqlDB, s.ID); err != nil {
 				c.fail(w, "affaires of source", err)
@@ -319,6 +436,14 @@ func (c copro) sourceVoir(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		data.Toutes = toutes
+		if s.Etat == db.SourceATrier {
+			sugg, err := suggestions(r.Context(), c.sqlDB, []db.SourceDB{s}, toutes)
+			if err != nil {
+				c.fail(w, "suggestions", err)
+				return
+			}
+			data.Suggestion = sugg[s.ID]
+		}
 	}
 	c.render(w, "source", data)
 }
@@ -344,6 +469,10 @@ func (c copro) sourceRattacher(w http.ResponseWriter, r *http.Request) {
 	n, err := rattacherSource(ctx, c.sqlDB, s, a, currentUser(r))
 	if err != nil {
 		c.fail(w, "rattacher source", err)
+		return
+	}
+	if err := fermerPropositionsCaduques(ctx, c.sqlDB, currentUser(r)); err != nil {
+		c.fail(w, "closing propositions", err)
 		return
 	}
 	flash := "Rattaché à l'affaire n°" + strconv.Itoa(a.Numero) + " (" + a.Titre + ")."
@@ -382,6 +511,10 @@ func (c copro) sourceNouvelleAffaire(w http.ResponseWriter, r *http.Request) {
 		c.fail(w, "rattacher source", err)
 		return
 	}
+	if err := fermerPropositionsCaduques(ctx, c.sqlDB, currentUser(r)); err != nil {
+		c.fail(w, "closing propositions", err)
+		return
+	}
 	c.redirect(w, r, "/affaires/"+a.ID+"/edit", "Affaire n°"+strconv.Itoa(num)+" créée depuis le message : complétez la fiche.")
 }
 
@@ -401,6 +534,10 @@ func (c copro) sourceEtat(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		c.fail(w, "set source etat", err)
+		return
+	}
+	if err := fermerPropositionsCaduques(r.Context(), c.sqlDB, currentUser(r)); err != nil {
+		c.fail(w, "closing propositions", err)
 		return
 	}
 	flash := "Message écarté."
@@ -438,6 +575,55 @@ func rattacherSource(ctx context.Context, sqlDB *sql.DB, s db.SourceDB, a db.Aff
 		}
 	}
 	return len(autres), nil
+}
+
+// fermerPropositionsCaduques closes the waiting propositions that only sort
+// messages (rattacher, creer_affaire, ignorer) once all their messages were
+// sorted by hand: accepting one afterwards would file the messages a second
+// time, open an affaire twice or set aside a filed message. It is recorded as
+// accepted when what was done by hand is what it proposed, as refused
+// otherwise. Those that do more than sorting (a comment, a relance, lever)
+// stay: the administrator still has to decide on them.
+func fermerPropositionsCaduques(ctx context.Context, sqlDB *sql.DB, par string) error {
+	props, err := db.GetPropositions(ctx, sqlDB, 0, db.PropEnAttente)
+	if err != nil {
+		return err
+	}
+	for _, p := range props {
+		if len(p.SourceIDs) == 0 || (p.Action != db.PropRattacher && p.Action != db.PropCreerAffaire && p.Action != db.PropIgnorer) {
+			continue
+		}
+		sources, err := db.GetSources(ctx, sqlDB, db.SourcesFilter{IDs: p.SourceIDs})
+		if err != nil {
+			return err
+		}
+		reste, suivie := false, p.Action != db.PropCreerAffaire && len(sources) == len(p.SourceIDs)
+		for _, s := range sources {
+			switch {
+			case s.Etat == db.SourceATrier:
+				reste = true
+			case p.Action == db.PropIgnorer:
+				suivie = suivie && s.Etat == db.SourceIgnoree
+			case p.Action == db.PropRattacher:
+				refs, err := db.AffairesOfSource(ctx, sqlDB, s.ID)
+				if err != nil {
+					return err
+				}
+				suivie = suivie && slices.ContainsFunc(refs, func(a db.AffaireRef) bool { return a.ID == p.AffaireID })
+			}
+		}
+		if reste {
+			continue
+		}
+		etat, resultat := db.PropRefusee, "Sans objet : les messages ont été triés à la main autrement."
+		if suivie {
+			etat, resultat = db.PropAcceptee, "Fait à la main depuis les messages collectés."
+		}
+		if err := db.DecideProposition(ctx, sqlDB, p.ID, etat, par, resultat); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	return nil
 }
 
 func lierSource(ctx context.Context, sqlDB *sql.DB, s db.SourceDB, a db.AffaireDB, par string) error {
