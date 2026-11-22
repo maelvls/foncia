@@ -54,6 +54,19 @@ var coproTmpl = template.Must(template.New("copro").Funcs(template.FuncMap{
 			Choisie  string
 		}{invite, affaires, s.AffaireID()}
 	},
+	// The same field on a page that has one per row: the affaires are
+	// written once ("liste_affaires") instead of in every row, which made
+	// /sources weigh megabytes.
+	"choixAffaireListe": func(invite string, s *suggestion) any {
+		var choisie *db.AffaireDB
+		if s != nil {
+			choisie = s.Affaire
+		}
+		return struct {
+			Invite  string
+			Choisie *db.AffaireDB
+		}{invite, choisie}
+	},
 	"suggestionCtx": func(basePath string, s *suggestion) any {
 		return struct {
 			BasePath string

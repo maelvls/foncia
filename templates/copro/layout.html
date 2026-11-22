@@ -145,18 +145,28 @@
 // as one types: case and accents are ignored and every word typed must be
 // found (in the number, the title or the place of the affaire), the affaires
 // where each one starts a word coming first. Without JavaScript the select
-// stays a select.
+// stays a select. On a page with one field per row, data-combo names the
+// select that holds the affaires once for all of them.
 document.addEventListener("DOMContentLoaded", function () {
-	var plie = function (t) { return t.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase(); };
-	document.querySelectorAll("select[data-combo]").forEach(function (select, n) {
-		var options = Array.prototype.filter.call(select.options, function (o) { return o.value; }).map(function (o) {
+	var plie = function (t) { return t.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase(); };
+	var lire = function (source) {
+		return Array.prototype.filter.call(source.options, function (o) { return o.value; }).map(function (o) {
 			var texte = o.textContent.trim();
 			return {
-				o: o, texte: texte, detail: o.dataset.detail || "",
+				valeur: o.value, texte: texte, detail: o.dataset.detail || "",
 				num: (texte.match(/^n°\s*(\d+)/) || [])[1] || "",
 				cle: " " + plie(texte + " " + (o.dataset.detail || "") + " " + (o.dataset.mots || "")).replace(/[^a-z0-9]+/g, " "),
 			};
 		});
+	};
+	var listes = {};
+	document.querySelectorAll("select[data-combo]").forEach(function (select, n) {
+		var nom = select.dataset.combo, options;
+		if (nom && document.getElementById(nom)) {
+			options = listes[nom] || (listes[nom] = lire(document.getElementById(nom)));
+		} else {
+			options = lire(select);
+		}
 		var obligatoire = select.required, trouvees = [], actif = -1;
 
 		var boite = document.createElement("span");
@@ -187,7 +197,7 @@ document.addEventListener("DOMContentLoaded", function () {
 			if (select.value) { boite.classList.remove("erreur"); }
 		};
 		var choisie = function () {
-			return options.find(function (x) { return x.o.value === select.value; });
+			return options.find(function (x) { return x.valeur === select.value; });
 		};
 		// What the text typed matches. The name of the affaire already chosen
 		// is not a search: all of them are shown, to pick another.
@@ -218,7 +228,11 @@ document.addEventListener("DOMContentLoaded", function () {
 			champ.removeAttribute("aria-activedescendant");
 		};
 		var choisir = function (x) {
-			select.value = x.o.value;
+			// With a shared list, the select of the row doesn't have the option yet.
+			if (!Array.prototype.some.call(select.options, function (o) { return o.value === x.valeur; })) {
+				select.add(new Option(x.texte, x.valeur));
+			}
+			select.value = x.valeur;
 			champ.value = x.texte;
 			valider();
 			fermer();
@@ -297,10 +311,28 @@ document.addEventListener("DOMContentLoaded", function () {
 </script>
 {{end}}
 
+{{define "libelle_affaire"}}n°{{.Numero}} — {{.Titre}}{{if eq (print .Statut) "levee"}} (levée){{end}}{{end}}
+
 {{define "choix_affaire"}}
 <select name="affaire_id" required data-combo>
 	<option value="">{{.Invite}}</option>
-	{{range .Affaires}}<option value="{{.ID}}"{{if eq .ID $.Choisie}} selected{{end}} data-detail="{{.Localisation}}" data-mots="{{.Responsable}}">n°{{.Numero}} — {{.Titre}}{{if eq (print .Statut) "levee"}} (levée){{end}}</option>{{end}}
+	{{range .Affaires}}<option value="{{.ID}}"{{if eq .ID $.Choisie}} selected{{end}} data-detail="{{.Localisation}}" data-mots="{{.Responsable}}">{{template "libelle_affaire" .}}</option>{{end}}
+</select>
+{{end}}
+
+{{/* The affaires, once, for all the "choix_affaire_liste" of the page. */}}
+{{define "liste_affaires"}}
+<select id="liste-affaires" hidden disabled>
+	{{range .}}<option value="{{.ID}}" data-detail="{{.Localisation}}" data-mots="{{.Responsable}}">{{template "libelle_affaire" .}}</option>{{end}}
+</select>
+{{end}}
+
+{{/* Without JavaScript, only the preselected affaire can be picked: the
+page of the message has the whole list. */}}
+{{define "choix_affaire_liste"}}
+<select name="affaire_id" required data-combo="liste-affaires">
+	<option value="">{{.Invite}}</option>
+	{{with .Choisie}}<option value="{{.ID}}" selected>{{template "libelle_affaire" .}}</option>{{end}}
 </select>
 {{end}}
 

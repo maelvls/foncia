@@ -426,8 +426,10 @@ func TestSuggestions(t *testing.T) {
 		assert.NotContains(t, l, " selected")
 		assert.NotContains(t, l, "Claude propose")
 		assert.Contains(t, l, `<button class="btn secondaire">OK</button>`)
-		assert.Contains(t, l, "n°3 — Éclairage du hall (levée)", "the field filters, so the affaires levées are offered too")
-		assert.Contains(t, l, "data-combo")
+		assert.Contains(t, l, `data-combo="liste-affaires"`)
+		assert.NotContains(t, l, "Éclairage du hall", "the affaires are written once for the page, not in every row")
+		assert.Equal(t, 1, strings.Count(body, "n°3 — Éclairage du hall (levée)"), "the field filters, so the affaires levées are offered too")
+		assert.Contains(t, body, `<select id="liste-affaires" hidden disabled>`)
 	})
 
 	t.Run("on the page of the message too", func(t *testing.T) {
