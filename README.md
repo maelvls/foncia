@@ -294,9 +294,9 @@ tenants included.
 It is for the administrators (`--admin-users`) only: these are personal phone
 numbers, given to one person and not to everybody who has an account here.
 
-The people come from the contacts of a phone. The convention is in the name of
-the contact: the apartment between parentheses, with a word in front when the
-person doesn't simply live there.
+The people come from the contacts of a phone, where they are kept anyway. The
+convention is in the name of the contact: the apartment between parentheses,
+with a word in front when the person doesn't simply live there.
 
 | Contact                      | Read as                                   |
 |------------------------------|-------------------------------------------|
@@ -307,6 +307,20 @@ person doesn't simply live there.
 | `Claude ROUX (vendeur C01)`  | Sold C01.                                 |
 | `Jo (plombier C01)`          | Anything else: kept as "autre, plombier". |
 
+The contacts are read in two ways.
+
+**From WhatsApp, on its own.** The phone sends its contacts to the devices
+linked to its WhatsApp account, and keeps them up to date; the whatsapp service
+(`--whatsapp-url`, the one the messages are collected from) is such a device.
+Its `GET /internal/contacts?match=<regexp>` gives the contacts whose name
+mentions an apartment, and only those. They are read when `serve` starts, then
+every `--residents-period` (an hour), and when the button of the page is
+pressed: naming a neighbour in the phone is all it takes for them to show up.
+
+WhatsApp only knows the number of somebody's WhatsApp account: not their
+e-mail, not their other numbers, and not the people who have no account.
+
+**From an export of the contacts, by hand**, for what WhatsApp doesn't know.
 Export the contacts as a vCard (on the iPhone: Contacts, Lists, long press on
 "All Contacts", Export; on the Mac: Contacts, File, Export, Export vCard) and
 give the file to the form of the page, or to the CLI:
@@ -318,22 +332,27 @@ ssh server docker exec -i foncia foncia import-residents - < contacts.vcf
 
 Only the contacts that follow the convention are read, and the file isn't
 kept. The form of the page sorts the file in the browser first, so that the
-rest of the address book never leaves the device. The import is meant to be run
-again whenever the contacts change:
+rest of the address book never leaves the device.
+
+Both can be run again and again, in any order:
 
 - A contact is the row of the same apartment and name (case, accents and the
-  order of the words don't matter); failing that, the row with the same phone
-  number, which is how a renamed contact or a move to another apartment is
-  followed; failing that, somebody new.
-- The contacts win where they say something: the apartment, the name, the
-  qualité, the phone and the e-mail. What was typed on the page and the
-  contacts don't know stays: the note always, and a phone, an e-mail or a
-  precision ("locataire") that the contact doesn't have.
-- Who is no longer in the contacts is listed, and removed only on request (the
-  button of the result page, or `--purge`). People added by hand on the page
-  are never removed by an import.
+  order of the words don't matter); failing that, a row that came from
+  contacts and has the same phone number, which is how a renamed contact or a
+  move to another apartment is followed; failing that, somebody new.
+- WhatsApp, read live, has the last word on who is where: the name, the
+  apartment, the qualité. An export is a picture of one day: it doesn't rename
+  or move somebody WhatsApp follows, it adds their e-mail and their other
+  numbers. Either one takes over a row typed on the page.
+- What a source doesn't know stays: the note always, and a phone, an e-mail or
+  a precision ("locataire") that the contact doesn't have.
+- Who is no longer in a source is listed, and removed only on request (the
+  button of the result page, or `--purge` for an export). The periodic reading
+  never removes anybody, and people added by hand on the page are never
+  removed by either.
 - The same person twice in the same apartment is reported, so that the
-  contacts can be cleaned up.
+  contacts can be cleaned up. A card with two numbers, which WhatsApp gives
+  once per number, is one person with two numbers.
 
 ## Fichiers, messages et Claude
 

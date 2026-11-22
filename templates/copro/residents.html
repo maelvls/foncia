@@ -12,6 +12,13 @@
 	input#filtre { max-width: 340px; }
 	/* Two by two on a phone, where four cards on top of each other hide the list. */
 	.cartes.serrees { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+	.carnet {
+		display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+		border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: .9rem;
+	}
+	.carnet .texte { flex: 1 1 260px; }
+	.carnet .texte span { display: block; margin-top: 2px; font-size: .85rem; }
+	.carnet .echec { color: var(--danger); }
 	.carte .liste { font-size: .8rem; color: var(--muted); margin-top: 4px; }
 	ul.personnes { margin: 6px 0 12px; padding-left: 20px; }
 	ul.personnes li { margin: 2px 0; }
@@ -55,8 +62,29 @@
 	</div>
 </div>
 
+{{if .WhatsApp}}
+<div class="carnet">
+	<div class="texte">
+		<strong>La liste suit les contacts du téléphone, par WhatsApp.</strong>
+		Un voisin noté « Camille MARTIN (C01) » dans les contacts arrive ici tout seul, dans l'heure.
+		{{with .Carnet}}
+			{{if .Erreur}}
+			<span class="echec">La dernière lecture, le {{quand .Quand}}, a échoué : {{.Erreur}}</span>
+			{{else}}
+			<span class="muted">Dernière lecture le {{quand .Quand}} : {{.Retenus}} personne{{if gt .Retenus 1}}s{{end}}{{if .Ajouts}}, {{.Ajouts}} ajoutée{{if gt .Ajouts 1}}s{{end}}{{end}}{{if .MisAJour}}, {{.MisAJour}} mise{{if gt .MisAJour 1}}s{{end}} à jour{{end}}{{if .Absents}}, {{.Absents}} qui n'y {{if gt .Absents 1}}sont{{else}}est{{end}} plus{{end}}.</span>
+			{{end}}
+		{{else}}
+			<span class="muted">Pas encore lu.</span>
+		{{end}}
+	</div>
+	<form method="POST" action="{{.BasePath}}/residents/whatsapp">
+		<button type="submit" class="btn secondaire">Relire maintenant</button>
+	</form>
+</div>
+{{end}}
+
 <details class="bloc">
-	<summary>Importer depuis les contacts du téléphone…</summary>
+	<summary>{{if .WhatsApp}}Comment noter un voisin, et compléter avec un export des contacts…{{else}}Importer depuis les contacts du téléphone…{{end}}</summary>
 	<p>
 		Dans les contacts, l'appartement se note entre parenthèses dans le nom :
 		<strong>Camille MARTIN (C01)</strong> habite au C01,
@@ -64,6 +92,12 @@
 		<strong>Sacha PETIT (ex loc C01)</strong> est un ancien locataire.
 		Un autre mot devant l'appartement, <strong>(compagnon C01)</strong>, <strong>(vendeur C01)</strong>, est gardé comme précision.
 	</p>
+	{{if .WhatsApp}}
+	<p>
+		WhatsApp ne connaît que le numéro du compte WhatsApp de chacun : pas les e-mails, pas les autres numéros,
+		et pas les personnes qui n'ont pas WhatsApp. Un export des contacts les ajoute.
+	</p>
+	{{end}}
 	<p class="muted">
 		Sur l'iPhone : Contacts → Listes → appui long sur « Tous les contacts » → Exporter, puis choisir le fichier ici.
 		Sur le Mac : Contacts → Fichier → Exporter → Exporter vCard…
@@ -267,8 +301,11 @@ function fichesAvecAppartement(texte) {
 	</div>
 	{{if not .IsNew}}
 	<div class="aide">
-		{{if eq (print .R.Origine) "contacts"}}
-		Vient des contacts du téléphone : au prochain import, le nom, l'appartement, la qualité, le téléphone et l'e-mail
+		{{if eq (print .R.Origine) "whatsapp"}}
+		Vient des contacts du téléphone, lus par WhatsApp : le nom, l'appartement et la qualité y sont relus toutes les heures.
+		Mieux vaut donc les corriger dans les contacts du téléphone. La note, l'e-mail et les autres numéros, eux, ne sont qu'ici.
+		{{else if eq (print .R.Origine) "contacts"}}
+		Vient d'un export des contacts du téléphone : au prochain import, le nom, l'appartement, la qualité, le téléphone et l'e-mail
 		sont repris des contacts quand ils y figurent. Mieux vaut donc les corriger dans les contacts. La note, elle, n'est qu'ici.
 		{{else}}
 		Saisi ici par {{.R.CreatedBy}}.
@@ -284,7 +321,8 @@ function fichesAvecAppartement(texte) {
 {{define "residents_import"}}<!DOCTYPE html>
 <html lang="fr">
 <head>
-<title>Import des contacts</title>
+{{$wa := eq (print .Plan.Source) "whatsapp"}}
+<title>{{if $wa}}Lecture de WhatsApp{{else}}Import des contacts{{end}}</title>
 {{template "head"}}
 {{template "residents_style"}}
 </head>
@@ -292,18 +330,22 @@ function fichesAvecAppartement(texte) {
 {{template "nav" .}}
 
 <p><a href="{{.BasePath}}/residents">← Tous les résidents</a></p>
-<h1>Import des contacts</h1>
+<h1>{{if $wa}}Lecture des contacts de WhatsApp{{else}}Import des contacts{{end}}</h1>
 
 {{with .Plan}}
 <div class="cartes">
+	{{if $wa}}
+	<div class="carte"><div class="titre">Voisins dans WhatsApp</div><div class="valeur">{{.Retenus}}</div></div>
+	{{else}}
 	<div class="carte"><div class="titre">Contacts lus</div><div class="valeur">{{.Lus}}</div><small>dont {{.Retenus}} avec un appartement</small></div>
+	{{end}}
 	<div class="carte"><div class="titre">Ajoutés</div><div class="valeur">{{len .Ajouts}}</div></div>
 	<div class="carte"><div class="titre">Mis à jour</div><div class="valeur">{{len .MisAJour}}</div></div>
 	<div class="carte"><div class="titre">Inchangés</div><div class="valeur">{{.Inchanges}}</div></div>
 </div>
 
 {{if not .Retenus}}
-<p>Aucun contact de ce fichier ne porte d'appartement dans son nom, comme « Camille MARTIN (C01) ». Rien n'a changé.</p>
+<p>Aucun contact {{if $wa}}connu de WhatsApp{{else}}de ce fichier{{end}} ne porte d'appartement dans son nom, comme « Camille MARTIN (C01) ». Rien n'a changé.</p>
 {{end}}
 
 {{if .Ajouts}}
@@ -318,7 +360,11 @@ function fichesAvecAppartement(texte) {
 
 {{if .Absents}}
 <h2>Plus dans les contacts <small>({{len .Absents}})</small></h2>
+{{if $wa}}
+<p class="muted">Ces personnes venaient de WhatsApp et n'y sont plus : le contact a été supprimé du téléphone, ou son nom ne porte plus d'appartement. Elles sont toujours dans la liste.</p>
+{{else}}
 <p class="muted">Ces personnes venaient d'un import précédent et ne sont plus dans ce fichier : le contact a été supprimé, ou son nom ne porte plus d'appartement. Elles sont toujours dans la liste.</p>
+{{end}}
 <form method="POST" action="{{$.BasePath}}/residents/supprimer">
 	<ul class="personnes">{{range .Absents}}<li><input type="hidden" name="id" value="{{.ID}}"><strong>{{.Appartement}}</strong> <a href="{{$.BasePath}}/residents/{{.ID}}">{{.Nom}}</a></li>{{end}}</ul>
 	<button type="submit" class="btn danger" onclick="return confirm('Supprimer ces {{len .Absents}} personnes de la liste ?')">Les supprimer de la liste</button>

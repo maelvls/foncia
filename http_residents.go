@@ -59,6 +59,11 @@ type residentsData struct {
 	NResidents     int
 	NProprietaires int
 	SansResident   []string // The apartments where nobody is known to live.
+
+	// The address book of WhatsApp, when there is a whatsapp service to ask:
+	// how its last reading went, if there was one.
+	WhatsApp bool
+	Carnet   *etatCarnet
 }
 
 type residentEditData struct {
@@ -77,6 +82,7 @@ func addResidentsHandlers(mux *http.ServeMux, c copro) {
 	mux.HandleFunc("GET /residents", c.residents)
 	mux.HandleFunc("GET /residents/export.csv", c.residentsCSV)
 	mux.HandleFunc("POST /residents/import", c.residentsImporter)
+	mux.HandleFunc("POST /residents/whatsapp", c.residentsWhatsApp)
 	mux.HandleFunc("POST /residents/supprimer", c.residentsSupprimer)
 	mux.HandleFunc("GET /residents/new", c.residentNew)
 	mux.HandleFunc("POST /residents/new", c.residentCreate)
@@ -126,7 +132,10 @@ func (c copro) residents(w http.ResponseWriter, r *http.Request) {
 		c.fail(w, "listing residents", err)
 		return
 	}
-	data := residentsData{page: c.page(r, "residents")}
+	data := residentsData{page: c.page(r, "residents"), WhatsApp: c.carnet != nil}
+	if e, ok := dernierCarnet(r.Context(), c.sqlDB); ok && data.WhatsApp {
+		data.Carnet = &e
+	}
 	data.Appartements, data.Anciens = parAppartement(rs)
 	for _, a := range data.Appartements {
 		if a.SansResident {
@@ -318,6 +327,27 @@ func (c copro) residentsImporter(w http.ResponseWriter, r *http.Request) {
 	c.render(w, "residents_import", residentsImportData{page: c.page(r, "residents"), Plan: plan})
 }
 
+// residentsWhatsApp reads the address book of WhatsApp now, without waiting
+// for the next periodic reading, and shows what it changed.
+func (c copro) residentsWhatsApp(w http.ResponseWriter, r *http.Request) {
+	if !c.adminOnly(w, r) {
+		return
+	}
+	if c.carnet == nil {
+		renderErr(w, http.StatusNotFound, "Aucun service WhatsApp n'est branché sur ce site (--whatsapp-url).")
+		return
+	}
+	plan, err := synchroniserResidents(r.Context(), c.sqlDB, c.carnet)
+	if err != nil {
+		logutil.Errorf("residents: reading the address book of WhatsApp: %v", err)
+		renderErr(w, http.StatusBadGateway, "Le service WhatsApp n'a pas donné ses contacts. Le détail est dans les logs du serveur, et sur la page des résidents.")
+		return
+	}
+	logutil.Infof("residents: %s read the address book of WhatsApp: %d neighbour(s), %d added, %d updated, %d unchanged, %d no longer there",
+		currentUser(r), plan.Retenus, len(plan.Ajouts), len(plan.MisAJour), plan.Inchanges, len(plan.Absents))
+	c.render(w, "residents_import", residentsImportData{page: c.page(r, "residents"), Plan: plan})
+}
+
 // importerResidents reads an export of the contacts and brings the table up to
 // date. With purger, the people of an earlier import who are no longer in the
 // contacts are removed; otherwise they are only reported.
@@ -326,11 +356,17 @@ func importerResidents(ctx context.Context, sqlDB *sql.DB, raw []byte, auteur st
 	if len(cartes) == 0 {
 		return importResidents{}, errPasDeVCard
 	}
+	return appliquerContacts(ctx, sqlDB, cartes, db.ResidentDesContacts, auteur, purger)
+}
+
+// appliquerContacts brings the table up to date with the contacts read from a
+// source: an export (importerResidents) or WhatsApp (synchroniserResidents).
+func appliquerContacts(ctx context.Context, sqlDB *sql.DB, cartes []contactVCard, source db.ResidentOrigine, auteur string, purger bool) (importResidents, error) {
 	existants, err := db.GetResidents(ctx, sqlDB)
 	if err != nil {
 		return importResidents{}, err
 	}
-	plan := planifierImport(existants, cartes)
+	plan := planifierImport(existants, cartes, source)
 	for i := range plan.Ajouts {
 		plan.Ajouts[i].CreatedBy = auteur
 	}

@@ -202,7 +202,7 @@ func residentDeContact(c contactVCard) (db.ResidentDB, bool) {
 		return db.ResidentDB{}, false
 	}
 
-	r := db.ResidentDB{Appartement: appartement, Origine: db.ResidentDesContacts}
+	r := db.ResidentDB{Appartement: appartement}
 	r.Qualite, r.Detail = qualiteDe(mot)
 	r.Nom = strings.TrimSpace(prenom + " " + nom)
 	if r.Nom == "" {
@@ -325,13 +325,14 @@ func lienWhatsApp(t string) template.URL {
 // importResidents is what an import of the contacts changes, before it is
 // applied (see db.ApplyResidents) and to tell the person what happened.
 type importResidents struct {
-	Lus       int // Cards in the file.
-	Retenus   int // Those that follow the convention, without the duplicates.
+	Source    db.ResidentOrigine // Where the contacts were read.
+	Lus       int                // Contacts read.
+	Retenus   int                // Those that follow the convention, without the duplicates.
 	Ajouts    []db.ResidentDB
 	MisAJour  []db.ResidentDB
 	Inchanges int
-	// In the table because of an earlier import, and no longer in the
-	// contacts: removed from the phone, or the mention was taken out.
+	// In the table because this source brought them earlier, and no longer
+	// in it: removed from the phone, or the mention was taken out.
 	Absents []db.ResidentDB
 	// Contacts that say the same person twice in the same apartment.
 	Doublons []db.ResidentDB
@@ -359,14 +360,16 @@ func rangQualite(q db.ResidentQualite) int {
 	return 0
 }
 
-// residentsDesContacts keeps the cards that follow the convention.
-func residentsDesContacts(cartes []contactVCard) (retenus, doublons []db.ResidentDB) {
+// residentsDesContacts keeps the cards that follow the convention, as rows of
+// the given origin.
+func residentsDesContacts(cartes []contactVCard, source db.ResidentOrigine) (retenus, doublons []db.ResidentDB) {
 	index := make(map[string]int)
 	for _, c := range cartes {
 		r, ok := residentDeContact(c)
 		if !ok {
 			continue
 		}
+		r.Origine = source
 		cle := cleResident(r)
 		i, vu := index[cle]
 		if !vu {
@@ -379,32 +382,52 @@ func residentsDesContacts(cartes []contactVCard) (retenus, doublons []db.Residen
 			garde, autre = autre, garde
 		}
 		// The other card may know a number that this one doesn't.
-		if garde.Telephone == "" {
-			garde.Telephone = autre.Telephone
-		}
-		if garde.Email == "" {
-			garde.Email = autre.Email
-		}
+		garde.Telephone = reunir(garde.Telephone, autre.Telephone)
+		garde.Email = reunir(garde.Email, autre.Email)
 		retenus[i] = garde
+		// WhatsApp gives a contact once per number that has an account:
+		// the same name saying the same thing twice is one card of the
+		// phone, not two.
+		if source == db.ResidentDeWhatsApp && garde.Qualite == autre.Qualite && garde.Detail == autre.Detail {
+			continue
+		}
 		doublons = append(doublons, autre)
 	}
 	return retenus, doublons
 }
 
-// planifierImport compares the contacts with the table.
+// reunir joins two lists of phone numbers or e-mails, each written once.
+func reunir(a, b string) string {
+	var out []string
+	for _, v := range append(strings.Split(a, ","), strings.Split(b, ",")...) {
+		if v = strings.TrimSpace(v); v != "" && !slices.Contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+// planifierImport compares the contacts of a source with the table. The
+// source is where the contacts were read: WhatsApp (db.ResidentDeWhatsApp) or
+// an export sent by hand (db.ResidentDesContacts).
 //
-// A contact is the row of the same apartment and name; failing that, the row
-// of an earlier import with the same phone number (the contact was renamed, or
-// moved to another apartment); failing that, somebody new.
+// A contact is the row of the same apartment and name; failing that, a row
+// that came from contacts and has the same phone number (the contact was
+// renamed, or moved to another apartment); failing that, somebody new.
 //
-// The contacts win where they say something: the apartment, the name, the
-// qualité, and the phone and e-mail when they have one. What was typed on the
-// site and the contacts don't know stays: the note always, the phone and
-// e-mail of a contact that has none, the detail ("locataire") of somebody the
-// contacts only say lives there.
-func planifierImport(existants []db.ResidentDB, cartes []contactVCard) importResidents {
-	contacts, doublons := residentsDesContacts(cartes)
-	plan := importResidents{Lus: len(cartes), Retenus: len(contacts), Doublons: doublons}
+// Who is where is said by the most trusted source that knows the person
+// (db.ResidentOrigine.Rang): WhatsApp, read live, has the last word; an
+// export is a picture of one day and doesn't rename or move somebody WhatsApp
+// knows. Either one takes over a row typed on the site.
+//
+// What a source doesn't know stays. The note is never touched. An e-mail only
+// comes from an export. WhatsApp knows one number of a person: it is added in
+// front of the others rather than instead of them, while an export lists all
+// the numbers and replaces them. The detail ("locataire") of somebody the
+// contacts only say lives there stays too.
+func planifierImport(existants []db.ResidentDB, cartes []contactVCard, source db.ResidentOrigine) importResidents {
+	contacts, doublons := residentsDesContacts(cartes, source)
+	plan := importResidents{Source: source, Lus: len(cartes), Retenus: len(contacts), Doublons: doublons}
 
 	parCle := make(map[string]int, len(existants))
 	for i, e := range existants {
@@ -425,7 +448,7 @@ func planifierImport(existants []db.ResidentDB, cartes []contactVCard) importRes
 			continue
 		}
 		for j, e := range existants {
-			if !pris[j] && e.Origine == db.ResidentDesContacts && memeTelephone(c, e) {
+			if !pris[j] && e.Origine != db.ResidentDuSite && memeTelephone(c, e) {
 				paire[i], pris[j] = j, true
 				break
 			}
@@ -439,13 +462,23 @@ func planifierImport(existants []db.ResidentDB, cartes []contactVCard) importRes
 		}
 		e := existants[paire[i]]
 		maj := e
-		maj.Appartement, maj.Nom, maj.Origine = c.Appartement, c.Nom, db.ResidentDesContacts
-		if c.Qualite != e.Qualite {
-			maj.Qualite, maj.Detail = c.Qualite, c.Detail
-		} else if c.Detail != "" {
-			maj.Detail = c.Detail
+		if source.Rang() >= e.Origine.Rang() {
+			maj.Appartement, maj.Nom, maj.Origine = c.Appartement, c.Nom, source
+			if c.Qualite != e.Qualite {
+				maj.Qualite, maj.Detail = c.Qualite, c.Detail
+			} else if c.Detail != "" {
+				maj.Detail = c.Detail
+			}
 		}
-		if c.Telephone != "" {
+		switch {
+		case c.Telephone == "":
+		case source == db.ResidentDeWhatsApp:
+			// Only when a number is missing: the order WhatsApp gives its
+			// numbers in is nobody's choice, and must not reshuffle the row.
+			if reunir(e.Telephone, c.Telephone) != e.Telephone {
+				maj.Telephone = reunir(c.Telephone, e.Telephone)
+			}
+		default:
 			maj.Telephone = c.Telephone
 		}
 		if c.Email != "" {
@@ -458,7 +491,7 @@ func planifierImport(existants []db.ResidentDB, cartes []contactVCard) importRes
 		}
 	}
 	for j, e := range existants {
-		if !pris[j] && e.Origine == db.ResidentDesContacts {
+		if !pris[j] && e.Origine == source {
 			plan.Absents = append(plan.Absents, e)
 		}
 	}

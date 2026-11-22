@@ -56,17 +56,32 @@ func (q ResidentQualite) French() string {
 	return string(q)
 }
 
-// ResidentOrigine tells who keeps the row up to date: the import of the phone
-// contacts, or the people typing on the site.
+// ResidentOrigine tells who keeps the row up to date: the address book as
+// WhatsApp knows it (read again and again, on its own), an export of the
+// contacts sent by hand, or the people typing on the site.
 type ResidentOrigine string
 
 const (
+	ResidentDeWhatsApp  ResidentOrigine = "whatsapp"
 	ResidentDesContacts ResidentOrigine = "contacts"
 	ResidentDuSite      ResidentOrigine = "site"
 )
 
 func (o ResidentOrigine) Valid() bool {
-	return o == ResidentDesContacts || o == ResidentDuSite
+	return o == ResidentDeWhatsApp || o == ResidentDesContacts || o == ResidentDuSite
+}
+
+// Rang orders the origins by how much they are trusted on who is where:
+// WhatsApp is read live, an export is a picture of one day, and a row typed on
+// the site is nobody's until a contact matches it.
+func (o ResidentOrigine) Rang() int {
+	switch o {
+	case ResidentDeWhatsApp:
+		return 2
+	case ResidentDesContacts:
+		return 1
+	}
+	return 0
 }
 
 // Telephones splits the phone numbers of the row.

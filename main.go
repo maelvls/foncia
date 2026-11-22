@@ -284,6 +284,14 @@ func main() {
 		}
 		go collecterEnBoucle(ctx, sqlDB, brainTrigger{path: *claudeTriggerFile}, collecteurs)
 
+		// The residents follow the address book of the same whatsapp service.
+		carnet, err := carnetConfigure(sqlDB)
+		if err != nil {
+			logutil.Errorf("%v", err)
+			os.Exit(1)
+		}
+		go synchroniserResidentsEnBoucle(ctx, sqlDB, carnet)
+
 		var htmlHeader string
 		if *htmlHeaderFile != "" {
 			htmlHeader, err = readHeaderFile(*htmlHeaderFile)

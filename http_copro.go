@@ -114,6 +114,7 @@ type copro struct {
 	baseURL  string  // With the base path; for the share links.
 	partage  partage // The key of the share links; zero in the pages that make none.
 	brain    brainTrigger
+	carnet   carnetFunc // The address book of WhatsApp, for the residents; nil without a whatsapp service.
 }
 
 func (c copro) page(r *http.Request, section string) page {
