@@ -235,6 +235,17 @@ func TestIndexHandler(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), "SARL SMF SERVICES - CONTRAT MAINTENANCE")
 	})
 
+	t.Run("has the navigation bar and the styles of the rest of the site", func(t *testing.T) {
+		mux := newTestMux(t, openTestDB(t))
+
+		body := do(t, mux, "GET", "/?filter=missions").Body.String()
+
+		assert.Contains(t, body, `<nav class="sections">`)
+		assert.Contains(t, body, `<a href="/" class="actif">Factures et ordres de service</a>`)
+		assert.Contains(t, body, `<a href="/?filter=missions" class="actif"`)
+		assert.Contains(t, body, "--accent:", "the shared stylesheet is missing")
+	})
+
 	t.Run("an unknown filter returns 400, not 500", func(t *testing.T) {
 		mux := newTestMux(t, openTestDB(t))
 

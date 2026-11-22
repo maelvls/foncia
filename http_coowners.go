@@ -1,9 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"html/template"
 	"net/http"
 	"sort"
 	"strings"
@@ -12,21 +12,27 @@ import (
 	"github.com/maelvls/foncia/logutil"
 )
 
-func coownersEndpoint(client *http.Client, uuid string) http.HandlerFunc {
+func coownersEndpoint(c copro, client *http.Client, uuid string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		coownersData, err := fetchCoowners(r.Context(), client, uuid)
 		if err != nil {
-			logutil.Errorf("while getting coowners: %v", err)
-			http.Error(w, "erreur interne, voir les logs du serveur", http.StatusInternalServerError)
+			c.fail(w, "while getting coowners", err)
 			return
 		}
 
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		err = coownersTmpl.Execute(w, coownersData)
+		// Into a buffer first, so that a template that fails halfway isn't
+		// served as a truncated 200.
+		var buf bytes.Buffer
+		err = coownersTmpl.Execute(&buf, struct {
+			page
+			Lignes []coownerRow
+		}{c.page(r, "coowners"), coownersData})
 		if err != nil {
-			logutil.Errorf("executing template: %v", err)
+			c.fail(w, "executing the co-owners template", err)
 			return
 		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = buf.WriteTo(w)
 	}
 }
 
@@ -83,7 +89,7 @@ type coownerRow struct {
 	Parking   []string `json:"parking"`   // Example: ["44", "45"].
 }
 
-var coownersTmpl = template.Must(template.New("coowners").Parse(coownersHTML))
+var coownersTmpl = avecLayout("coowners", coownersHTML)
 
 var lotMapping = []struct {
 	Lot         int

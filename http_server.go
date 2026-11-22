@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"html/template"
 	"net"
 	"net/http"
 	"path"
@@ -26,7 +25,8 @@ type MissionOrExpense struct {
 }
 
 type tmlpData struct {
-	BasePath   string
+	page // BasePath and what the navigation bar needs.
+
 	SyncStatus string
 	NtfyTopic  string
 	Items      []MissionOrExpense
@@ -34,14 +34,14 @@ type tmlpData struct {
 	Filter     string
 }
 
-var tmpl = template.Must(template.New("base").Parse(indexHTML))
+var tmpl = avecLayout("base", indexHTML)
 
 type tmlpErrData struct {
 	Error   string
 	Version string
 }
 
-var tmlpErr = template.Must(template.New("").Parse(errorHTML))
+var tmlpErr = avecLayout("error", errorHTML)
 
 // logRequests logs every incoming request. It wraps the whole mux rather than
 // each handler individually.
@@ -221,6 +221,8 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 	mux.HandleFunc("GET /dl/{typ}/{hash}", dl)
 	mux.HandleFunc("GET /dl/{typ}/{hash}/{filename...}", dl)
 
+	c := copro{sqlDB: sqlDB, basePath: basePath}
+
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
@@ -249,7 +251,7 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 			f = filter{HideExpenses: true, HideMissions: true, HideDocs: false,
 				DocCategories: db.GeneralAssemblyCategories}
 		default:
-			renderErr(w, http.StatusBadRequest, fmt.Sprintf("Invalid filter: %q", filterParam))
+			renderErr(w, http.StatusBadRequest, fmt.Sprintf("Filtre inconnu : %q.", filterParam))
 			return
 		}
 
@@ -280,7 +282,7 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 		// failed halfway used to be served as a successful but truncated page.
 		var page bytes.Buffer
 		err = tmpl.Execute(&page, tmlpData{
-			BasePath:   basePath,
+			page:       c.page(r, "factures"),
 			SyncStatus: statusMsg,
 			NtfyTopic:  *ntfyTopic,
 			Items:      filteredItems,
@@ -299,7 +301,7 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 		}
 	})
 
-	mux.HandleFunc("GET /coowners", coownersEndpoint(client, uuid))
+	mux.HandleFunc("GET /coowners", coownersEndpoint(c, client, uuid))
 
 	addAffairesHandlers(mux, sqlDB, basePath)
 	addComptesHandlers(mux, sqlDB, basePath)
