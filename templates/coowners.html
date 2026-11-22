@@ -1,30 +1,32 @@
 <!DOCTYPE html>
-<html>
+<html lang="fr">
 <head>
-<title>Liste des co-propriétaires</title>
-<meta charset="utf-8">
+<title>Copropriétaires · Terra Nostra 2</title>
+{{template "head"}}
 </head>
 <body>
-	<h1>Liste des co-propriétaires</h1>
-	<table>
-<thead>
-	<tr>
-		<th>Nom</th>
-		<th>Adresse</th>
-		<th>Appartement</th>
-		<th>Places de parking</th>
-	</tr>
-</thead>
-<tbody>
-	{{range .}}
-	<tr>
-		<td>{{.Name}}</td>
-		<td>{{.Address}}</td>
-		<td>{{.Apartment}}</td>
-		<td>{{range .Parking}}{{.}} {{end}}</td>
-	</tr>
-	{{end}}
-</tbody>
-	</table>
+{{template "nav" .}}
+
+<h1>Copropriétaires <small>{{len .Lignes}}</small></h1>
+
+<div class="scroll">
+<table>
+	<thead>
+		<tr><th>Appartement</th><th>Nom</th><th>Adresse</th><th>Places de parking</th></tr>
+	</thead>
+	<tbody>
+		{{range .Lignes}}
+		<tr>
+			<td>{{if .Apartment}}<strong>{{.Apartment}}</strong>{{end}}</td>
+			<td>{{.Name}}</td>
+			<td>{{.Address}}</td>
+			<td>{{range $i, $p := .Parking}}{{if $i}}, {{end}}{{$p}}{{end}}</td>
+		</tr>
+		{{else}}
+		<tr><td colspan="4" class="muted">Aucun copropriétaire.</td></tr>
+		{{end}}
+	</tbody>
+</table>
+</div>
 </body>
 </html>

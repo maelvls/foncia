@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"net/http"
 	"net/url"
 	"slices"
@@ -340,7 +339,7 @@ func (o oauthServer) user(r *http.Request) string {
 	return strings.ToLower(strings.TrimSpace(r.Header.Get(o.userHeader)))
 }
 
-var oauthTmpl = template.Must(template.New("oauth").Parse(oauthHTML))
+var oauthTmpl = avecLayout("oauth", oauthHTML)
 
 // handleAuthorize shows the consent page.
 func (o oauthServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {

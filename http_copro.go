@@ -21,7 +21,9 @@ import (
 //go:embed templates/copro/*.html
 var coproFS embed.FS
 
-var coproTmpl = template.Must(template.New("copro").Funcs(template.FuncMap{
+// coproFuncs is what every template of the site can call, the older pages
+// (index, co-owners) included.
+var coproFuncs = template.FuncMap{
 	"quand":    func(t time.Time) string { return t.In(paris).Format("02/01/2006 à 15:04") },
 	"jour":     func(t time.Time) string { return t.In(paris).Format("02/01/2006") },
 	"exercice": nomExercice,
@@ -87,7 +89,17 @@ var coproTmpl = template.Must(template.New("copro").Funcs(template.FuncMap{
 			Lignes   []affaireLigne
 		}{basePath, lignes}
 	},
-}).ParseFS(coproFS, "templates/copro/*.html"))
+}
+
+var coproTmpl = template.Must(template.New("copro").Funcs(coproFuncs).ParseFS(coproFS, "templates/copro/*.html"))
+
+// avecLayout parses a page that lives outside templates/copro and gives it
+// the "head" and "nav" templates of the layout, so that it looks like the
+// rest of the site.
+func avecLayout(name, html string) *template.Template {
+	t := template.Must(template.New(name).Funcs(coproFuncs).Parse(html))
+	return template.Must(t.ParseFS(coproFS, "templates/copro/layout.html"))
+}
 
 // taille is a file size for humans.
 func taille(n int64) string {
