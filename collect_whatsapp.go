@@ -31,7 +31,7 @@ import (
 
 var (
 	whatsappURL       = flag.String("whatsapp-url", "", "URL of the whatsapp service of the Pi, e.g. http://whatsapp:8093. Empty disables the WhatsApp collection.")
-	whatsappTokenFile = flag.String("whatsapp-token-file", "", "File holding the token of the whatsapp service's /internal API (its state/internal.token).")
+	whatsappTokenFile = flag.String("whatsapp-token-file", "", "File holding this service's token for the whatsapp service's /internal API: its workload identity, a short JWT made for whatsapp that the house's issuer writes again every few minutes (vls.dev/oidc). Read at each call.")
 	whatsappChats     = flag.String("whatsapp-chats", "", "Comma-separated JIDs of the conversations about the building that are read whole (groups 1203…@g.us, people 336…@s.whatsapp.net).")
 	whatsappFiltered  = flag.String("whatsapp-filtered-chats", "", "Comma-separated JIDs of conversations that only sometimes are about the building (the residents' group): only the exchanges matching --whatsapp-keywords are kept.")
 	whatsappContacts  = flag.String("whatsapp-contacts", `\((prop |loc )?[A-D]\d{2}\)`, "Regular expression on the address-book names: the conversations with the people it matches are read whole, e.g. « Léa (C11) ». Empty for none.")
@@ -44,24 +44,24 @@ type whatsappCollecteur struct {
 	sqlDB    *sql.DB
 	client   *http.Client
 	base     string
-	token    string
-	chats    map[string]bool // Read whole.
-	filtered map[string]bool // Only the exchanges matching keywords.
-	contacts *regexp.Regexp  // nil: none.
+	token    func() (string, error) // Read at each call: see jetonFichier.
+	chats    map[string]bool        // Read whole.
+	filtered map[string]bool        // Only the exchanges matching keywords.
+	contacts *regexp.Regexp         // nil: none.
 	keywords *regexp.Regexp
 	now      func() time.Time
 }
 
 func newWhatsappCollecteur(sqlDB *sql.DB) (*whatsappCollecteur, error) {
-	raw, err := os.ReadFile(*whatsappTokenFile)
-	if err != nil {
-		return nil, fmt.Errorf("--whatsapp-token-file: %w", err)
+	if *whatsappTokenFile == "" {
+		return nil, errors.New("--whatsapp-url needs --whatsapp-token-file")
 	}
+	var err error
 	w := &whatsappCollecteur{
 		sqlDB:    sqlDB,
 		client:   &http.Client{Timeout: 2 * time.Minute},
 		base:     strings.TrimRight(*whatsappURL, "/"),
-		token:    strings.TrimSpace(string(raw)),
+		token:    jetonFichier(*whatsappTokenFile),
 		chats:    jidSet(*whatsappChats),
 		filtered: jidSet(*whatsappFiltered),
 		now:      time.Now,
@@ -75,6 +75,25 @@ func newWhatsappCollecteur(sqlDB *sql.DB) (*whatsappCollecteur, error) {
 		return nil, fmt.Errorf("--whatsapp-keywords: %w", err)
 	}
 	return w, nil
+}
+
+// jetonFichier reads the token in path each time it is asked. The token is
+// this service's workload identity: the issuer replaces the file every few
+// minutes and a token lasts less than an hour, so one read at the start
+// would be refused soon after. The file may also come after this service
+// starts: a call made before fails, the next one goes through.
+func jetonFichier(path string) func() (string, error) {
+	return func() (string, error) {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("--whatsapp-token-file: %w", err)
+		}
+		token := strings.TrimSpace(string(raw))
+		if token == "" {
+			return "", fmt.Errorf("--whatsapp-token-file: %s is empty", path)
+		}
+		return token, nil
+	}
 }
 
 func jidSet(s string) map[string]bool {
@@ -117,7 +136,11 @@ func (w *whatsappCollecteur) get(ctx context.Context, path string) (*http.Respon
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+w.token)
+	token, err := w.token()
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return nil, err
