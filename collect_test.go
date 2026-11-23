@@ -183,7 +183,7 @@ func TestWhatsapp(t *testing.T) {
 	t.Cleanup(srv.Close)
 	*whatsappContacts = `\((prop |loc )?[A-D]\d{2}\)`
 	w := &whatsappCollecteur{
-		sqlDB: sqlDB, client: srv.Client(), base: srv.URL, token: "tok",
+		sqlDB: sqlDB, client: srv.Client(), base: srv.URL, token: func() (string, error) { return "tok", nil },
 		chats: jidSet("cs@g.us"), filtered: jidSet("res@g.us"),
 		now: func() time.Time { return t0.Add(48 * time.Hour) },
 	}

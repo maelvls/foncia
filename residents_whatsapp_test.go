@@ -53,7 +53,7 @@ func fauxWhatsApp(t *testing.T, down *bool) *whatsappCollecteur {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return &whatsappCollecteur{client: srv.Client(), base: srv.URL, token: "tok"}
+	return &whatsappCollecteur{client: srv.Client(), base: srv.URL, token: func() (string, error) { return "tok", nil }}
 }
 
 // postPage posts an empty form as the given user and returns the status and

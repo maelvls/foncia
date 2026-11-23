@@ -457,8 +457,10 @@ comment, relance or levée still waits on `/propositions`.
   `refresh_token` of a login with the `gmail.readonly` scope),
   `--gmail-query` (only the matching e-mails are read), `--gmail-account`.
 - WhatsApp: `--whatsapp-url http://whatsapp:8093` and
-  `--whatsapp-token-file` (the whatsapp service's `state/internal.token`, see
-  vls.dev/whatsapp/internal.go). Only `--whatsapp-chats`, the people whose
+  `--whatsapp-token-file`: this service's token for the whatsapp service,
+  its workload identity, a short JWT that the house's issuer (vls.dev/oidc)
+  writes again every 10 minutes and that whatsapp checks
+  (vls.dev/whatsapp/workload.go). The file is read at each call. Only `--whatsapp-chats`, the people whose
   address-book name matches `--whatsapp-contacts` (« Léa (C11) ») and, among
   the exchanges of `--whatsapp-filtered-chats`, those matching
   `--whatsapp-keywords` are read. Photos and documents are downloaded right
