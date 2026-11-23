@@ -1,6 +1,10 @@
 {{define "head"}}
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+{{/* What makes the site installable on a phone's home screen, which an
+iPhone wants before it lets the site send notifications. The pages without a
+navigation bar (errors, the OAuth consent) give no data: no link there. */}}
+{{with .}}<link rel="manifest" href="{{.BasePath}}/manifest.webmanifest">{{end}}
 <style>
 	:root {
 		--border: #e3e3e8; --bg-alt: #f7f7fa; --text: #26262b; --muted: #6b6b76;
@@ -368,6 +372,7 @@ page of the message has the whole list. */}}
 	<a href="{{.BasePath}}/sources" {{if eq .Section "sources"}}class="actif"{{end}}>À trier{{if .NATrier}} <span class="badge en_cours">{{.NATrier}}</span>{{end}}</a>
 	<a href="{{.BasePath}}/propositions" {{if eq .Section "propositions"}}class="actif"{{end}}>Propositions{{if .NPropositions}} <span class="badge en_cours">{{.NPropositions}}</span>{{end}}</a>
 	{{end}}
+	<a href="{{.BasePath}}/notifications" {{if eq .Section "notifications"}}class="actif"{{end}}>Notifications</a>
 	<span class="qui">{{.User}}</span>
 </nav>
 {{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}

@@ -35,7 +35,7 @@
 <html lang="fr">
 <head>
 <title>{{if .Admin}}Résidents et copropriétaires{{else}}Copropriétaires{{end}} · Terra Nostra 2</title>
-{{template "head"}}
+{{template "head" .}}
 {{template "residents_style"}}
 </head>
 <body>
@@ -329,7 +329,7 @@ function fichesAvecAppartement(texte) {
 <html lang="fr">
 <head>
 <title>{{if .IsNew}}Ajouter une personne{{else}}{{.R.Nom}}{{end}}</title>
-{{template "head"}}
+{{template "head" .}}
 </head>
 <body>
 {{template "nav" .}}
@@ -401,7 +401,7 @@ function fichesAvecAppartement(texte) {
 <head>
 {{$wa := eq (print .Plan.Source) "whatsapp"}}
 <title>{{if $wa}}Lecture de WhatsApp{{else}}Import des contacts{{end}}</title>
-{{template "head"}}
+{{template "head" .}}
 {{template "residents_style"}}
 </head>
 <body>

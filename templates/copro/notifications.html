@@ -1,0 +1,39 @@
+{{define "notifications"}}<!DOCTYPE html>
+<html lang="fr">
+<head>
+<title>Notifications · Terra Nostra 2</title>
+{{template "head" .}}
+<style>
+	#push { max-width: 44rem; }
+	.push-kinds { display: grid; gap: 8px; margin: 14px 0; }
+	.push-kinds label { display: flex; gap: 8px; align-items: baseline; cursor: pointer; }
+	.push-note { margin: 10px 0; }
+	.push-note.bien { color: var(--ok); }
+	.push-note.alerte { color: var(--warn); }
+	.push-devices ul { list-style: none; margin: 0; padding: 0; }
+	.push-devices li { padding: 8px 0; border-bottom: 1px solid var(--border); }
+	button:disabled { opacity: .55; cursor: default; }
+</style>
+</head>
+<body>
+{{template "nav" .}}
+
+<h1>Notifications <small id="push-state"></small></h1>
+
+<p class="muted" style="max-width: 44rem">
+	Soyez prévenu sur cet appareil quand Foncia enregistre une nouvelle intervention ou une nouvelle
+	facture pour la résidence. Les notifications s'activent appareil par appareil (téléphone,
+	ordinateur) et ne concernent que vous.
+</p>
+
+{{if .Disponible}}
+<div id="push" data-base="{{.BasePath}}"><p class="muted">Chargement…</p></div>
+<noscript><p class="muted">Cette page a besoin de JavaScript.</p></noscript>
+<script src="{{.BasePath}}/push.js"></script>
+{{else}}
+<p class="muted">Les notifications ne sont pas disponibles sur ce serveur.</p>
+{{end}}
+
+</body>
+</html>
+{{end}}

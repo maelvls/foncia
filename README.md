@@ -1,8 +1,9 @@
 # The `foncia` CLI
 
 The `foncia` CLI lets you list all "missionRepairs" and "missionIncidents". It
-also lets you create a server that notifies you using ntfy.sh when a new
-"missionIncident" or "missionRepair" is created. Example:
+also lets you create a server that notifies you when a new "missionIncident",
+"missionRepair" or invoice is created (see [Notifications](#notifications)).
+Example:
 
 ![suivi-foncia](https://github.com/user-attachments/assets/a7cfef68-5432-4756-9244-9c866e43a298)
 
@@ -190,6 +191,45 @@ new assistants:
 ```sql
 DELETE FROM oauth_tokens WHERE email = 'someone@example.com';
 ```
+
+## Notifications
+
+After each sync, `foncia serve` tells what is new at Foncia: the new missions
+("Nouvelle intervention") and the new invoices ("Nouvelle facture"). Nothing is
+sent for the first sync of an empty database.
+
+**From the site (Web Push).** Each person turns the notifications on, one
+device at a time, on the page **Notifications** (`/notifications`), picks the
+kinds of news, can send a test, and removes a device from there. On an iPhone or
+an iPad, the site must first be installed on the home screen (Share → "Sur
+l'écran d'accueil"), which the web manifest allows; Apple gives no notifications
+to a site open in a Safari tab.
+
+- A sync that finds one mission or one invoice sends it with its label, and a
+  click opens its row; a sync that finds several sends one notification per
+  kind ("5 nouvelles factures", the first ones listed), which opens the list.
+- Each message is encrypted for the device (RFC 8291) and posted to the push
+  service of its browser (Apple, Google, Mozilla), which can't read it.
+- The devices are in the `push_abonnements` table, each with the e-mail given by
+  `--auth-header`; a device whose push service answers 404 or 410 is removed.
+  The server's VAPID keys are made at the first start and kept in `reglages`
+  (`push_vapid`): losing the database cuts every subscription, and each device
+  has to be turned on again.
+- The push services want to know who runs the server: `--push-contact` (an
+  e-mail or an https URL), which defaults to `--baseurl`. Apple refuses anything
+  else than an https URL or an e-mail.
+- The reverse proxy must serve `/sw.js`, `/push.js`, `/manifest.webmanifest` and
+  `/api/push*` like the pages (behind the login), and the icons
+  (`/icon.png`, `/apple-touch-icon.png`, `/favicon.svg`), which are not in the
+  binary.
+- Somebody removed from the reverse proxy's list keeps getting the
+  notifications of the devices they turned on, since foncia doesn't know that
+  list: delete their rows (`DELETE FROM push_abonnements WHERE email = '…'`),
+  or give the list with `--allowed-users`, which the notifications follow.
+
+**With Ntfy.** `--ntfy-topic` also sends each new mission and invoice to that
+topic of <https://ntfy.sh>, for whoever follows it with the Ntfy app. A topic is
+public to anybody who knows its name. Empty (the default) sends nothing there.
 
 ## Restricting who can see the pages
 

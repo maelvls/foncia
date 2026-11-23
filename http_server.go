@@ -56,8 +56,9 @@ func logRequests(next http.Handler) http.Handler {
 // the context. The `basePath` should always start with a slash and not end with
 // a slash. If you want to given an empty base path, don't give "/". Instead,
 // give "". The baseURL is used by the MCP server (--mcp) for its OAuth issuer
-// and for the links it hands out.
-func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client *http.Client, uuid, basePath, baseURL, invoicesDir string, lastSync func() (time.Time, error), htmlHeader string) error {
+// and for the links it hands out. The push is what sends the notifications of
+// the site (push.go); nil leaves the page "Notifications" saying there are none.
+func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client *http.Client, uuid, basePath, baseURL, invoicesDir string, lastSync func() (time.Time, error), htmlHeader string, push *pusher) error {
 	if basePath != "" && !strings.HasPrefix(basePath, "/") {
 		return fmt.Errorf("base path must start with a slash or be an empty string")
 	}
@@ -111,6 +112,8 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 		return fetchCoowners(ctx, client, uuid)
 	}, coownersTTL)
 	addResidentsHandlers(subMux, c)
+	c.push = push
+	addPushHandlers(subMux, c)
 	// The share links are for people without an account: outside the routes
 	// that onlyAllowedUsers guards. The proxy must let /f/* through too.
 	addPublicHandlers(rootMux, c)
