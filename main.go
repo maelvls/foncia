@@ -31,16 +31,20 @@ var (
 	// EnableDebug enables debugFlag logs.
 	debugFlag = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
 
-	serveBasePath  = flag.String("basepath", "", "Base path, useful for reverse proxies. Must start with a slash or be empty.")
-	serveAddr      = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
-	serveBaseURL   = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications, and given to the push services as who runs this server (see --push-contact). If empty, --addr is used.")
-	dbPath         = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
-	allowedUsers   = flag.String("allowed-users", "", "Comma-separated list of email addresses allowed to use the web UI, matched against --auth-header. Empty (the default) means no check is done in this process and access control is left entirely to the reverse proxy.")
-	authHeader     = flag.String("auth-header", "X-Forwarded-Email", "Header set by the authenticating reverse proxy, used by --allowed-users and by /oauth/authorize (see --mcp). The proxy must strip this header from incoming requests.")
-	mcpFlag        = flag.Bool("mcp", false, "Serve an MCP server on /mcp for Claude, ChatGPT, Grok..., with its own OAuth 2.1 authorization server. The reverse proxy must log the users in on /oauth/authorize and give their email in --auth-header, and let /mcp, /oauth/token, /oauth/register and /.well-known/oauth-* through without a login. The links and the OAuth issuer use --baseurl.")
-	ntfyTopic      = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/, on top of the notifications of the site itself (the page Notifications). Empty sends none there.")
-	invoicesDir    = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
-	htmlHeaderFile = flag.String("header-file", "", "File containing an HTML header to be added to the top of the page. Can contain Go template syntax. The template is executed with the following data: {BasePath, SyncStatus, NtfyTopic, Items, Version}.")
+	serveBasePath    = flag.String("basepath", "", "Base path, useful for reverse proxies. Must start with a slash or be empty.")
+	serveAddr        = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
+	serveBaseURL     = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications, and given to the push services as who runs this server (see --push-contact). If empty, --addr is used.")
+	dbPath           = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
+	allowedUsers     = flag.String("allowed-users", "", "Comma-separated list of email addresses allowed to use the web UI, matched against --auth-header. Empty (the default) means no check is done in this process and access control is left entirely to the reverse proxy.")
+	authHeader       = flag.String("auth-header", "X-Forwarded-Email", "Header set by the authenticating reverse proxy, used by --allowed-users and by /oauth/authorize (see --mcp). The proxy must strip this header from incoming requests.")
+	mcpFlag          = flag.Bool("mcp", false, "Serve an MCP server on /mcp for Claude, ChatGPT, Grok..., with its own OAuth 2.1 authorization server. The reverse proxy must log the users in on /oauth/authorize and give their email in --auth-header, and let /mcp, /oauth/token, /oauth/register and /.well-known/oauth-* through without a login. The links and the OAuth issuer use --baseurl.")
+	workloadJWKS     = flag.String("workload-jwks", "", "The JWKS file of the house's issuer of workload identities (vls.dev/oidc), e.g. /run/oidc/.well-known/jwks.json. Turns on /api/v1, for the services named in --api-callers. Empty: no /api/v1.")
+	workloadIssuer   = flag.String("workload-issuer", "https://vls.dev", "The iss of the workload tokens that /api/v1 accepts.")
+	workloadAudience = flag.String("workload-audience", "", "The aud that the workload tokens must have for /api/v1. Empty: --baseurl.")
+	apiCallers       = flag.String("api-callers", "", "Comma-separated subs of the workload tokens that may call /api/v1, e.g. docker:residence.")
+	ntfyTopic        = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/, on top of the notifications of the site itself (the page Notifications). Empty sends none there.")
+	invoicesDir      = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
+	htmlHeaderFile   = flag.String("header-file", "", "File containing an HTML header to be added to the top of the page. Can contain Go template syntax. The template is executed with the following data: {BasePath, SyncStatus, NtfyTopic, Items, Version}.")
 
 	// In order to test the Ntfy integration, you can use --sync-period=1m and
 	// manually remove the last item from the DB:

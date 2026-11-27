@@ -105,6 +105,19 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	}, coownersTTL)
 	addCoownersHandlers(subMux, c)
 	addPushHandlers(subMux, c)
+	// /api/v1, for the other services of the house: outside the routes that
+	// onlyAllowedUsers guards, with a check of its own (workload.go).
+	if *workloadJWKS != "" {
+		audience := *workloadAudience
+		if audience == "" {
+			audience = baseURL
+		}
+		api := apiV1{sqlDB: db, client: client, invoicesDir: invoicesDir, basePath: basePath, lastSync: lastSync}
+		callers := subjects(*apiCallers)
+		rootMux.Handle(basePath+"/api/v1/", logRequests(calledBy(newWorkloads(*workloadJWKS, *workloadIssuer, audience), callers, http.StripPrefix(basePath, api.routes()))))
+		logutil.Infof("API on %s/api/v1 for %v, workload tokens for %s", basePath, callers, audience)
+	}
+
 	if *mcpFlag {
 		mcpHandler := newMCPHandler(mcpServer{
 			sqlDB:       db,

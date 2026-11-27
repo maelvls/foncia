@@ -29,7 +29,7 @@ var coproFuncs = template.FuncMap{
 	"exercice": nomExercice,
 	"positif":  func(a db.Amount) db.Amount { return max(a, -a) },
 	"taille":   taille,
-	"chemin": url.PathEscape,
+	"chemin":   url.PathEscape,
 }
 
 var coproTmpl = template.Must(template.New("copro").Funcs(coproFuncs).ParseFS(coproFS, "templates/copro/*.html"))
