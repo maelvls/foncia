@@ -10,7 +10,7 @@ import (
 )
 
 // ExpenseRow is an expense together with its primary key, which the rest of
-// the code never needed until expenses could be attached to an affaire.
+// the accounts pages use to find an expense again from any of its copies.
 type ExpenseRow struct {
 	ID string
 	ExpenseDocumentDB

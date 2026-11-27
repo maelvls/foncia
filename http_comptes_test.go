@@ -1,9 +1,13 @@
 package main
 
 import (
+	"database/sql"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -222,6 +226,50 @@ func TestResumeComptes(t *testing.T) {
 	})
 }
 
+// coproServer serves the comptes routes on an empty in-memory database,
+// without the rest of the serve stack (which needs a Foncia token). The client
+// doesn't follow redirects: the POST handlers answer 303 and the tests assert
+// on the Location.
+func coproServer(t *testing.T) (*httptest.Server, *sql.DB, *http.Client) {
+	t.Helper()
+	sqlDB, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	mux := http.NewServeMux()
+	addComptesHandlers(mux, sqlDB, "")
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return srv, sqlDB, client
+}
+
+func get(t *testing.T, client *http.Client, url string) (int, string) {
+	t.Helper()
+	resp, err := client.Get(url)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp.StatusCode, string(body)
+}
+
+// post sends the form as the given user and returns the status and Location.
+func post(t *testing.T, client *http.Client, user, url string, form url.Values) (int, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if user != "" {
+		req.Header.Set(*authHeader, user)
+	}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	return resp.StatusCode, resp.Header.Get("Location")
+}
+
 func TestComptesHTTP(t *testing.T) {
 	ctx := t.Context()
 	srv, sqlDB, client := coproServer(t)
@@ -270,7 +318,7 @@ func TestComptesHTTP(t *testing.T) {
 		assert.Contains(t, body, "Aucune dépense ne correspond.")
 	})
 
-	t.Run("an expense answers to the id of any of its copies, and is attached once", func(t *testing.T) {
+	t.Run("an expense answers to the id of any of its copies", func(t *testing.T) {
 		rows, err := db.GetExpenseRows(ctx, sqlDB)
 		require.NoError(t, err)
 		var copies []string
@@ -288,86 +336,6 @@ func TestComptesHTTP(t *testing.T) {
 		status, _ := get(t, client, srv.URL+"/comptes/depenses/nope")
 		assert.Equal(t, http.StatusNotFound, status)
 
-		aid, err := db.InsertAffaire(ctx, sqlDB, db.AffaireDB{Numero: 7, Titre: "Contrat ACME"})
-		require.NoError(t, err)
-		post(t, client, "", srv.URL+"/comptes/depenses/"+copies[0]+"/lier", url.Values{"affaire_id": {aid}})
-		_, loc := post(t, client, "", srv.URL+"/comptes/depenses/"+copies[1]+"/lier", url.Values{"affaire_id": {aid}})
-		assert.Contains(t, loc, "D%C3%A9j%C3%A0")
-		liens, err := db.GetLiens(ctx, sqlDB, aid)
-		require.NoError(t, err)
-		assert.Len(t, liens, 1)
-
-		_, body := get(t, client, srv.URL+"/comptes/depenses?exercice=2025")
-		assert.Contains(t, body, "n°7 Contrat ACME")
-	})
-}
-
-func TestRemboursementsHTTP(t *testing.T) {
-	ctx := t.Context()
-	srv, sqlDB, client := coproServer(t)
-
-	status, _ := post(t, client, "alice@example.com", srv.URL+"/remboursements/new", url.Values{
-		"objet": {"6 blocs de secours"}, "vendeur": {"Quincaillerie"}, "montant": {"195,41"},
-		"date_achat": {"2025-01-15"}, "demandeur": {"Alice"}, "statut": {"demande"}, "date_demande": {"Email du 15/01/2025"},
-	})
-	require.Equal(t, http.StatusSeeOther, status)
-
-	rbs, err := db.GetRemboursements(ctx, sqlDB)
-	require.NoError(t, err)
-	require.Len(t, rbs, 1)
-	assert.Equal(t, db.Amount(19541), rbs[0].Montant)
-	assert.Equal(t, "alice@example.com", rbs[0].CreatedBy)
-
-	_, body := get(t, client, srv.URL+"/remboursements")
-	assert.Contains(t, body, "6 blocs de secours")
-	assert.Contains(t, body, "15/01/2025")
-	_, body = get(t, client, srv.URL+"/comptes")
-	assert.Contains(t, body, "195,41 €", "the amount owed to co-owners shows on the accounts page")
-
-	t.Run("invalid forms are refused", func(t *testing.T) {
-		for _, form := range []url.Values{
-			{"objet": {""}, "montant": {"1"}, "statut": {"demande"}},
-			{"objet": {"x"}, "montant": {"0"}, "statut": {"demande"}},
-			{"objet": {"x"}, "montant": {"1,234"}, "statut": {"demande"}},
-			{"objet": {"x"}, "montant": {"1"}, "statut": {"payé"}},
-			{"objet": {"x"}, "montant": {"1"}, "statut": {"demande"}, "date_achat": {"15/01/2025"}},
-		} {
-			status, _ := post(t, client, "", srv.URL+"/remboursements/new", form)
-			assert.Equal(t, http.StatusBadRequest, status, "%v", form)
-		}
-	})
-
-	t.Run("once paid back, it leaves the pending total", func(t *testing.T) {
-		status, _ := post(t, client, "", srv.URL+"/remboursements/"+rbs[0].ID, url.Values{
-			"objet": {"6 blocs de secours"}, "montant": {"195,41"}, "date_achat": {"2025-01-15"},
-			"statut": {"rembourse"}, "date_remboursement": {"30/01/2025"},
-		})
-		require.Equal(t, http.StatusSeeOther, status)
-
-		got, err := db.GetRemboursement(ctx, sqlDB, rbs[0].ID)
-		require.NoError(t, err)
-		assert.Equal(t, db.RemboursementRembourse, got.Statut)
-		assert.Equal(t, "alice@example.com", got.CreatedBy, "an edit doesn't change who entered it")
-
-		_, body := get(t, client, srv.URL+"/comptes")
-		assert.NotContains(t, body, "195,41 €")
-
-		status, _ = post(t, client, "", srv.URL+"/remboursements/nope", url.Values{"objet": {"x"}, "montant": {"1"}, "statut": {"demande"}})
-		assert.Equal(t, http.StatusNotFound, status)
-	})
-
-	t.Run("deleting also detaches it from the affaires", func(t *testing.T) {
-		aid, err := db.InsertAffaire(ctx, sqlDB, db.AffaireDB{Numero: 1, Titre: "Blocs de secours"})
-		require.NoError(t, err)
-		status, _ := post(t, client, "", srv.URL+"/affaires/"+aid+"/liens", url.Values{"kind": {"remboursement"}, "ref": {rbs[0].ID}})
-		require.Equal(t, http.StatusSeeOther, status)
-
-		status, _ = post(t, client, "", srv.URL+"/remboursements/"+rbs[0].ID+"/delete", nil)
-		require.Equal(t, http.StatusSeeOther, status)
-
-		liens, err := db.GetLiens(ctx, sqlDB, aid)
-		require.NoError(t, err)
-		assert.Empty(t, liens)
 	})
 }
 

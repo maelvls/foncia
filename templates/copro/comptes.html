@@ -32,11 +32,6 @@
 		<small>{{.C.TravauxCredits}} encaissés (appels, indemnités, transferts)</small>
 		<small><a href="{{.BasePath}}/comptes/depenses?exercice={{.C.Exercice}}&source=repairs">voir les lignes</a></small>
 	</div>
-	<div class="carte">
-		<div class="titre">Remboursements en attente</div>
-		<div class="valeur">{{.Attente}}</div>
-		<small><a href="{{.BasePath}}/remboursements">{{.AttenteN}} achat{{if gt .AttenteN 1}}s{{end}} avancé{{if gt .AttenteN 1}}s{{end}} par des copropriétaires</a></small>
-	</div>
 </div>
 
 <h2>Budget {{.C.Nom}} <small>comparé aux dépenses du compte courant</small></h2>

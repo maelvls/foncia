@@ -15,9 +15,34 @@ import (
 
 // The co-owners, as Foncia knows them: the name on the title deed (a person, a
 // couple, an SCI), their postal address, their apartment and their parking
-// spaces. They are shown on /residents, apartment by apartment, above the
-// people who live there (http_residents.go); /coowners was their own page and
-// now leads there.
+// spaces, on /coproprietaires. /coowners and /residents were their pages
+// before, and lead there.
+
+func addCoownersHandlers(mux *http.ServeMux, c copro) {
+	mux.HandleFunc("GET /coproprietaires", c.coproprietaires)
+	for _, ancien := range []string{"GET /coowners", "GET /residents"} {
+		mux.HandleFunc(ancien, func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, c.basePath+"/coproprietaires", http.StatusFound)
+		})
+	}
+}
+
+func (c copro) coproprietaires(w http.ResponseWriter, r *http.Request) {
+	data := struct {
+		page
+		Lignes []coownerRow
+		Erreur string
+	}{page: c.page(r, "coproprietaires")}
+	if c.coowners != nil {
+		rows, err := c.coowners(r.Context())
+		if err != nil {
+			logutil.Errorf("co-owners: %v", err)
+			data.Erreur = err.Error()
+		}
+		data.Lignes = rows
+	}
+	c.render(w, "coproprietaires", data)
+}
 
 // coownersFunc gives the co-owners. nil when there is no Foncia to ask (the
 // tests of the other pages).
@@ -61,7 +86,7 @@ func coownersEnCache(fetch coownersFunc, ttl time.Duration) coownersFunc {
 
 // fetchCoowners asks Foncia for the co-owners and resolves their lots into an
 // apartment and parking spaces, sorted by apartment. It is shared by the
-// /residents page and the MCP list_coowners tool.
+// /coproprietaires page and the MCP list_coowners tool.
 func fetchCoowners(ctx context.Context, client *http.Client, uuid string) ([]coownerRow, error) {
 	coowners, err := api.GetCouncilCoowners(ctx, client, graphqlURL, uuid)
 	if err != nil {
