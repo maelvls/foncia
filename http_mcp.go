@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -34,7 +35,7 @@ const mcpInstructions = `Données de la copropriété Terra Nostra 2 (syndic Fon
 - "visit_report" : un rapport de visite de l'immeuble par le gestionnaire.
 - "general_assembly" : une convocation, un procès-verbal ou une annexe d'assemblée générale.
 
-Utilise search pour trouver des éléments, puis read_document avec l'identifiant de document renvoyé pour lire le PDF. Les liens (url) demandent une connexion Google sur le site.`
+Utilise search pour trouver des éléments, puis read_document avec l'identifiant de document renvoyé pour lire le PDF. changes donne ce qui est arrivé ou a changé depuis un curseur. Les liens (url) demandent une connexion Google sur le site.`
 
 // mcpItemType is the "type" of an item returned by the search tool.
 const (
@@ -68,8 +69,7 @@ type mcpServer struct {
 
 var readOnlyTool = &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: new(false)}
 
-// addFonciaReadTools adds search and read_document, which both the /mcp
-// server and Claude's server (mcp_brain.go) have.
+// addFonciaReadTools adds search and read_document.
 func addFonciaReadTools(server *mcp.Server, s mcpServer) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search",
@@ -110,6 +110,13 @@ func newMCPHandler(s mcpServer) http.Handler {
 		Description: "Tell when the data was last synchronized with Foncia, whether that failed, and how many items of each type there are.",
 		Annotations: readOnlyTool,
 	}, s.syncStatus)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "changes",
+		Title:       "Ce qui a changé",
+		Description: "What appeared or changed in the mirror of Foncia (missions, work orders, expenses, account documents, contracts), oldest first, after a cursor: give since the cursor of the previous answer to get what came next, or 0 for the whole history. Each change has the thing as it is now and, when it has one, the URL of its PDF.",
+		Annotations: readOnlyTool,
+	}, s.changes)
 
 	// Stateless: there is no session to keep between two requests, which
 	// suits the reverse proxy in front of us and survives restarts.
@@ -531,4 +538,58 @@ func containsAll(haystack string, words []string) bool {
 		}
 	}
 	return true
+}
+
+// -----------------------------------------------------------------------------
+// changes
+// -----------------------------------------------------------------------------
+
+type changesInput struct {
+	Since int64 `json:"since,omitempty" jsonschema:"The cursor of the previous answer; 0 or absent for the whole history."`
+	Limit int   `json:"limit,omitempty" jsonschema:"Maximum number of changes, 100 by default, at most 500."`
+}
+
+type mcpChange struct {
+	Seq    int64          `json:"seq"`
+	At     string         `json:"at"`
+	Type   string         `json:"type"` // mission, work_order, expense, account_document, contract_document
+	ID     string         `json:"id"`
+	Action string         `json:"action"` // existant, nouveau, modifie
+	Objet  map[string]any `json:"objet,omitempty"`
+	URL    string         `json:"url,omitempty"` // The PDF, for the user's browser.
+}
+
+type changesOutput struct {
+	Cursor  int64       `json:"cursor"` // To give as since next time.
+	End     int64       `json:"end"`    // The last change: cursor < end means there is more.
+	Changes []mcpChange `json:"changes"`
+}
+
+func (s mcpServer) changes(ctx context.Context, _ *mcp.CallToolRequest, in changesInput) (*mcp.CallToolResult, changesOutput, error) {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	limit = min(limit, 500)
+	end, err := db.DernierChangement(ctx, s.sqlDB)
+	if err != nil {
+		return nil, changesOutput{}, err
+	}
+	cs, err := db.GetChangements(ctx, s.sqlDB, max(in.Since, 0), limit)
+	if err != nil {
+		return nil, changesOutput{}, err
+	}
+	out := changesOutput{Cursor: max(in.Since, 0), End: end, Changes: []mcpChange{}}
+	for _, c := range cs {
+		mc := mcpChange{Seq: c.Seq, At: c.At, Type: c.Kind, ID: c.Ref, Action: c.Action}
+		if err := json.Unmarshal(c.Objet, &mc.Objet); err != nil {
+			return nil, changesOutput{}, fmt.Errorf("the change %d: %w", c.Seq, err)
+		}
+		if c.Fichier != "" {
+			mc.URL = s.baseURL + "/dl/" + c.Fichier
+		}
+		out.Changes = append(out.Changes, mc)
+		out.Cursor = c.Seq
+	}
+	return nil, out, nil
 }

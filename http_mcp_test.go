@@ -112,7 +112,7 @@ func TestMCP_ListTools(t *testing.T) {
 		names = append(names, tool.Name)
 		assert.True(t, tool.Annotations.ReadOnlyHint, "%s should be read-only", tool.Name)
 	}
-	assert.ElementsMatch(t, []string{"search", "read_document", "list_coowners", "sync_status"}, names)
+	assert.ElementsMatch(t, []string{"search", "read_document", "list_coowners", "sync_status", "changes"}, names)
 	assert.Contains(t, session.InitializeResult().Instructions, "Terra Nostra 2")
 }
 
@@ -295,6 +295,35 @@ func TestMCP_SyncStatus(t *testing.T) {
 	assert.Equal(t, map[string]int{"mission": 1, "expense": 2, "visit_report": 1, "general_assembly": 0, "other_document": 0}, out.Counts)
 	assert.Equal(t, "2022-10-13", out.Oldest)
 	assert.Equal(t, "2024-09-20", out.Newest)
+}
+
+func TestMCP_Changes(t *testing.T) {
+	sqlDB := openTestDB(t)
+	seedForSearch(t, sqlDB)
+	session := startMCP(t, sqlDB)
+
+	var all changesOutput
+	callTool(t, session, "changes", map[string]any{}, &all)
+	require.Len(t, all.Changes, 4, "one mission, two expenses, one visit report")
+	assert.Equal(t, all.End, all.Cursor)
+
+	var page changesOutput
+	callTool(t, session, "changes", map[string]any{"limit": 1}, &page)
+	require.Len(t, page.Changes, 1)
+	assert.Less(t, page.Cursor, page.End)
+
+	var withPDF int
+	for _, c := range all.Changes {
+		if c.URL != "" {
+			withPDF++
+			assert.Contains(t, c.URL, "/dl/")
+		}
+	}
+	assert.Positive(t, withPDF)
+
+	var none changesOutput
+	callTool(t, session, "changes", map[string]any{"since": all.Cursor}, &none)
+	assert.Empty(t, none.Changes)
 }
 
 func TestParseDocumentID(t *testing.T) {

@@ -31,16 +31,20 @@ var (
 	// EnableDebug enables debugFlag logs.
 	debugFlag = flag.Bool("debug", false, "Enable debug logs, including equivalent curl commands.")
 
-	serveBasePath  = flag.String("basepath", "", "Base path, useful for reverse proxies. Must start with a slash or be empty.")
-	serveAddr      = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
-	serveBaseURL   = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications, and given to the push services as who runs this server (see --push-contact). If empty, --addr is used.")
-	dbPath         = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
-	allowedUsers   = flag.String("allowed-users", "", "Comma-separated list of email addresses allowed to use the web UI, matched against --auth-header. Empty (the default) means no check is done in this process and access control is left entirely to the reverse proxy.")
-	authHeader     = flag.String("auth-header", "X-Forwarded-Email", "Header set by the authenticating reverse proxy, used by --allowed-users and by /oauth/authorize (see --mcp). The proxy must strip this header from incoming requests.")
-	mcpFlag        = flag.Bool("mcp", false, "Serve an MCP server on /mcp for Claude, ChatGPT, Grok..., with its own OAuth 2.1 authorization server. The reverse proxy must log the users in on /oauth/authorize and give their email in --auth-header, and let /mcp, /oauth/token, /oauth/register and /.well-known/oauth-* through without a login. The links and the OAuth issuer use --baseurl.")
-	ntfyTopic      = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/, on top of the notifications of the site itself (the page Notifications). Empty sends none there.")
-	invoicesDir    = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
-	htmlHeaderFile = flag.String("header-file", "", "File containing an HTML header to be added to the top of the page. Can contain Go template syntax. The template is executed with the following data: {BasePath, SyncStatus, NtfyTopic, Items, Version}.")
+	serveBasePath    = flag.String("basepath", "", "Base path, useful for reverse proxies. Must start with a slash or be empty.")
+	serveAddr        = flag.String("addr", "0.0.0.0:8080", "Address and port to serve the server on.")
+	serveBaseURL     = flag.String("baseurl", "", "Domain on which the server is running. Used to generate URLs in Ntfy notifications, and given to the push services as who runs this server (see --push-contact). If empty, --addr is used.")
+	dbPath           = flag.String("db", "foncia.sqlite", "Path to the sqlite3 database. You can use ':memory:' if you don't want to save the database.")
+	allowedUsers     = flag.String("allowed-users", "", "Comma-separated list of email addresses allowed to use the web UI, matched against --auth-header. Empty (the default) means no check is done in this process and access control is left entirely to the reverse proxy.")
+	authHeader       = flag.String("auth-header", "X-Forwarded-Email", "Header set by the authenticating reverse proxy, used by --allowed-users and by /oauth/authorize (see --mcp). The proxy must strip this header from incoming requests.")
+	mcpFlag          = flag.Bool("mcp", false, "Serve an MCP server on /mcp for Claude, ChatGPT, Grok..., with its own OAuth 2.1 authorization server. The reverse proxy must log the users in on /oauth/authorize and give their email in --auth-header, and let /mcp, /oauth/token, /oauth/register and /.well-known/oauth-* through without a login. The links and the OAuth issuer use --baseurl.")
+	workloadJWKS     = flag.String("workload-jwks", "", "The JWKS file of the house's issuer of workload identities (vls.dev/oidc), e.g. /run/oidc/.well-known/jwks.json. Turns on /api/v1, for the services named in --api-callers. Empty: no /api/v1.")
+	workloadIssuer   = flag.String("workload-issuer", "https://vls.dev", "The iss of the workload tokens that /api/v1 accepts.")
+	workloadAudience = flag.String("workload-audience", "", "The aud that the workload tokens must have for /api/v1. Empty: --baseurl.")
+	apiCallers       = flag.String("api-callers", "", "Comma-separated subs of the workload tokens that may call /api/v1, e.g. docker:residence.")
+	ntfyTopic        = flag.String("ntfy-topic", "", "Topic to send notifications to using https://ntfy.sh/, on top of the notifications of the site itself (the page Notifications). Empty sends none there.")
+	invoicesDir      = flag.String("invoices-dir", "invoices", "Directory to save invoices to. Will be created if it doesn't exist.")
+	htmlHeaderFile   = flag.String("header-file", "", "File containing an HTML header to be added to the top of the page. Can contain Go template syntax. The template is executed with the following data: {BasePath, SyncStatus, NtfyTopic, Items, Version}.")
 
 	// In order to test the Ntfy integration, you can use --sync-period=1m and
 	// manually remove the last item from the DB:
@@ -111,17 +115,23 @@ func main() {
 			"  %s [flags] <command>\n"+
 			"\n"+
 			"Commands:\n"+
-			"  serve, collecter, mcp-brain, list, comptes-travaux, convocations, import-affaires, import-remboursements, import-residents, rm-last-expense, rm-last-mission, token, version\n"+
+			"  serve, list, comptes-travaux, convocations, rm-last-expense, rm-last-mission, token, version\n"+
 			"\n"+
 			"Flags:\n", os.Args[0])
 		flag.CommandLine.PrintDefaults()
 	}
 
+	retired := retiredFlags()
 	flag.Parse()
 	if *debugFlag {
 		logutil.EnableDebug = true
 		logutil.Debugf("debug output enabled")
 	}
+	flag.Visit(func(f *flag.Flag) {
+		if retired[f.Name] {
+			logutil.Infof("--%s is ignored: the e-mails, the WhatsApp messages, the affaires and the residents are no longer this service's", f.Name)
+		}
+	})
 
 	// One context for the whole process, cancelled on SIGINT/SIGTERM, so that
 	// an in-flight sync or HTTP request is interrupted instead of the process
@@ -233,19 +243,6 @@ func main() {
 						}
 						goto sleep
 					}
-					{
-						// What's new at Foncia is sorted into the affaires
-						// like the messages.
-						n, err := sourcesFoncia(ctx, sqlDB, serveBaseURL+*serveBasePath, newMissions, newExpenses)
-						if err != nil {
-							logutil.Errorf("while recording the Foncia novelties as sources: %v", err)
-						}
-						if n > 0 {
-							if err := (brainTrigger{path: *claudeTriggerFile}).demander(fmt.Sprintf("%d nouveauté(s) Foncia", n)); err != nil {
-								logutil.Errorf("asking Claude to run: %v", err)
-							}
-						}
-					}
 					for _, ev := range annonces(*serveBasePath, newMissions, newExpenses) {
 						push.notify(ctx, ev)
 					}
@@ -290,22 +287,6 @@ func main() {
 			logutil.Infof("running in read-only mode, skipping synchronization")
 		}
 
-		// The e-mails and WhatsApp messages about the building.
-		collecteurs, err := collecteursConfigures(ctx, sqlDB)
-		if err != nil {
-			logutil.Errorf("%v", err)
-			os.Exit(1)
-		}
-		go collecterEnBoucle(ctx, sqlDB, brainTrigger{path: *claudeTriggerFile}, collecteurs)
-
-		// The residents follow the address book of the same whatsapp service.
-		carnet, err := carnetConfigure(sqlDB)
-		if err != nil {
-			logutil.Errorf("%v", err)
-			os.Exit(1)
-		}
-		go synchroniserResidentsEnBoucle(ctx, sqlDB, carnet)
-
 		var htmlHeader string
 		if *htmlHeaderFile != "" {
 			htmlHeader, err = readHeaderFile(*htmlHeaderFile)
@@ -336,41 +317,6 @@ func main() {
 		wg.Wait()
 		if ctx.Err() != nil {
 			logutil.Errorf("%v", context.Cause(ctx))
-			os.Exit(1)
-		}
-	case "mcp-brain":
-		// Claude's MCP server on stdin/stdout, for the runner of brain/.
-		// The logs go to stderr; stdout is the protocol.
-		sqlDB := openDB()
-		defer sqlDB.Close()
-		if err := runBrainMCP(ctx, sqlDB, *invoicesDir); err != nil && ctx.Err() == nil {
-			logutil.Errorf("mcp-brain: %v", err)
-			os.Exit(1)
-		}
-	case "collecter":
-		// Runs the configured collectors once, for a first import or to
-		// check the configuration. Doesn't ask Claude to run.
-		sqlDB := openDB()
-		defer sqlDB.Close()
-		collecteurs, err := collecteursConfigures(ctx, sqlDB)
-		if err != nil {
-			logutil.Errorf("%v", err)
-			os.Exit(1)
-		}
-		if len(collecteurs) == 0 {
-			logutil.Errorf("nothing to collect: give --gmail-token-file or --whatsapp-url")
-			os.Exit(1)
-		}
-		failed := false
-		for _, c := range collecteurs {
-			n, err := c.collecter(ctx)
-			fmt.Printf("%s : %d nouveau(x) message(s)\n", c.nom(), n)
-			if err != nil {
-				logutil.Errorf("%s: %v", c.nom(), err)
-				failed = true
-			}
-		}
-		if failed {
 			os.Exit(1)
 		}
 	case "list":
@@ -412,35 +358,6 @@ func main() {
 
 		username, password := getCreds()
 		ConvocationsCmd(ctx, username, password, search, *outDir, *withAll, *asJSON)
-	case "import-affaires":
-		args := flag.Args()[1:]
-		if len(args) != 1 {
-			logutil.Errorf("usage: %s import-affaires <path/to/affaires.json>", os.Args[0])
-			os.Exit(1)
-		}
-		sqlDB := openDB()
-		defer sqlDB.Close()
-		ImportAffairesCmd(ctx, sqlDB, args[0])
-	case "import-remboursements":
-		args := flag.Args()[1:]
-		if len(args) != 1 {
-			logutil.Errorf("usage: %s import-remboursements <path/to/remboursements.json>", os.Args[0])
-			os.Exit(1)
-		}
-		sqlDB := openDB()
-		defer sqlDB.Close()
-		ImportRemboursementsCmd(ctx, sqlDB, args[0])
-	case "import-residents":
-		fs := flag.NewFlagSet(flag.Arg(0), flag.ExitOnError)
-		purger := fs.Bool("purge", false, "Also remove the people of an earlier import who are no longer in the contacts. Without it, they are only listed.")
-		args := parseInterspersed(fs, flag.Args()[1:])
-		if len(args) != 1 {
-			logutil.Errorf("usage: %s import-residents [--purge] <path/to/contacts.vcf | ->", os.Args[0])
-			os.Exit(1)
-		}
-		sqlDB := openDB()
-		defer sqlDB.Close()
-		ImportResidentsCmd(ctx, sqlDB, args[0], *purger)
 	case "rm-last-expense":
 		sqlDB := openDB()
 		defer sqlDB.Close()
@@ -644,4 +561,23 @@ func openDB() *sql.DB {
 		os.Exit(1)
 	}
 	return sqlDB
+}
+
+// retiredFlags accepts, and ignores, the flags of what this service no longer
+// does (the collection of e-mails and WhatsApp messages, the affaires, Claude,
+// the residents), so that a deployment that still gives them keeps starting.
+func retiredFlags() map[string]bool {
+	names := []string{
+		"admin-users", "claude-trigger-file", "files-dir",
+		"gmail-account", "gmail-api", "gmail-query", "gmail-token-file",
+		"residents-period", "sources-period", "sources-since",
+		"whatsapp-chats", "whatsapp-contacts", "whatsapp-filtered-chats", "whatsapp-gap",
+		"whatsapp-keywords", "whatsapp-settle", "whatsapp-token-file", "whatsapp-url",
+	}
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		flag.String(n, "", "Retired, ignored.")
+		m[n] = true
+	}
+	return m
 }

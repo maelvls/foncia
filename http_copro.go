@@ -15,8 +15,8 @@ import (
 	"github.com/maelvls/foncia/logutil"
 )
 
-// What the pages of the conseil syndical (affaires, comptes, remboursements)
-// share: one template set, one navigation bar, and who is looking.
+// What the pages of the site share: one template set, one navigation bar, and
+// who is looking.
 
 //go:embed templates/copro/*.html
 var coproFS embed.FS
@@ -29,77 +29,7 @@ var coproFuncs = template.FuncMap{
 	"exercice": nomExercice,
 	"positif":  func(a db.Amount) db.Amount { return max(a, -a) },
 	"taille":   taille,
-	"brainCtx": func(basePath string, e brainEtat) any {
-		return struct {
-			brainEtat
-			BasePath string
-		}{e, basePath}
-	},
-	"chemin": url.PathEscape,
-	// The directory of the residents: the links that call a number, and the
-	// number without its spaces so that the search finds "0612".
-	"lienTelephone": lienTelephone,
-	"lienWhatsApp":  lienWhatsApp,
-	"chiffres":      func(s string) string { return strings.ReplaceAll(s, " ", "") },
-	"residentCtx": func(basePath string, p db.ResidentDB) any {
-		return struct {
-			BasePath string
-			P        db.ResidentDB
-		}{basePath, p}
-	},
-	// The "message" sub-template shows one collected message, in the lists
-	// and in the dossier of an affaire (where it can be detached).
-	"messageCtx": func(basePath, affaireID string, s db.SourceDB, lienID string) any {
-		return struct {
-			BasePath  string
-			AffaireID string
-			LienID    string
-			S         db.SourceDB
-		}{basePath, affaireID, lienID, s}
-	},
-	// The "choix_affaire" sub-template is the field that picks an affaire:
-	// a select that the script of "head" turns into a field that filters
-	// as one types. s, when not nil, preselects an affaire.
-	"choixAffaire": func(invite string, affaires []db.AffaireDB, s *suggestion) any {
-		return struct {
-			Invite   string
-			Affaires []db.AffaireDB
-			Choisie  string
-		}{invite, affaires, s.AffaireID()}
-	},
-	// The same field on a page that has one per row: the affaires are
-	// written once ("liste_affaires") instead of in every row, which made
-	// /sources weigh megabytes.
-	"choixAffaireListe": func(invite string, s *suggestion) any {
-		var choisie *db.AffaireDB
-		if s != nil {
-			choisie = s.Affaire
-		}
-		return struct {
-			Invite  string
-			Choisie *db.AffaireDB
-		}{invite, choisie}
-	},
-	"suggestionCtx": func(basePath string, s *suggestion) any {
-		return struct {
-			BasePath string
-			S        *suggestion
-		}{basePath, s}
-	},
-	"tableRemboursements": func(basePath string, lignes []db.RemboursementDB) any {
-		return struct {
-			BasePath string
-			Lignes   []db.RemboursementDB
-		}{basePath, lignes}
-	},
-	// A sub-template only sees what it is given, and it needs the base path
-	// along with the rows.
-	"tableAffaires": func(basePath string, lignes []affaireLigne) any {
-		return struct {
-			BasePath string
-			Lignes   []affaireLigne
-		}{basePath, lignes}
-	},
+	"chemin":   url.PathEscape,
 }
 
 var coproTmpl = template.Must(template.New("copro").Funcs(coproFuncs).ParseFS(coproFS, "templates/copro/*.html"))
@@ -129,12 +59,6 @@ type page struct {
 	User     string
 	Section  string
 	Flash    string
-
-	// For the administrators (--admin-users) only: the collected messages
-	// still to sort and Claude's propositions waiting for a decision.
-	Admin         bool
-	NATrier       int
-	NPropositions int
 }
 
 const utilisateurInconnu = "inconnu"
@@ -152,47 +76,12 @@ func currentUser(r *http.Request) string {
 type copro struct {
 	sqlDB    *sql.DB
 	basePath string
-	baseURL  string  // With the base path; for the share links.
-	partage  partage // The key of the share links; zero in the pages that make none.
-	brain    brainTrigger
-	carnet   carnetFunc   // The address book of WhatsApp, for the residents; nil without a whatsapp service.
-	coowners coownersFunc // The co-owners according to Foncia, for the residents; nil without Foncia.
+	coowners coownersFunc // The co-owners according to Foncia; nil without Foncia.
 	push     *pusher      // The notifications of the site (push.go); nil in the pages that send none.
 }
 
 func (c copro) page(r *http.Request, section string) page {
-	p := page{BasePath: c.basePath, User: currentUser(r), Section: section, Flash: r.URL.Query().Get("flash")}
-	if isAdmin(r) {
-		p.Admin = true
-		if n, err := db.CountSources(r.Context(), c.sqlDB); err == nil {
-			p.NATrier = n[db.SourceATrier]
-		} else {
-			logutil.Errorf("counting sources: %v", err)
-		}
-		if n, err := db.CountPropositionsEnAttente(r.Context(), c.sqlDB); err == nil {
-			p.NPropositions = n
-		} else {
-			logutil.Errorf("counting propositions: %v", err)
-		}
-	}
-	return p
-}
-
-// isAdmin tells whether the user sees the messages still to sort and the
-// propositions (--admin-users). Without any authenticating proxy (local runs,
-// tests), there is nobody to hide them from.
-func isAdmin(r *http.Request) bool {
-	u := currentUser(r)
-	list := strings.TrimSpace(*adminUsers)
-	if list == "" {
-		return u == utilisateurInconnu
-	}
-	for _, a := range strings.Split(list, ",") {
-		if strings.EqualFold(strings.TrimSpace(a), u) {
-			return true
-		}
-	}
-	return false
+	return page{BasePath: c.basePath, User: currentUser(r), Section: section, Flash: r.URL.Query().Get("flash")}
 }
 
 // render executes into a buffer first so that a template that fails halfway
@@ -219,7 +108,7 @@ func (c copro) fail(w http.ResponseWriter, what string, err error) {
 func (c copro) redirect(w http.ResponseWriter, r *http.Request, path, flash string) {
 	u, err := url.Parse(path)
 	if err != nil || !cheminLocal(path) {
-		u = &url.URL{Path: "/affaires"}
+		u = &url.URL{Path: "/"}
 	}
 	if flash != "" {
 		q := u.Query()
@@ -229,29 +118,8 @@ func (c copro) redirect(w http.ResponseWriter, r *http.Request, path, flash stri
 	http.Redirect(w, r, c.basePath+u.String(), http.StatusSeeOther)
 }
 
-// cheminLocal tells whether a "retour" form field is a path of this app, so
+// cheminLocal tells whether a path to redirect to is a path of this app, so
 // that it can't be used to bounce somebody to another site.
 func cheminLocal(p string) bool {
 	return strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "//") && !strings.Contains(p, "\\")
-}
-
-// retour is where a form wants to go back to, or the fallback.
-func retour(r *http.Request, fallback string) string {
-	if p := r.FormValue("retour"); cheminLocal(p) {
-		return p
-	}
-	return fallback
-}
-
-// lienExterne accepts what can go in an href: an http(s) URL, or nothing.
-func lienExterne(s string) (string, bool) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", true
-	}
-	u, err := url.Parse(s)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return "", false
-	}
-	return s, true
 }

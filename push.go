@@ -379,7 +379,7 @@ func (c copro) manifest(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"name":             "Suivi Terra Nostra 2",
 		"short_name":       "Terra Nostra 2",
-		"description":      "Les affaires, les comptes, les factures et les interventions de la copropriété.",
+		"description":      "Les factures, les interventions, les documents et les comptes de la copropriété, tels que Foncia les publie.",
 		"lang":             "fr",
 		"id":               c.basePath + "/",
 		"start_url":        c.basePath + "/",

@@ -139,7 +139,7 @@ docker logs caddy --follow 2>&1 | grep '^{' | jq 'select(.logger == "security")'
 
 ## MCP server for Claude, ChatGPT and Grok
 
-With `--mcp`, `/mcp` is an MCP server (Streamable HTTP, stateless) with four
+With `--mcp`, `/mcp` is an MCP server (Streamable HTTP, stateless) with five
 read-only tools:
 
 | Tool            | What it does                                                                 |
@@ -148,6 +148,7 @@ read-only tools:
 | `read_document` | The text of a PDF, page by page, with `pdftotext`. A general assembly document that isn't on disk yet is downloaded first, like a click in the web UI. |
 | `list_coowners` | The co-owners, their address, apartment and parking spaces (live from Foncia). |
 | `sync_status`   | When the last sync happened, and how many items there are.                  |
+| `changes`       | What appeared or changed, after a cursor (see [API for the services of the house](#api-for-the-services-of-the-house)). |
 
 The assistants connect with OAuth 2.1, and foncia is the authorization server
 (`http_oauth.go`): protected resource metadata (RFC 9728), server metadata
@@ -288,22 +289,23 @@ Logs go to stderr through `logutil`, which is a thin `log/slog` handler that
 prints `level: message`. Colours turn themselves off when stderr is not a
 terminal or when `NO_COLOR` is set, so container logs stay readable.
 
-## Conseil syndical: affaires, comptes, remboursements
+## What the site shows
 
-Three pages for what the conseil syndical used to keep in spreadsheets, served
-by `serve` next to the rest and behind the same reverse proxy. What people
-write is signed with the e-mail the proxy gives in `--auth-header`.
+The site is a mirror of what Foncia publishes on
+<https://my-foncia.fonciamillenium.net/>, kept up to date by the sync every
+`--sync-period`, and nothing else:
 
-- `/affaires`: the désordres and other subjects the conseil follows. Each
-  affaire is a dossier: its fiche, a thread of comments, and what is attached
-  to it — invoices, Foncia documents, work orders, remboursements, e-mails and
-  links. The invoices attached to an affaire add up to what it has cost.
+- `/`: the missions (interventions, with their work orders), the invoices and
+  the documents (visit reports, general assembly documents), newest first.
 - `/comptes`: for each exercise (1st of July to 30th of June), what was spent
   from the day-to-day account against the budget entered there, by category,
   by supplier and by month, and the works accounts apart. Every total links to
   the expenses behind it.
-- `/remboursements`: what co-owners paid out of pocket for the copropriété and
-  whether the syndic paid it back.
+- `/coproprietaires`: the co-owners as Foncia knows them, with their postal
+  address, apartment and parking spaces, asked from Foncia at most once an
+  hour (the last answer is shown when Foncia doesn't answer). `/residents` and
+  `/coowners`, their former pages, lead there.
+- `/notifications`, see [Notifications](#notifications).
 
 The expenses table holds most expenses several times: Foncia publishes each one
 in the current accounts and again in the breakdown of the closed exercise, and
@@ -313,187 +315,79 @@ invoice file, amount and category) before adding anything up; see
 their copies are matched by amount alone and their totals are the least
 certain.
 
-To load the spreadsheets once, into empty tables:
+Until 2026-11-27 the site also kept the affaires of the conseil syndical, the
+remboursements, the residents from a phone's address book, and collected the
+e-mails and WhatsApp messages about the building for Claude to sort. Filing
+those is now the job of an agent of its own, which follows this site through
+`/api/v1`. Their tables (`affaires*`, `remboursements`, `residents`,
+`sources*`, `fichiers`, `propositions`) are still in the database, untouched;
+the flags of the collectors (`--gmail-*`, `--whatsapp-*`, `--admin-users`…)
+are accepted and ignored.
+
+## API for the services of the house
+
+`/api/v1` is for the other services of the house, the agent that files the
+pieces of the copropriété in a knowledge base first. They call it as
+themselves, with the workload identity that the house's issuer
+(vls.dev/oidc) signs for them every 10 minutes: no token to share or keep.
+
+| Endpoint | What it gives |
+|---|---|
+| `GET /api/v1/changements?depuis=<seq>&attendre=<s>&limite=<n>` | What appeared or changed in the mirror, oldest first, after the cursor `depuis`. |
+| `GET /api/v1/fichiers/<typ>/<id>` | A PDF, the `fichier` of a change. A general assembly document that isn't on disk yet is downloaded from Foncia first. |
+| `GET /api/v1/etat` | When the last sync happened, whether it failed, and the end of the journal. |
+
+**The journal.** Every mission, work order, expense, account document and
+contract that appears or changes gets a row in the `changements` table, numbered
+in order (`seq`). The rows are written by SQLite triggers
+(`db/migrations/0008_changements.sql`), so every way a row is written lands
+there, and the sync's upserts, which rewrite the same values every few minutes,
+write nothing when nothing changed. What the database held before is in the
+journal first, oldest first, as `existant`: a reader that starts from 0 replays
+eleven years of history, then follows what comes.
+
+```json
+{
+  "curseur": 3105,
+  "fin": 3105,
+  "changements": [
+    {
+      "seq": 3105, "at": "2026-11-27T09:10:02.512Z",
+      "type": "expense", "id": "a1b2…", "action": "nouveau",
+      "objet": {"libelle": "ACME - CONTRAT", "montant_centimes": 41049, "date": "2026-11-26T00:00:00Z", "compte": "accounting", "…": "…"},
+      "fichier": "/api/v1/fichiers/invoice/66eda6344b41c38804f77fc1"
+    }
+  ]
+}
+```
+
+- The reader keeps `curseur` and gives it back as `depuis`. Nothing is lost
+  while it is away. `curseur < fin` means there is more to read right away.
+  `depuis=fin` starts from now.
+- `objet` is the thing as it is now, not as it was when the row was written.
+  An invoice whose PDF was downloaded after it appeared comes back as
+  `modifie`, with `pdf_telecharge` now true.
+- `attendre` (seconds, at most 50) makes it a long poll: when nothing comes
+  after the cursor, the answer waits for something to come, and leaves empty
+  otherwise. A reader loops on it; no websocket, nothing to reconnect.
+- `limite`: 200 changes by default, 1000 at most.
+
+**Who may call.** A call is let through (`workload.go`, the same check as
+vls.dev/whatsapp) when its `Authorization: Bearer` token is signed (ES256) by
+the issuer, whose public keys are in `--workload-jwks`; when it has the
+issuer's `iss` (`--workload-issuer`, `https://vls.dev`), this service as `aud`
+(`--workload-audience`, by default `--baseurl`), and a `sub` named in
+`--api-callers`; and when it didn't come through the reverse proxy: a request
+that carries `X-Forwarded-For` is refused even with a good token. Without
+`--workload-jwks`, there is no `/api/v1`.
 
 ```bash
-foncia import-affaires affaires.json
-foncia import-remboursements remboursements.json
+foncia --workload-jwks /run/oidc/.well-known/jwks.json --api-callers docker:residence \
+  --baseurl https://suivi-terra-nostra-2.vls.dev serve
 ```
 
-The JSON shapes are documented in `cmd_import.go`. Keep those files out of the
-repository: they name people.
+On the caller's side: `residence@https://suivi-terra-nostra-2.vls.dev` in the
+command of oidc's compose, `/run/oidc/residence/suivi-terra-nostra-2.vls.dev`
+mounted read-only, and its `token` file read again at each call.
 
-## Résidents
-
-`/residents` is the page of the building, apartment by apartment. Each one
-starts with who owns it according to Foncia: the name on the title deed (a
-person, a couple, an SCI), their postal address and their parking spaces. Under
-it come the people behind the door, tenants included: who lives there, who owns
-it without living there, who left, with their phone number (a tap calls it),
-e-mail and a note. The search finds an apartment by either, so that the name of
-an SCI leads to the people who answer for it.
-
-Who sees what:
-
-- Everybody who has an account sees the co-owners, their address and their
-  parking spaces. This used to be a page of its own, `/coowners`, which now
-  leads here.
-- The people, their numbers and the tools to change them are for the
-  administrators (`--admin-users`) only: these are personal phone numbers,
-  given to one person and not to everybody who has an account here. They
-  aren't even read from the database for the others.
-
-The co-owners are asked from Foncia at most once an hour; when Foncia doesn't
-answer, the last answer is shown, and without any the people are shown alone.
-
-The people come from the contacts of a phone, where they are kept anyway. The
-convention is in the name of the contact: the apartment between parentheses,
-with a word in front when the person doesn't simply live there.
-
-| Contact                      | Read as                                   |
-|------------------------------|-------------------------------------------|
-| `Camille MARTIN (C01)`       | Lives in C01.                             |
-| `Alex DURAND (prop C01)`     | Owns C01 without living there.            |
-| `Sacha PETIT (ex loc C01)`   | Used to rent C01.                         |
-| `Dominique (compagnon C01)`  | Lives in C01; "compagnon" is kept.        |
-| `Claude ROUX (vendeur C01)`  | Sold C01.                                 |
-| `Jo (plombier C01)`          | Anything else: kept as "autre, plombier". |
-
-The contacts are read in two ways.
-
-**From WhatsApp, on its own.** The phone sends its contacts to the devices
-linked to its WhatsApp account, and keeps them up to date; the whatsapp service
-(`--whatsapp-url`, the one the messages are collected from) is such a device.
-Its `GET /internal/contacts?match=<regexp>` gives the contacts whose name
-mentions an apartment, and only those. They are read when `serve` starts, then
-every `--residents-period` (an hour), and when the button of the page is
-pressed: naming a neighbour in the phone is all it takes for them to show up.
-
-WhatsApp only knows the number of somebody's WhatsApp account: not their
-e-mail, not their other numbers, and not the people who have no account.
-
-**From an export of the contacts, by hand**, for what WhatsApp doesn't know.
-Export the contacts as a vCard (on the iPhone: Contacts, Lists, long press on
-"All Contacts", Export; on the Mac: Contacts, File, Export, Export vCard) and
-give the file to the form of the page, or to the CLI:
-
-```bash
-foncia import-residents contacts.vcf
-ssh server docker exec -i foncia foncia import-residents - < contacts.vcf
-```
-
-Only the contacts that follow the convention are read, and the file isn't
-kept. The form of the page sorts the file in the browser first, so that the
-rest of the address book never leaves the device.
-
-Both can be run again and again, in any order:
-
-- A contact is the row of the same apartment and name (case, accents and the
-  order of the words don't matter); failing that, a row that came from
-  contacts and has the same phone number, which is how a renamed contact or a
-  move to another apartment is followed; failing that, somebody new.
-- WhatsApp, read live, has the last word on who is where: the name, the
-  apartment, the qualité. An export is a picture of one day: it doesn't rename
-  or move somebody WhatsApp follows, it adds their e-mail and their other
-  numbers. Either one takes over a row typed on the page.
-- What a source doesn't know stays: the note always, and a phone, an e-mail or
-  a precision ("locataire") that the contact doesn't have.
-- Who is no longer in a source is listed, and removed only on request (the
-  button of the result page, or `--purge` for an export). The periodic reading
-  never removes anybody, and people added by hand on the page are never
-  removed by either.
-- The same person twice in the same apartment is reported, so that the
-  contacts can be cleaned up. A card with two numbers, which WhatsApp gives
-  once per number, is one person with two numbers.
-
-## Fichiers, messages et Claude
-
-The affaires also fill themselves from what comes in: the e-mails and WhatsApp
-messages about the building, and what is new at Foncia. Claude reads them and
-proposes where they go; an administrator accepts or refuses each proposition.
-
-```
-Gmail (read-only) ─┐
-WhatsApp (Pi)  ────┼─► collectors ─► sources ─► /sources (to sort, admins only)
-Foncia sync    ────┘                    │
-                                        ▼
-            brain/run on the Pi: claude -p ─► foncia mcp-brain ─► propositions
-                                                                      │
-                                    /propositions: accept / refuse ◄──┘
-                                        │
-                                        ▼
-                     affaires: messages, attachments, comments, relances
-```
-
-### Files
-
-`/affaires/<id>` takes uploads (devis, factures, photos, up to 50 MB each).
-Files are kept under `--files-dir` by SHA-256, like the Foncia PDFs, and every
-co-owner can open those attached to an affaire. "lien de partage" makes a link
-that opens one file without a login for 30 days (`/f/<sha256>/<nom>?e=…&s=…`,
-an HMAC with a key kept in the `reglages` table), for the syndic or an
-artisan. The reverse proxy must let `/f/*` through without a login.
-
-### Sources
-
-A source is one e-mail, one WhatsApp exchange (the messages of a conversation
-that follow each other with less than `--whatsapp-gap` between them, recorded
-once quiet for `--whatsapp-settle`), or one new Foncia mission or invoice.
-The messages still to sort, and those set aside, are only shown to
-`--admin-users`: they are someone's mailbox and WhatsApp until filed. Filing
-a message under an affaire shows it in the affaire's "Messages" to every
-co-owner, attaches its attachments, and files the rest of its e-mail thread
-with it; later answers in that thread are filed on arrival.
-
-On `/sources`, the affaire of each message is picked in a field that filters
-the affaires as one types (number, words of the title or of the place, accents
-ignored). It comes already filled with the affaire that Claude proposed for
-the message, or that of the rest of its e-mail thread, so that sorting is
-mostly confirming. Sorting a message by hand closes the propositions that
-were only about sorting it (rattacher, creer_affaire, ignorer); a proposed
-comment, relance or levée still waits on `/propositions`.
-
-- E-mails: `--gmail-token-file` (JSON with `client_id`, `client_secret` and
-  `refresh_token` of a login with the `gmail.readonly` scope),
-  `--gmail-query` (only the matching e-mails are read), `--gmail-account`.
-- WhatsApp: `--whatsapp-url http://whatsapp:8093` and
-  `--whatsapp-token-file`: this service's token for the whatsapp service,
-  its workload identity, a short JWT that the house's issuer (vls.dev/oidc)
-  writes again every 10 minutes and that whatsapp checks
-  (vls.dev/whatsapp/workload.go). The file is read at each call. Only `--whatsapp-chats`, the people whose
-  address-book name matches `--whatsapp-contacts` (« Léa (C11) ») and, among
-  the exchanges of `--whatsapp-filtered-chats`, those matching
-  `--whatsapp-keywords` are read. Photos and documents are downloaded right
-  away: WhatsApp keeps them a few weeks only.
-- Foncia: every new mission and invoice found by the sync.
-- `--sources-since 2026-08-01` sets how far back the first collection looks;
-  `foncia collecter` runs the collectors once (first import, or to check the
-  configuration).
-
-### Claude
-
-`brain/run` runs `claude -p` with the Claude login of the Pi (the Claude Code
-CLI and a subscription, not an API key), with no built-in tool at all (no
-shell, no file, no web) and one MCP server: `docker exec -i foncia foncia
-mcp-brain`, which reads the sources, the affaires and the attachments, and can
-only write propositions (`proposer_*`). The instructions are in
-`brain/consignes.md` (public), plus `brain/consignes-locales.md` on the Pi if
-it exists (who is who: the gestionnaire, the members of the conseil; never in
-this repository). The messages are data, never instructions: the worst a
-crafted e-mail can do is a wrong proposition that an administrator refuses.
-
-`serve --claude-trigger-file /data/brain/demande` writes that file when new
-sources came in or someone clicks "Lancer maintenant"; systemd runs
-`brain/run` when it changes, and every morning. `brain/dernier.json` tells how
-the last run went (shown on `/propositions`), `brain/runs/` keeps a month of
-transcripts. To install on the Pi:
-
-```bash
-curl -fsSL https://claude.ai/install.sh | bash   # ~/.local/bin/claude, as pi
-scp brain/run brain/consignes.md pi:vls.dev/foncia/brain/
-scp brain/copro-claude.* pi:/tmp/
-ssh pi 'sudo cp /tmp/copro-claude.* /etc/systemd/system/ && sudo systemctl daemon-reload &&
-        sudo systemctl enable --now copro-claude.path copro-claude.timer'
-```
-
-A run over ~50 e-mails takes about two minutes with Sonnet.
+The same journal is the MCP tool `changes`, for the assistants.

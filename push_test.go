@@ -280,8 +280,7 @@ func pushServer(t *testing.T) (*httptest.Server, *sql.DB, *pushService, *httptes
 	p, sqlDB, ps, pushSrv := testPusher(t)
 	mux := newTestMux(t, sqlDB)
 	c := copro{sqlDB: sqlDB, push: p}
-	addSourcesHandlers(mux, c)
-	addResidentsHandlers(mux, c)
+	addCoownersHandlers(mux, c)
 	addPushHandlers(mux, c)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

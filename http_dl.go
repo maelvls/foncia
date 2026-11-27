@@ -97,7 +97,7 @@ func resolveDocument(ctx context.Context, sqlDB *sql.DB, client *http.Client, in
 		if doc.FilePath != "" && fileExists(doc.FilePath) {
 			return doc.FilePath, nil
 		}
-		// Claude's server (mcp-brain) has no Foncia session to download with.
+		// Without a Foncia session (the tests), there is nothing to download with.
 		if client == nil {
 			return "", errNotDownloaded
 		}

@@ -92,6 +92,7 @@ func TestMigrate(t *testing.T) {
 			"idx_affaires_numero",
 			"idx_affaires_relances_affaire_id",
 			"idx_affaires_statut",
+			"idx_changements_kind_ref",
 			"idx_contract_documents_hash_file",
 			"idx_contract_documents_supplier_id",
 			"idx_expenses_hash_file",
@@ -109,7 +110,7 @@ func TestMigrate(t *testing.T) {
 			"idx_work_orders_mission_id",
 			"idx_work_orders_supplier_id",
 		}, indexNames(t, sqlDB), "idx_entries_started_at must have been renamed")
-		for _, table := range []string{"oauth_clients", "oauth_tokens", "fichiers", "sources", "sources_fichiers", "propositions", "reglages", "affaires_liens", "push_abonnements"} {
+		for _, table := range []string{"oauth_clients", "oauth_tokens", "fichiers", "sources", "sources_fichiers", "propositions", "reglages", "affaires_liens", "push_abonnements", "changements"} {
 			assert.Contains(t, tableSQL(t, sqlDB, table), "STRICT", "%s must be STRICT", table)
 		}
 		assert.Contains(t, tableSQL(t, sqlDB, "affaires_liens"), "'fichier', 'source'")

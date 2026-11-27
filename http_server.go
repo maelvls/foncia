@@ -99,24 +99,25 @@ func ServeHTTP(ctx context.Context, db *sql.DB, httpListen net.Listener, client 
 	if err != nil {
 		return fmt.Errorf("while adding handlers: %w", err)
 	}
-	cle, err := chargerPartage(ctx, db)
-	if err != nil {
-		return fmt.Errorf("while loading the key of the share links: %w", err)
-	}
-	c := copro{sqlDB: db, basePath: basePath, baseURL: baseURL + basePath, partage: cle, brain: brainTrigger{path: *claudeTriggerFile}}
-	addSourcesHandlers(subMux, c)
-	if c.carnet, err = carnetConfigure(db); err != nil {
-		return fmt.Errorf("while setting up the address book of WhatsApp: %w", err)
-	}
+	c := copro{sqlDB: db, basePath: basePath, push: push}
 	c.coowners = coownersEnCache(func(ctx context.Context) ([]coownerRow, error) {
 		return fetchCoowners(ctx, client, uuid)
 	}, coownersTTL)
-	addResidentsHandlers(subMux, c)
-	c.push = push
+	addCoownersHandlers(subMux, c)
 	addPushHandlers(subMux, c)
-	// The share links are for people without an account: outside the routes
-	// that onlyAllowedUsers guards. The proxy must let /f/* through too.
-	addPublicHandlers(rootMux, c)
+	// /api/v1, for the other services of the house: outside the routes that
+	// onlyAllowedUsers guards, with a check of its own (workload.go).
+	if *workloadJWKS != "" {
+		audience := *workloadAudience
+		if audience == "" {
+			audience = baseURL
+		}
+		api := apiV1{sqlDB: db, client: client, invoicesDir: invoicesDir, basePath: basePath, lastSync: lastSync}
+		callers := subjects(*apiCallers)
+		rootMux.Handle(basePath+"/api/v1/", logRequests(calledBy(newWorkloads(*workloadJWKS, *workloadIssuer, audience), callers, http.StripPrefix(basePath, api.routes()))))
+		logutil.Infof("API on %s/api/v1 for %v, workload tokens for %s", basePath, callers, audience)
+	}
+
 	if *mcpFlag {
 		mcpHandler := newMCPHandler(mcpServer{
 			sqlDB:       db,
@@ -311,7 +312,6 @@ func addHandlers(mux *http.ServeMux, sqlDB *sql.DB, client *http.Client, uuid, b
 		}
 	})
 
-	addAffairesHandlers(mux, sqlDB, basePath)
 	addComptesHandlers(mux, sqlDB, basePath)
 
 	return nil
